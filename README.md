@@ -22,7 +22,7 @@ curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/dreamverse
 ### Usage
 
 #### Dreamverse (30s)
-```
+```bash
 # Single ~30s video (GPT expands prompt into 6 segments automatically)
 python dreamverse.py --prompt "a kid burps into a tunnel, with a huge echo"
 
@@ -38,7 +38,7 @@ python dreamverse.py --prompt "detailed scene description..." --no-enhance```
 
 #### Fastvideo 1080p (5s)
 
-```
+```bash
 # Single video
 python fastvideo.py --prompt "a fox running through a snowy forest"
 
