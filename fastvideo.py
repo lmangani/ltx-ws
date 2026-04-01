@@ -330,6 +330,11 @@ class VideoSession:
         self._log("connected ✓", always=True)
         await ws.send(msg_session_init_v2(self.job.params))
         self._log("→ session_init_v2")
+        # Send simple_generate immediately — do NOT wait for a "connected" event.
+        # The server may send gpu_assigned before or instead of "connected",
+        # and generation only starts once it receives simple_generate.
+        await ws.send(msg_simple_generate(self.job.params))
+        self._log(f"→ simple_generate  prompt={self.job.params.prompt[:60]!r}", always=True)
 
     async def _recv_loop(self, ws):
         async for frame in ws:
@@ -360,9 +365,8 @@ class VideoSession:
         t = msg.get("type", "")
 
         if t == "connected":
-            self._log("← connected → sending simple_generate")
-            await ws.send(msg_simple_generate(self.job.params))
-            self._log(f"→ simple_generate  prompt={self.job.params.prompt[:60]!r}")
+            # Server ack — simple_generate was already sent on open, nothing to do.
+            self._log("← connected")
 
         elif t == "queue_position":
             pos = msg.get("position") or msg.get("queue_position", "?")
@@ -374,8 +378,17 @@ class VideoSession:
         elif t == "session_started":
             self._log("← session_started")
 
-        elif t == "stream_started":
-            self._log("← stream_started — receiving frames…", always=True)
+        elif t == "ltx2_stream_start" or t == "stream_started":
+            self._log("← stream started — receiving frames…", always=True)
+
+        elif t == "ltx2_segment_start":
+            seg = msg.get("segment_idx", "?")
+            total = msg.get("total_segments", "?")
+            self._log(f"← segment {seg}/{total} started", always=True)
+
+        elif t == "ltx2_segment_complete":
+            seg = msg.get("segment_idx", "?")
+            self._log(f"← segment {seg} complete")
 
         elif t == "ltx2_stream_complete":
             print()   # newline after progress bar
@@ -386,6 +399,16 @@ class VideoSession:
                 always=True,
             )
             self._done.set()
+
+        elif t == "media_init":
+            mime = msg.get("mime", "?")
+            self._log(f"← media_init  mime={mime}")
+
+        elif t == "media_segment_complete":
+            self._log(f"← media_segment_complete")
+
+        elif t == "step_complete":
+            self._log(f"← step_complete")
 
         elif t == "latency":
             gms = msg.get("generation_ms") or msg.get("generation_latency_ms")
