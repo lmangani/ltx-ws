@@ -33,7 +33,7 @@ python dreamverse.py --prompt "sunset over the ocean" --count 3
 python dreamverse.py --prompt "dog learns to skateboard" --prompt "volcano at night"
 
 # Skip GPT prompt expansion, use prompt as-is
-python dreamverse.py --prompt "detailed scene description..." --no-enhance```
+python dreamverse.py --prompt "detailed scene description..." --no-enhance
 ```
 
 #### Fastvideo 1080p (5s)
