@@ -21,16 +21,38 @@ curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/dreamverse
 
 ### Usage
 
-#### Dreamverse (6 scenes, 30s)
+#### Dreamverse (30s)
 ```
-python dreamverse.py --prompt "a dog learns to fly" --verbose
+# Single ~30s video (GPT expands prompt into 6 segments automatically)
+python dreamverse.py --prompt "a kid burps into a tunnel, with a huge echo"
+
+# Queue of 3 videos
+python dreamverse.py --prompt "sunset over the ocean" --count 3
+
+# Multiple prompts
+python dreamverse.py --prompt "dog learns to skateboard" --prompt "volcano at night"
+
+# Skip GPT prompt expansion, use prompt as-is
+python dreamverse.py --prompt "detailed scene description..." --no-enhance```
 ```
 
-#### 1080p 5s
+#### Fastvideo 1080p (5s)
 
 ```
-python fastvideo.py --prompt "your prompt here" [options]
-```
+# Single video
+python fastvideo.py --prompt "a fox running through a snowy forest"
+
+# 5 videos from the same prompt
+python fastvideo.py --prompt "sunset over the ocean" --count 5
+
+# Multiple prompts, one video each
+python fastvideo.py --prompt "forest rain" --prompt "city lights" --prompt "volcano"
+
+# Image-to-video
+python fastvideo.py --prompt "the scene comes alive" --image photo.jpg
+
+# AI prompt enhancement, custom output folder
+python fastvideo.py --prompt "girl walking in rain" --enhance --output-dir ./videos```
 
 #### Quick examples
 
