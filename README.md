@@ -4,16 +4,13 @@ A command-line queue manager for [FastVideo](https://1080p.fastvideo.org/)
 
 > Reverse-engineered from the FastVideo web app's WebSocket protocol (`src/App.svelte`, LTX-2 backend).
 
----
 
-## Requirements
+### Requirements
 
 - Python 3.10+
 - `websockets` library (auto-installed on first run)
 
----
-
-## Install
+### Install
 
 Just grab the latest script directly:
 
@@ -22,15 +19,13 @@ curl -O https://raw.githubusercontent.com/lmangani/fastervideo.py/main/fastvideo
 pip install websockets
 ```
 
----
-
-## Usage
+### Usage
 
 ```
 python fastvideo.py --prompt "your prompt here" [options]
 ```
 
-### Quick examples
+#### Quick examples
 
 ```bash
 # Single video
@@ -67,7 +62,7 @@ python fastvideo.py --prompt "test" --count 5 --dry-run
 python fastvideo.py --prompt "test" --verbose
 ```
 
-## Full Example
+#### Full Example
 
 ```bash
 % python fastvideo.py --prompt "a mouse running through a dark pipe" --count 1
@@ -100,11 +95,10 @@ python fastvideo.py --prompt "test" --verbose
   ✓ [01] video_001_a_mouse_running_through_a_dark_pipe_20260401_184637.mp4  3893 KB  6.6s  41 chunks
 ```
 
----
 
-## All options
+### Options
 
-### Generation
+#### Generation
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
@@ -116,7 +110,7 @@ python fastvideo.py --prompt "test" --verbose
 | `--loop` | | off | Enable loop generation. |
 | `--preset-id ID` | | `simple_custom_prompt` | Override the session preset ID. |
 
-### Queue & network
+#### Queue & network
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
@@ -124,7 +118,7 @@ python fastvideo.py --prompt "test" --verbose
 | `--delay SECS` | `-d` | `1.0` | Pause between consecutive jobs. |
 | `--retries N` | `-r` | `1` | Max attempts per job (with exponential backoff). |
 
-### Output
+#### Output
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
@@ -132,16 +126,15 @@ python fastvideo.py --prompt "test" --verbose
 | `--prefix STR` | | `video` | Filename prefix. |
 | `--ext EXT` | | `mp4` | File extension. |
 
-### Misc
+#### Misc
 
 | Flag | Description |
 |---|---|
 | `--verbose` / `-v` | Print full WebSocket protocol trace. |
 | `--dry-run` | Show the job queue and exit without connecting. |
 
----
 
-## Output filenames
+### Output filenames
 
 Files are named automatically:
 
@@ -151,9 +144,7 @@ Files are named automatically:
 
 Example: `video_001_sunset_over_the_ocean_20260401_183000.mp4`
 
----
-
-## Notes
+### Notes
 
 **Sequential generation** — each video opens a fresh WebSocket connection. The server enforces one active session per IP, so jobs run one at a time.
 
@@ -167,9 +158,8 @@ ffmpeg -i input.mp4 -c copy fixed.mp4
 
 **Generation time** — typical generation is 5–10 seconds per video once a GPU is assigned. Queue wait time varies by server load.
 
----
 
-## Protocol
+### Protocol
 
 The client speaks directly to `wss://1080p.fastvideo.org/ws` using the same WebSocket protocol as the web app.
 
