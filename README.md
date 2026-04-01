@@ -69,7 +69,88 @@ python fastvideo.py --prompt "test" --count 5 --dry-run
 python fastvideo.py --prompt "test" --verbose
 ```
 
-#### Full Example
+#### Full Example (dreamverse)
+
+```
+% python dreamverse.py --prompt "a dog learns to fly" --verbose
+
+════════════════════════════════════════════════════════════
+  Dreamverse Queue — 1 job(s)
+  Endpoint : wss://dreamverse.fastvideo.org/ws
+  Timeout  : 480s per video
+  Delay    : 2.0s between jobs
+════════════════════════════════════════════════════════════
+
+  ┌─ Job 01/1  dreamverse_001_a_dog_learns_to_fly_20260401_191248.mp4
+  │  prompt: 'a dog learns to fly'
+  └──────────────────────────────────────────────────
+    [  0.61s] connected ✓
+    [  0.61s] → session_init_v2  prompt='a dog learns to fly'
+    [  0.61s] ← queue_status  position=0  gpus=2/4
+    [  0.78s] ← gpu_assigned  gpu=2  session_timeout=300s
+    [  0.78s] ← loop_generation_updated  enabled=False
+    [  0.78s] ← generation_paused_updated  paused=True
+    [  0.78s] ← rewrite started  model=gpt-oss-120b  (expanding prompt into segments…)
+    [  5.84s] ← generation_paused_updated  paused=False
+    [  5.84s] ← seed_prompts_updated  6 segments  reason=rewrite  fallback=False
+      seg 1: A sunny park glows with green grass and dappled light as a golden‑retriever name…
+      seg 2: A gust lifts the kite higher, tugging the string and pulling Buddy forward. He d…
+      seg 3: Buddy flaps his ears and paws, trying to stay aloft as the kite steadies him a f…
+      seg 4: The camera pans to a colorful hot‑air balloon drifting nearby, its burner flicke…
+      seg 5: The balloon lifts, and Buddy feels the lift of warm air beneath him. He gasps, t…
+      seg 6: The balloon gently descends, and Buddy’s harness releases, letting him glide bac…
+    [  5.84s] ← rewrite complete  fallback=False
+    [  5.85s] ← stream start  segments=6  mode=av_fmp4
+    [  5.85s] ← seed_prompts_reset_applied  reason=initial_rewrite
+    [  5.85s] ← segment 1 source=curated
+    [  5.85s] ← segment 1/6 started  prompt='A sunny park glows with green grass and dappled light as a g'
+    [  9.83s] ← media_init  mime=video/mp4; codecs="avc1.42E01E,mp4a.40.2"  stream_id=seg001-611d6ad2
+    [  9.88s] first chunk  TTFF=9.88s
+      ↓ 46 chunks  7977.4 KB  seg 0/6       [ 11.30s] ← media_segment_complete
+    [ 11.30s] ← step_complete
+    [ 11.30s] ← segment 1/6 complete
+    [ 11.30s] ← segment 2 source=curated
+    [ 11.30s] ← segment 2/6 started  prompt='A gust lifts the kite higher, tugging the string and pulling'
+    [ 14.27s] ← media_init  mime=video/mp4; codecs="avc1.42E01E,mp4a.40.2"  stream_id=seg002-a810b25d
+      ↓ 90 chunks  14719.3 KB  seg 1/6       [ 14.94s] ← media_segment_complete
+    [ 14.94s] ← step_complete
+    [ 14.94s] ← segment 2/6 complete
+    [ 14.94s] ← segment 3 source=curated
+    [ 14.94s] ← segment 3/6 started  prompt='Buddy flaps his ears and paws, trying to stay aloft as the k'
+    [ 18.79s] ← media_init  mime=video/mp4; codecs="avc1.42E01E,mp4a.40.2"  stream_id=seg003-ef3aeb1f
+      ↓ 132 chunks  21596.2 KB  seg 2/6       [ 19.46s] ← media_segment_complete
+    [ 19.46s] ← step_complete
+    [ 19.46s] ← segment 3/6 complete
+    [ 19.46s] ← segment 4 source=curated
+    [ 19.46s] ← segment 4/6 started  prompt='The camera pans to a colorful hot‑air balloon drifting nearb'
+    [ 23.25s] ← media_init  mime=video/mp4; codecs="avc1.42E01E,mp4a.40.2"  stream_id=seg004-acaae5e3
+      ↓ 180 chunks  29262.0 KB  seg 3/6       [ 23.99s] ← media_segment_complete
+    [ 23.99s] ← step_complete
+    [ 23.99s] ← segment 4/6 complete
+    [ 23.99s] ← segment 5 source=curated
+    [ 23.99s] ← segment 5/6 started  prompt='The balloon lifts, and Buddy feels the lift of warm air bene'
+    [ 27.68s] ← media_init  mime=video/mp4; codecs="avc1.42E01E,mp4a.40.2"  stream_id=seg005-b20cb0eb
+      ↓ 219 chunks  32688.7 KB  seg 4/6       [ 28.40s] ← media_segment_complete
+    [ 28.40s] ← step_complete
+    [ 28.40s] ← segment 5/6 complete
+    [ 28.40s] ← segment 6 source=curated
+    [ 28.40s] ← segment 6/6 started  prompt='The balloon gently descends, and Buddy’s harness releases, l'
+    [ 32.09s] ← media_init  mime=video/mp4; codecs="avc1.42E01E,mp4a.40.2"  stream_id=seg006-0048cc93
+      ↓ 261 chunks  37140.8 KB  seg 5/6       [ 32.54s] ← media_segment_complete
+    [ 32.54s] ← step_complete
+    [ 32.54s] ← segment 6/6 complete
+
+    [ 32.54s] ← ltx2_stream_complete  32.5s  6 segments  261 chunks
+    [ 33.06s] saved → dreamverse_001_a_dog_learns_to_fly_20260401_191248.mp4  (37140.8 KB)
+  ✓ saved  dreamverse_001_a_dog_learns_to_fly_20260401_191248.mp4  (37141 KB, 6 segments, 33.1s)
+
+════════════════════════════════════════════════════════════
+  Summary: 1 done  0 failed  (1 total)
+════════════════════════════════════════════════════════════
+  ✓ [01] dreamverse_001_a_dog_learns_to_fly_20260401_191248.mp4  37141 KB  33.1s  6 segments  261 chunks
+```
+
+#### Full Example (1080p)
 
 ```bash
 % python fastvideo.py --prompt "a mouse running through a dark pipe" --count 1
@@ -101,6 +182,7 @@ python fastvideo.py --prompt "test" --verbose
 ════════════════════════════════════════════════════════════
   ✓ [01] video_001_a_mouse_running_through_a_dark_pipe_20260401_184637.mp4  3893 KB  6.6s  41 chunks
 ```
+
 
 
 ### Options
