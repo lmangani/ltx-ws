@@ -1,8 +1,8 @@
-# fastvideo.py
+# videofentanyl
 
-A command-line queue manager for [FastVideo](https://1080p.fastvideo.org/) 
+A command-line tool for [FastVideo](https://fastvideo.org/) 
 
-> Reverse-engineered from the FastVideo web app's WebSocket protocol (`src/App.svelte`, LTX-2 backend).
+> Reverse-engineered from the FastVideo web app's WebSocket protocol _(LTX-2 backend)_
 
 
 ### Requirements
@@ -15,8 +15,8 @@ A command-line queue manager for [FastVideo](https://1080p.fastvideo.org/)
 Just grab the latest script directly:
 
 ```bash
-curl -O https://raw.githubusercontent.com/lmangani/fastervideo.py/main/fastvideo.py
-curl -O https://raw.githubusercontent.com/lmangani/fastervideo.py/main/dreamverse.py
+curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/fastvideo.py
+curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/dreamverse.py
 ```
 
 ### Usage
