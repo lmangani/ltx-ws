@@ -8,7 +8,7 @@ A command-line queue manager for [FastVideo](https://1080p.fastvideo.org/)
 ### Requirements
 
 - Python 3.10+
-- `websockets` library (auto-installed on first run)
+- `websockets` library
 
 ### Install
 
@@ -16,10 +16,17 @@ Just grab the latest script directly:
 
 ```bash
 curl -O https://raw.githubusercontent.com/lmangani/fastervideo.py/main/fastvideo.py
-pip install websockets
+curl -O https://raw.githubusercontent.com/lmangani/fastervideo.py/main/dreamverse.py
 ```
 
 ### Usage
+
+#### Dreamverse (6 scenes, 30s)
+```
+python dreamverse.py --prompt "a dog learns to fly" --verbose
+```
+
+#### 1080p 5s
 
 ```
 python fastvideo.py --prompt "your prompt here" [options]
