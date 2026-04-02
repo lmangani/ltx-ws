@@ -3,32 +3,32 @@ name: videofentanyl
 description: "Use this skill whenever the user wants to generate a video, create a video from a prompt, generate a short clip, generate a long video, use FastVideo or Dreamverse, batch generate videos, or save videos to disk. Trigger on phrases like 'generate a video', 'make a video', 'create a clip', 'generate videos from prompts', 'use fastvideo', 'use dreamverse', 'batch video generation', 'long video', 'short video clip', or any request to synthesize video from a text prompt or image."
 ---
 
-# fastervideo.py — Video Generation Skill
+# videofentanyl.py — Video Generation Skill
 
-Two scripts for generating AI videos via the FastVideo WebSocket API.
+Single unified script for generating AI videos via the FastVideo WebSocket API.
+Select the backend with `--mode` (default: `fastvideo`).
 No API key required. One active session per IP at a time.
 
-| Script | Use for | Output | Typical time |
+| Mode | Use for | Output | Typical time |
 |---|---|---|---|
-| `fastvideo.py` | Short clips | ~5s, single segment, 1080p | 5–10s |
-| `dreamverse.py` | Long videos | ~30s, 6 segments, GPT-expanded prompt | 60–120s |
+| `fastvideo` (default) | Short clips | ~5s, single segment, 1080p | 5–10s |
+| `dreamverse` | Long videos | ~30s, 6 segments, GPT-expanded prompt | 60–120s |
 
 ---
 
 ## Environment Setup
 
-Resolve `FASTERVIDEO_DIR` — the repo root. All scripts are there.
+Resolve `VIDEOFENTANYL_DIR` — the directory containing the script.
 
 ```
-$FASTERVIDEO_DIR/fastvideo.py
-$FASTERVIDEO_DIR/dreamverse.py
+$VIDEOFENTANYL_DIR/videofentanyl.py
 ```
 
 **How to resolve:**
 1. Check if the user mentioned the path.
-2. Try: `ls fastvideo.py dreamverse.py` (may be in cwd).
+2. Try: `ls videofentanyl.py` (may be in cwd).
 3. If unknown, ask once:
-   > "Where is your fastervideo.py directory?"
+   > "Where is your videofentanyl.py directory?"
 
 **Install dependency (once):**
 ```bash
@@ -37,122 +37,110 @@ pip install websockets
 
 ---
 
-## fastvideo.py — Short Clips
+## fastvideo mode — Short Clips (default)
 
-One prompt → one WebSocket session → one video file + metadata sidecar.
+One prompt → one WebSocket session → one video file saved to disk.
 
 ### Basic usage
 
 ```bash
 # Single video
-python fastvideo.py --prompt "a fox running through a snowy forest"
+python videofentanyl.py --prompt "a fox running through a snowy forest"
 
 # Multiple videos from same prompt
-python fastvideo.py --prompt "sunset over the ocean" --count 5
+python videofentanyl.py --prompt "sunset over the ocean" --count 5
 
 # Multiple prompts, one video each
-python fastvideo.py \
+python videofentanyl.py \
   --prompt "forest rain timelapse" \
   --prompt "city lights at night"
 
 # Multiple prompts × N videos each
-python fastvideo.py \
+python videofentanyl.py \
   --prompt "coral reef" \
   --prompt "arctic tundra" \
   --count 3
 
 # Image-to-video
-python fastvideo.py --prompt "the scene comes alive" --image ./photo.jpg
+python videofentanyl.py --prompt "the scene comes alive" --image ./photo.jpg
 
 # With AI prompt enhancement (GPT rewrite)
-python fastvideo.py --prompt "girl walking in rain" --enhance
+python videofentanyl.py --prompt "girl walking in rain" --enhance
 
 # Custom output folder and prefix
-python fastvideo.py --prompt "test" --count 3 \
+python videofentanyl.py --prompt "test" --count 3 \
   --output-dir ./videos --prefix clip
 
 # Preview queue without connecting
-python fastvideo.py --prompt "test" --count 5 --dry-run
+python videofentanyl.py --prompt "test" --count 5 --dry-run
 
 # Full protocol trace
-python fastvideo.py --prompt "test" --verbose
+python videofentanyl.py --prompt "test" --verbose
 ```
 
-### All flags
+---
+
+## dreamverse mode — Long Videos (~30s)
+
+One prompt → GPT expands into 6 segment descriptions → 6-segment ~30s video.
+Enhancement is **on by default** for this mode.
+
+### Basic usage
+
+```bash
+# Single long video
+python videofentanyl.py --mode dreamverse --prompt "a kid burps into a tunnel, with a huge echo"
+
+# Queue of videos
+python videofentanyl.py --mode dreamverse --prompt "volcano eruption at night" --count 3
+
+# Multiple prompts
+python videofentanyl.py --mode dreamverse \
+  --prompt "dog learns to skateboard" \
+  --prompt "timelapse of a city waking up"
+
+# Skip GPT expansion (use prompt as-is)
+python videofentanyl.py --mode dreamverse --prompt "very detailed scene description..." --no-enhance
+
+# Custom output, verbose
+python videofentanyl.py --mode dreamverse --prompt "test" --output-dir ./videos --verbose
+```
+
+---
+
+## All flags
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
+| `--mode {fastvideo,dreamverse}` | `-m` | `fastvideo` | Generation backend. |
 | `--prompt TEXT` | `-p` | — | Prompt. Repeat for multiple. |
 | `--count N` | `-n` | `1` | Videos per prompt. |
-| `--enhance` | `-e` | off | GPT prompt rewrite before generation. |
+| `--enhance` | `-e` | off (fastvideo) / on (dreamverse) | GPT prompt rewrite before generation. |
+| `--no-enhance` | | — | Disable GPT expansion (dreamverse only). |
 | `--image PATH` | `-i` | — | Input image for image-to-video. |
+| `--preset-id ID` | | mode default | Override session preset ID. |
+| `--preset-label STR` | | mode default | Override preset label (dreamverse). |
 | `--auto-extension` | | off | Server-side segment auto-extension. |
 | `--loop` | | off | Loop generation. |
 | `--output-dir DIR` | `-o` | `.` | Save directory. |
-| `--prefix STR` | | `video` | Filename prefix. |
+| `--prefix STR` | | `video` / `dreamverse` | Filename prefix (per-mode default). |
 | `--ext EXT` | | `mp4` | File extension. |
-| `--timeout SECS` | `-t` | `240` | Per-video timeout. |
-| `--delay SECS` | `-d` | `1.0` | Pause between jobs. |
+| `--timeout SECS` | `-t` | `240` (fastvideo) / `480` (dreamverse) | Per-video timeout. |
+| `--delay SECS` | `-d` | `1.0` (fastvideo) / `2.0` (dreamverse) | Pause between jobs. |
 | `--retries N` | `-r` | `1` | Max attempts (exponential backoff). |
 | `--verbose` | `-v` | off | Full WebSocket protocol trace. |
 | `--dry-run` | | off | Show queue, don't connect. |
 
 ---
 
-## dreamverse.py — Long Videos (~30s)
-
-One prompt → GPT expands into 6 segment descriptions → 6-segment video.
-`enhancement_enabled` is **on by default** — this is what makes it long-form.
-
-### Basic usage
-
-```bash
-# Single long video
-python dreamverse.py --prompt "a kid burps into a tunnel, with a huge echo"
-
-# Queue of videos
-python dreamverse.py --prompt "volcano eruption at night" --count 3
-
-# Multiple prompts
-python dreamverse.py \
-  --prompt "dog learns to skateboard" \
-  --prompt "timelapse of a city waking up"
-
-# Skip GPT expansion (use prompt as-is)
-python dreamverse.py --prompt "very detailed scene description..." --no-enhance
-
-# Custom output
-python dreamverse.py --prompt "test" --output-dir ./videos --verbose
-```
-
-### Dreamverse-specific flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `--no-enhance` | off | Disable GPT prompt expansion (on by default). |
-| `--preset-id ID` | `custom_editable` | Session preset ID. |
-| `--preset-label STR` | `Custom rollout` | Session preset label. |
-| `--timeout SECS` | `480` | Longer default — 6 segments take ~2 min. |
-| `--delay SECS` | `2.0` | Slightly longer inter-job pause. |
-
-All other flags (`--prompt`, `--count`, `--image`, `--output-dir`, `--prefix`, `--retries`, `--verbose`, `--dry-run`) work identically to fastvideo.py.
-
----
-
 ## Output Files
 
-Every successful job produces two files:
+Each successful job saves one video file:
 
 ```
-video_001_a_fox_running_20260401_183000.mp4   ← video
-video_001_a_fox_running_20260401_183000.txt   ← metadata sidecar
+video_001_a_fox_running_20260401_183000.mp4
+dreamverse_001_a_dog_learns_to_fly_20260401_191248.mp4
 ```
-
-**fastvideo.py sidecar** contains: prompt, endpoint, preset, enhance flag,
-timestamp, elapsed time, TTFF, latency, chunk count, bytes, server notices.
-
-**dreamverse.py sidecar** contains all of the above plus the **6 GPT-expanded
-segment prompts** — useful for re-using or editing individual segments.
 
 Filename pattern: `{prefix}_{N:03d}_{prompt_slug}_{timestamp}.{ext}`
 
@@ -160,7 +148,7 @@ Filename pattern: `{prefix}_{N:03d}_{prompt_slug}_{timestamp}.{ext}`
 
 ## Protocol Reference
 
-### fastvideo.py flow
+### fastvideo mode flow
 ```
 connect  →  session_init_v2    (preset: simple_custom_prompt, single_clip_mode: true)
          →  simple_generate    (prompt sent here)
@@ -170,7 +158,7 @@ connect  →  session_init_v2    (preset: simple_custom_prompt, single_clip_mode
          ←  ltx2_stream_complete
 ```
 
-### dreamverse.py flow
+### dreamverse mode flow
 ```
 connect  →  session_init_v2    (preset: custom_editable, single_clip_mode: false,
                                 initial_rollout_prompt: "<prompt>")
@@ -192,7 +180,7 @@ automatically after the GPT rewrite completes.
 
 ### Generate N videos from a list of prompts
 ```bash
-python fastvideo.py \
+python videofentanyl.py \
   --prompt "prompt one" \
   --prompt "prompt two" \
   --prompt "prompt three" \
@@ -203,7 +191,7 @@ Produces 6 videos total (3 prompts × 2 each), sequentially.
 
 ### Generate a long video with verbose logging
 ```bash
-python dreamverse.py \
+python videofentanyl.py --mode dreamverse \
   --prompt "a scientist discovers something extraordinary" \
   --verbose \
   --output-dir ./out
@@ -211,21 +199,17 @@ python dreamverse.py \
 
 ### Retry flaky jobs automatically
 ```bash
-python fastvideo.py --prompt "test" --count 10 --retries 3 --delay 2
+python videofentanyl.py --prompt "test" --count 10 --retries 3 --delay 2
 ```
 
 ### Check what would be generated without connecting
 ```bash
-python dreamverse.py --prompt "test" --count 5 --dry-run
+python videofentanyl.py --mode dreamverse --prompt "test" --count 5 --dry-run
 ```
 
 ---
 
 ## Troubleshooting
-
-**Stuck after `gpu_assigned` with no chunks** — this was a known bug (fixed).
-Ensure you have the latest script. The issue was `simple_generate` not being
-sent on socket open.
 
 **`ip_session_limit` error** — another session is active on your IP (e.g. a
 browser tab on `1080p.fastvideo.org` or `dreamverse.fastvideo.org`). The client
