@@ -67,6 +67,7 @@ import dataclasses
 import json
 import mimetypes
 import re
+import subprocess
 import sys
 import time
 import uuid
@@ -75,19 +76,30 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-# ── Dependency checks ──────────────────────────────────────────────────────────
+# ── Dependency bootstrap ───────────────────────────────────────────────────────
 
-def _require(pkg: str, import_as: str | None = None):
-    """Import a package or exit with a clear install hint."""
+def _ensure(pkg: str, import_as: str | None = None):
+    """Import a package, auto-installing it if missing.  Exit with a clear
+    message only if the installation itself fails."""
+    import importlib
     name = import_as or pkg
     try:
         return __import__(name)
     except ImportError:
-        print(f"Error: '{pkg}' is required. Install it with:\n"
-              f"  pip install {pkg}")
-        sys.exit(1)
+        print(f"  '{pkg}' not found — installing…")
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", pkg, "-q"],
+                stdout=subprocess.DEVNULL,
+            )
+        except subprocess.CalledProcessError:
+            print(f"Error: could not install '{pkg}'. "
+                  f"Please install it manually:\n  pip install {pkg}")
+            sys.exit(1)
+        importlib.invalidate_caches()
+        return __import__(name)
 
-websockets = _require("websockets")
+websockets = _ensure("websockets")
 
 
 # ── Mode configuration ─────────────────────────────────────────────────────────
@@ -710,13 +722,22 @@ def extract_last_frame(video_path: Path) -> Optional[dict]:
     Uses PyAV (av) for decoding and Pillow (PIL) for JPEG encoding.
     Returns an initial_image payload dict, or None on any failure.
     """
+    import importlib
     for pkg, mod in (("av", "av"), ("Pillow", "PIL")):
         try:
             __import__(mod)
         except ImportError:
-            print(f"Error: '{pkg}' is required for --autocontinue. "
-                  f"Install it with:\n  pip install {pkg}")
-            sys.exit(1)
+            print(f"  '{pkg}' not found — installing…")
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", pkg, "-q"],
+                    stdout=subprocess.DEVNULL,
+                )
+            except subprocess.CalledProcessError:
+                print(f"Error: could not install '{pkg}'. "
+                      f"Please install it manually:\n  pip install {pkg}")
+                sys.exit(1)
+            importlib.invalidate_caches()
     import av
     import io
     try:
