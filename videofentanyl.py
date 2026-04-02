@@ -718,11 +718,16 @@ def try_autoconcat_clips(
     file_prefix: str,
     ext: str,
     verbose: bool,
+    compact: bool = False,
 ) -> None:
     """After a successful autocontinue run, merge DONE outputs with ffmpeg and delete fragments.
 
     If ffmpeg is not on PATH, logs several lines and leaves all fragment files unchanged.
     On ffmpeg failure, logs stderr and leaves fragments in place.
+
+    When ``compact`` is True, concat is re-encoded with libx265 (CRF 28, ``faster`` preset)
+    instead of stream copy; ffmpeg is invoked with ``-n`` (no overwrite).  (x264's ``film``
+    tune is not valid for libx265 and is omitted.)
     """
     done = sorted(
         (j for j in jobs if j.status == JobStatus.DONE),
@@ -771,32 +776,59 @@ def try_autoconcat_clips(
         return
 
     log_level = "info" if verbose else "error"
-    cmd = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        log_level,
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(list_path),
-        "-c",
-        "copy",
-        str(merged),
-    ]
+    if compact:
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-n",
+            "-loglevel",
+            log_level,
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-vcodec",
+            "libx265",
+            "-crf",
+            "28",
+            "-preset",
+            "faster",
+            str(merged),
+        ]
+        ff_timeout = 3600
+    else:
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            log_level,
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-c",
+            "copy",
+            str(merged),
+        ]
+        ff_timeout = 600
     proc: subprocess.CompletedProcess[str] | None = None
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=ff_timeout,
         )
     except subprocess.TimeoutExpired:
-        print("\n  [autoconcat] ffmpeg timed out after 600s — leaving fragments in place.")
+        print(
+            f"\n  [autoconcat] ffmpeg timed out after {ff_timeout}s — "
+            "leaving fragments in place."
+        )
     except FileNotFoundError:
         print("\n  [autoconcat] ffmpeg executable disappeared — leaving fragments in place.")
     finally:
@@ -833,7 +865,8 @@ def try_autoconcat_clips(
             print(f"  [autoconcat] warning: could not remove {j.output_path}: {exc}")
 
     kb = merged.stat().st_size / 1024 if merged.exists() else 0
-    print(f"\n  [autoconcat] merged {len(done)} clips → {merged}  ({kb:.0f} KB)")
+    mode_note = " (libx265 compact)" if compact else ""
+    print(f"\n  [autoconcat] merged {len(done)} clips → {merged}  ({kb:.0f} KB){mode_note}")
     print(f"  [autoconcat] removed {removed} fragment file(s).")
 
 
@@ -1189,6 +1222,11 @@ examples:
              "(-c copy), then delete the fragments (requires --autocontinue; "
              "needs ffmpeg on PATH)",
     )
+    p.add_argument(
+        "--autocompact",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
 
     return p
 
@@ -1208,6 +1246,9 @@ async def async_main(args: argparse.Namespace):
         sys.exit(1)
     if args.autoconcat and not args.autocontinue:
         print("Error: --autoconcat requires --autocontinue")
+        sys.exit(2)
+    if args.autocompact and not args.autoconcat:
+        print("Error: --autocompact requires --autoconcat")
         sys.exit(2)
 
     # ── Resolve mode-specific defaults ───────────────────────────────────────
@@ -1283,6 +1324,7 @@ async def async_main(args: argparse.Namespace):
             prefix,
             args.ext.lstrip("."),
             args.verbose,
+            args.autocompact,
         )
     sys.exit(0 if failed == 0 else 1)
 
