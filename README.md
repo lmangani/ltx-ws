@@ -20,8 +20,8 @@ curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/videofenta
 The original single-backend scripts are still available:
 
 ```bash
-curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/fastvideo.py
-curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/dreamverse.py
+curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/legacy/fastvideo.py
+curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/legacy/dreamverse.py
 ```
 
 ---
