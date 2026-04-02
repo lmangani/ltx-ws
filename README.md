@@ -7,14 +7,16 @@ A unified command-line tool for [FastVideo](https://fastvideo.org/) — supporti
 ### Requirements
 
 - Python 3.10+
-- `websockets` library
+- `websockets`, `av`, `Pillow` libraries
 
 ### Install
 
-Grab the unified script directly:
+Grab the unified script and install dependencies:
 
 ```bash
 curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/videofentanyl.py
+curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/requirements.txt
+pip install -r requirements.txt
 ```
 
 The original single-backend scripts are still available:
@@ -47,6 +49,9 @@ python videofentanyl.py --prompt "the scene comes alive" --image photo.jpg
 
 # AI prompt enhancement, custom output folder
 python videofentanyl.py --prompt "girl walking in rain" --enhance --output-dir ./videos
+
+# Seamless multi-clip continuation (last frame of each clip → first frame of next)
+python videofentanyl.py --prompt "a river flowing through a canyon" --count 5 --autocontinue
 ```
 
 #### Dreamverse — long-form videos (~30s, 6 segments)
@@ -133,6 +138,7 @@ python videofentanyl.py \
 |---|---|
 | `--verbose` / `-v` | Print full WebSocket protocol trace. |
 | `--dry-run` | Show the job queue and exit without connecting. |
+| `--autocontinue` | Extract the last frame of each clip and feed it as the first frame of the next one. Ideal for seamless multi-clip runs in 1080p mode. |
 
 ---
 

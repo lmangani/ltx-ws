@@ -66,7 +66,6 @@ import base64
 import dataclasses
 import json
 import mimetypes
-import os
 import re
 import sys
 import time
@@ -76,18 +75,19 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-# ── Dependency bootstrap ───────────────────────────────────────────────────────
+# ── Dependency checks ──────────────────────────────────────────────────────────
 
-def _ensure(pkg: str, import_as: str | None = None):
+def _require(pkg: str, import_as: str | None = None):
+    """Import a package or exit with a clear install hint."""
     name = import_as or pkg
     try:
         return __import__(name)
     except ImportError:
-        print(f"  Installing {pkg}…")
-        os.system(f"{sys.executable} -m pip install {pkg} -q")
-        return __import__(name)
+        print(f"Error: '{pkg}' is required. Install it with:\n"
+              f"  pip install {pkg}")
+        sys.exit(1)
 
-websockets = _ensure("websockets")
+websockets = _require("websockets")
 
 
 # ── Mode configuration ─────────────────────────────────────────────────────────
@@ -599,17 +599,19 @@ class GenerationQueue:
 
     def __init__(
         self,
-        jobs:    list[Job],
-        mode:    str,
-        timeout: float,
-        delay:   float,
-        verbose: bool = False,
+        jobs:         list[Job],
+        mode:         str,
+        timeout:      float,
+        delay:        float,
+        verbose:      bool = False,
+        autocontinue: bool = False,
     ):
-        self.jobs    = jobs
-        self.mode    = mode
-        self.timeout = timeout
-        self.delay   = delay
-        self.verbose = verbose
+        self.jobs         = jobs
+        self.mode         = mode
+        self.timeout      = timeout
+        self.delay        = delay
+        self.verbose      = verbose
+        self.autocontinue = autocontinue
 
     async def run_all(self):
         total  = len(self.jobs)
@@ -624,7 +626,7 @@ class GenerationQueue:
         print(f"  Delay    : {self.delay}s between jobs")
         print(f"{'═'*60}\n")
 
-        for job in self.jobs:
+        for i, job in enumerate(self.jobs):
             print(f"  ┌─ Job {job.id:02d}/{total}  {job.output_path.name}")
             print(f"  │  prompt: {job.params.prompt[:72]!r}")
             if job.params.initial_image:
@@ -663,6 +665,11 @@ class GenerationQueue:
                        if job.segment_count else "")
                 print(f"  ✓ saved  {job.output_path.name}  "
                       f"({job.file_bytes/1024:.0f} KB{seg}, {job.elapsed:.1f}s)")
+                if self.autocontinue and i + 1 < len(self.jobs):
+                    frame = extract_last_frame(job.output_path)
+                    if frame:
+                        self.jobs[i + 1].params.initial_image = frame
+                        print(f"  → autocontinue: last frame → job {i + 2:02d}")
             else:
                 failed += 1
                 print(f"  ✗ FAILED  {job.error}")
@@ -695,6 +702,43 @@ def load_image_payload(path: str) -> dict:
     data = base64.b64encode(p.read_bytes()).decode()
     return {"name": p.name, "mime_type": mime,
             "data_url": f"data:{mime};base64,{data}"}
+
+
+def extract_last_frame(video_path: Path) -> Optional[dict]:
+    """Extract the last full frame from a video file without calling external tools.
+
+    Uses PyAV (av) for decoding and Pillow (PIL) for JPEG encoding.
+    Returns an initial_image payload dict, or None on any failure.
+    """
+    for pkg, mod in (("av", "av"), ("Pillow", "PIL")):
+        try:
+            __import__(mod)
+        except ImportError:
+            print(f"Error: '{pkg}' is required for --autocontinue. "
+                  f"Install it with:\n  pip install {pkg}")
+            sys.exit(1)
+    import av
+    import io
+    try:
+        last = None
+        with av.open(str(video_path)) as container:
+            stream = container.streams.video[0]
+            stream.codec_context.skip_frame = "NONREF"   # skip non-reference frames for speed
+            for frame in container.decode(stream):
+                last = frame
+        if last is None:
+            return None
+        buf = io.BytesIO()
+        last.to_image().save(buf, "JPEG")
+        data = base64.b64encode(buf.getvalue()).decode()
+        return {
+            "name":      "autocontinue.jpg",
+            "mime_type": "image/jpeg",
+            "data_url":  f"data:image/jpeg;base64,{data}",
+        }
+    except Exception as exc:
+        print(f"  [autocontinue] frame extraction failed: {exc}")
+        return None
 
 
 def sanitize_filename(s: str, maxlen: int = 48) -> str:
@@ -877,6 +921,12 @@ examples:
                    help="verbose protocol logging")
     p.add_argument("--dry-run", action="store_true",
                    help="print queue plan and exit without connecting")
+    p.add_argument(
+        "--autocontinue",
+        action="store_true",
+        help="extract the last frame of each clip and use it as the first "
+             "frame (--image) of the next one; ideal for 1080p multi-clip runs",
+    )
 
     return p
 
@@ -955,6 +1005,7 @@ async def async_main(args: argparse.Namespace):
         timeout=timeout,
         delay=delay,
         verbose=args.verbose,
+        autocontinue=args.autocontinue,
     )
     done, failed = await queue.run_all()
     sys.exit(0 if failed == 0 else 1)

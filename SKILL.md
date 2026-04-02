@@ -30,9 +30,11 @@ $VIDEOFENTANYL_DIR/videofentanyl.py
 3. If unknown, ask once:
    > "Where is your videofentanyl.py directory?"
 
-**Install dependency (once):**
+**Install dependencies (once):**
 ```bash
-pip install websockets
+pip install -r requirements.txt
+# or individually:
+pip install websockets av Pillow
 ```
 
 ---
@@ -70,6 +72,9 @@ python videofentanyl.py --prompt "girl walking in rain" --enhance
 # Custom output folder and prefix
 python videofentanyl.py --prompt "test" --count 3 \
   --output-dir ./videos --prefix clip
+
+# Seamless multi-clip continuation (last frame of each → first frame of next)
+python videofentanyl.py --prompt "ocean waves" --count 5 --autocontinue
 
 # Preview queue without connecting
 python videofentanyl.py --prompt "test" --count 5 --dry-run
