@@ -66,12 +66,18 @@ import base64
 import dataclasses
 import json
 import mimetypes
+import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
+import urllib.error
+import urllib.request
 from datetime import datetime
+from urllib.parse import unquote, urlparse
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -701,19 +707,247 @@ class GenerationQueue:
         return done, failed
 
 
+def _ffmpeg_concat_list_line(path: Path) -> str:
+    """One line for ffmpeg's concat demuxer (see ffmpeg -f concat)."""
+    p = path.resolve().as_posix().replace("'", r"'\''")
+    return f"file '{p}'"
+
+
+def try_autoconcat_clips(
+    jobs: list[Job],
+    file_prefix: str,
+    ext: str,
+    verbose: bool,
+) -> None:
+    """After a successful autocontinue run, merge DONE outputs with ffmpeg and delete fragments.
+
+    If ffmpeg is not on PATH, logs several lines and leaves all fragment files unchanged.
+    On ffmpeg failure, logs stderr and leaves fragments in place.
+    """
+    done = sorted(
+        (j for j in jobs if j.status == JobStatus.DONE),
+        key=lambda j: j.id,
+    )
+    if len(done) < 2:
+        print(
+            f"\n  [autoconcat] skipped — need at least 2 successful clips "
+            f"(got {len(done)})."
+        )
+        return
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        print("\n  [autoconcat] ffmpeg was not found on your PATH.")
+        print("  [autoconcat] Install ffmpeg to merge autocontinue fragments into one file.")
+        print("  [autoconcat] Without it, individual clip files are left as-is.")
+        print("  [autoconcat] Manual merge example (build list.txt with one `file 'path'` per line):")
+        print("  [autoconcat]   ffmpeg -y -f concat -safe 0 -i list.txt -c copy output.mp4")
+        print("  [autoconcat] Current fragment paths:")
+        for j in done:
+            print(f"  [autoconcat]   {j.output_path}")
+        return
+
+    out_dir = done[0].output_path.parent
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    merged = out_dir / f"{file_prefix}_merged_{ts}.{ext}"
+
+    list_body = "\n".join(_ffmpeg_concat_list_line(j.output_path) for j in done) + "\n"
+    fd, list_path_str = tempfile.mkstemp(
+        suffix=".ffconcat", prefix="videofentanyl_"
+    )
+    list_path = Path(list_path_str)
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        list_path.write_text(list_body, encoding="utf-8")
+    except OSError as exc:
+        print(f"\n  [autoconcat] could not write concat list: {exc}")
+        try:
+            list_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+
+    log_level = "info" if verbose else "error"
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        log_level,
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(list_path),
+        "-c",
+        "copy",
+        str(merged),
+    ]
+    proc: subprocess.CompletedProcess[str] | None = None
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        print("\n  [autoconcat] ffmpeg timed out after 600s — leaving fragments in place.")
+    except FileNotFoundError:
+        print("\n  [autoconcat] ffmpeg executable disappeared — leaving fragments in place.")
+    finally:
+        try:
+            list_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    if proc is None:
+        return
+
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        print("\n  [autoconcat] ffmpeg failed — leaving fragment files in place.")
+        if err:
+            elines = err.splitlines()
+            for line in elines[:40]:
+                print(f"  [autoconcat]   {line}")
+            if len(elines) > 40:
+                print("  [autoconcat]   …")
+        if merged.exists():
+            try:
+                merged.unlink()
+            except OSError:
+                pass
+        return
+
+    removed = 0
+    for j in done:
+        try:
+            j.output_path.unlink()
+            removed += 1
+        except OSError as exc:
+            print(f"  [autoconcat] warning: could not remove {j.output_path}: {exc}")
+
+    kb = merged.stat().st_size / 1024 if merged.exists() else 0
+    print(f"\n  [autoconcat] merged {len(done)} clips → {merged}  ({kb:.0f} KB)")
+    print(f"  [autoconcat] removed {removed} fragment file(s).")
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def load_image_payload(path: str) -> dict:
-    """Load an image file and return the initial_image payload dict."""
-    p = Path(path)
+MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
+
+def _parse_http_content_type(header: str | None) -> str | None:
+    if not header:
+        return None
+    return header.split(";")[0].strip().lower() or None
+
+
+def _is_http_url(s: str) -> bool:
+    u = s.strip().lower()
+    return u.startswith("http://") or u.startswith("https://")
+
+
+def _filename_from_url(url: str) -> str:
+    path = unquote(urlparse(url).path)
+    name = Path(path).name
+    if name and name not in (".", ".."):
+        return name
+    return "image.jpg"
+
+
+def _image_payload(name: str, mime: str, raw: bytes) -> dict:
+    if not mime.startswith("image/"):
+        mime = "image/jpeg"
+    data = base64.b64encode(raw).decode()
+    return {
+        "name": name,
+        "mime_type": mime,
+        "data_url": f"data:{mime};base64,{data}",
+    }
+
+
+def _download_url_to_temp_image(url: str) -> tuple[Path, str]:
+    """Download image bytes to a temp file. Caller must unlink the path when done."""
+    req = urllib.request.Request(
+        url.strip(),
+        headers={"User-Agent": USER_AGENT},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            ctype = _parse_http_content_type(resp.headers.get("Content-Type"))
+            raw = resp.read(MAX_IMAGE_DOWNLOAD_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Image URL returned HTTP {e.code}: {url}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Failed to download image: {e.reason}") from e
+
+    if len(raw) > MAX_IMAGE_DOWNLOAD_BYTES:
+        raise ValueError(
+            f"Image exceeds {MAX_IMAGE_DOWNLOAD_BYTES // (1024 * 1024)} MiB: {url}"
+        )
+
+    mime = ctype if ctype and ctype.startswith("image/") else None
+    if not mime:
+        mime, _ = mimetypes.guess_type(_filename_from_url(url))
+    if not mime or not mime.startswith("image/"):
+        mime = "image/jpeg"
+
+    ext = mimetypes.guess_extension(mime)
+    if ext == ".jpe":
+        ext = ".jpg"
+    if not ext:
+        ext = ".bin"
+
+    fd, path_str = tempfile.mkstemp(
+        suffix=ext, prefix="videofentanyl_img_", dir=None
+    )
+    path = Path(path_str)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        return path, mime
+    except Exception:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def load_image_payload(path_or_url: str) -> dict:
+    """Load an image from a local path or http(s) URL and return the initial_image payload dict.
+
+    Remote images are written to a temporary file, read into the payload, then removed.
+    """
+    s = path_or_url.strip()
+    if _is_http_url(s):
+        tmp: Path | None = None
+        try:
+            tmp, mime = _download_url_to_temp_image(s)
+            raw = tmp.read_bytes()
+            name = _filename_from_url(s)
+            return _image_payload(name, mime, raw)
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    p = Path(s)
     if not p.exists():
-        raise FileNotFoundError(f"Image not found: {path}")
+        raise FileNotFoundError(f"Image not found: {path_or_url}")
     mime, _ = mimetypes.guess_type(str(p))
     if not mime or not mime.startswith("image/"):
         mime = "image/jpeg"
-    data = base64.b64encode(p.read_bytes()).decode()
-    return {"name": p.name, "mime_type": mime,
-            "data_url": f"data:{mime};base64,{data}"}
+    return _image_payload(p.name, mime, p.read_bytes())
 
 
 def extract_last_frame(video_path: Path) -> Optional[dict]:
@@ -874,8 +1108,8 @@ examples:
     )
     gen.add_argument(
         "--image", "-i",
-        metavar="PATH",
-        help="input image for image-to-video mode",
+        metavar="PATH_OR_URL",
+        help="input image for image-to-video (local path or http(s) URL)",
     )
     gen.add_argument(
         "--preset-id",
@@ -948,6 +1182,13 @@ examples:
         help="extract the last frame of each clip and use it as the first "
              "frame (--image) of the next one; ideal for 1080p multi-clip runs",
     )
+    p.add_argument(
+        "--autoconcat",
+        action="store_true",
+        help="after generation, merge successful autocontinue clips with ffmpeg "
+             "(-c copy), then delete the fragments (requires --autocontinue; "
+             "needs ffmpeg on PATH)",
+    )
 
     return p
 
@@ -965,6 +1206,9 @@ async def async_main(args: argparse.Namespace):
     if args.count < 1:
         print("Error: --count must be >= 1")
         sys.exit(1)
+    if args.autoconcat and not args.autocontinue:
+        print("Error: --autoconcat requires --autocontinue")
+        sys.exit(2)
 
     # ── Resolve mode-specific defaults ───────────────────────────────────────
     timeout = args.timeout if args.timeout is not None else cfg["default_timeout"]
@@ -1017,6 +1261,9 @@ async def async_main(args: argparse.Namespace):
         print(f"  Endpoint   : {_ws_url(mode)}")
         print(f"  Output dir : {output_dir.resolve()}")
         print(f"  Timeout    : {timeout}s  Delay: {delay}s  Retries: {args.retries}")
+        if args.autoconcat:
+            print("  autoconcat : after run, merge successful clips with ffmpeg; "
+                  "remove fragments if merge succeeds")
         return
 
     # ── Run queue ─────────────────────────────────────────────────────────────
@@ -1029,6 +1276,14 @@ async def async_main(args: argparse.Namespace):
         autocontinue=args.autocontinue,
     )
     done, failed = await queue.run_all()
+    if args.autoconcat:
+        await asyncio.to_thread(
+            try_autoconcat_clips,
+            jobs,
+            prefix,
+            args.ext.lstrip("."),
+            args.verbose,
+        )
     sys.exit(0 if failed == 0 else 1)
 
 

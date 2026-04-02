@@ -8,6 +8,7 @@ A unified command-line tool for [FastVideo](https://fastvideo.org/) — supporti
 
 - Python 3.10+
 - `websockets`, `av`, `Pillow` libraries
+- **ffmpeg** (optional): only needed on your machine if you use `--autoconcat` to merge autocontinue clips after generation
 
 ### Install
 
@@ -44,14 +45,19 @@ python videofentanyl.py --prompt "sunset over the ocean" --count 5
 # Multiple prompts, one video each
 python videofentanyl.py --prompt "forest rain" --prompt "city lights" --prompt "volcano"
 
-# Image-to-video
+# Image-to-video (local file or https URL — URLs are downloaded to a temp file, then removed)
 python videofentanyl.py --prompt "the scene comes alive" --image photo.jpg
+python videofentanyl.py --prompt "the scene comes alive" --image https://example.com/still.png
 
 # AI prompt enhancement, custom output folder
 python videofentanyl.py --prompt "girl walking in rain" --enhance --output-dir ./videos
 
 # Seamless multi-clip continuation (last frame of each clip → first frame of next)
 python videofentanyl.py --prompt "a river flowing through a canyon" --count 5 --autocontinue
+
+# Same, then merge successful clips into one file with ffmpeg and delete the fragments
+# (requires --autocontinue; if ffmpeg is not on PATH, fragments are left in place and a log is printed)
+python videofentanyl.py --prompt "a river flowing through a canyon" --count 5 --autocontinue --autoconcat
 ```
 
 #### Dreamverse — long-form videos (~30s, 6 segments)
@@ -110,7 +116,7 @@ python videofentanyl.py \
 | `--count N` | `-n` | `1` | Videos to generate per prompt. |
 | `--enhance` | `-e` | off (fastvideo) / on (dreamverse) | Enable AI prompt enhancement (GPT rewrite). |
 | `--no-enhance` | | — | Disable GPT prompt expansion (dreamverse only). |
-| `--image PATH` | `-i` | — | Input image for image-to-video mode. |
+| `--image PATH_OR_URL` | `-i` | — | Input image for image-to-video: local path or `http(s)` URL (downloaded via a temp file). |
 | `--preset-id ID` | | mode default | Override the session preset ID. |
 | `--preset-label STR` | | mode default | Override the preset label (dreamverse). |
 | `--auto-extension` | | off | Enable server-side segment auto-extension. |
@@ -139,6 +145,7 @@ python videofentanyl.py \
 | `--verbose` / `-v` | Print full WebSocket protocol trace. |
 | `--dry-run` | Show the job queue and exit without connecting. |
 | `--autocontinue` | Extract the last frame of each clip and feed it as the first frame of the next one. Ideal for seamless multi-clip runs in 1080p mode. |
+| `--autoconcat` | After the queue finishes, merge **successful** autocontinue clips with **ffmpeg** (`-c copy`), then **delete** the fragment files. **Requires `--autocontinue`.** If `ffmpeg` is not on your PATH, the tool logs details and leaves all fragments unchanged. |
 
 ---
 
@@ -150,9 +157,16 @@ Files are named automatically:
 {prefix}_{job_number}_{prompt_slug}_{timestamp}.{ext}
 ```
 
+After **`--autoconcat`** succeeds, fragments are removed and a single merged file is written:
+
+```
+{prefix}_merged_{timestamp}.{ext}
+```
+
 Examples:
 - `video_001_sunset_over_the_ocean_20260401_183000.mp4`
 - `dreamverse_001_a_dog_learns_to_fly_20260401_191248.mp4`
+- `video_merged_20260402_120000.mp4` (merged run)
 
 ---
 
@@ -212,6 +226,8 @@ Examples:
 ```bash
 ffmpeg -i input.mp4 -c copy fixed.mp4
 ```
+
+**`--autoconcat`** — merged output is named `{prefix}_merged_{timestamp}.{ext}` next to the clips. Concat uses stream copy; if ffmpeg cannot merge your fragments, stderr is printed and the individual files are kept.
 
 **IP session limit** — if you see `ip_session_limit`, another session is active on your IP (e.g. a browser tab). The client detects this and retries automatically after 15 seconds.
 
