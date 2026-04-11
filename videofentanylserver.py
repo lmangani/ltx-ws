@@ -78,7 +78,7 @@ DEFAULT_HOST           = "0.0.0.0"
 DEFAULT_PORT           = 8765
 DEFAULT_MODEL          = "FastVideo/LTX2-Distilled-Diffusers"
 DEFAULT_NUM_GPUS       = 1
-DEFAULT_NUM_FRAMES     = 97    # ~4 s @ 24 fps; LTX requires (4k+1) frames
+DEFAULT_NUM_FRAMES     = 97    # ~4 s @ 24 fps; LTX requires (8k+1) frames: 9, 17, 25, … 97, 105, …
 DEFAULT_HEIGHT         = 480
 DEFAULT_WIDTH          = 848
 DEFAULT_FPS            = 24
@@ -512,7 +512,11 @@ class VideoServer:
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def _nearest_valid_frames(n: int) -> int:
-    """Round n to the nearest value satisfying (frames - 1) % 8 == 0, min 9."""
+    """Round n to the nearest value satisfying (frames - 1) % 8 == 0, min 9.
+
+    LTX2 uses a temporal compression factor of 8, so valid frame counts are
+    9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, … (i.e. 8k+1).
+    """
     if n < 9:
         return 9
     remainder = (n - 1) % 8
@@ -573,7 +577,7 @@ examples:
     vid = p.add_argument_group("video")
     vid.add_argument(
         "--num-frames", type=int, default=DEFAULT_NUM_FRAMES, dest="num_frames",
-        help=f"frames to generate — rounded to (4k+1) (default: {DEFAULT_NUM_FRAMES})",
+        help=f"frames to generate — rounded to (8k+1) (default: {DEFAULT_NUM_FRAMES})",
     )
     vid.add_argument(
         "--height", type=int, default=DEFAULT_HEIGHT,
@@ -622,7 +626,7 @@ def main() -> None:
     if valid_frames != args.num_frames:
         print(
             f"  [warn] --num-frames {args.num_frames} adjusted to {valid_frames} "
-            f"(LTX requires (4k+1) frames)",
+            f"(LTX2 requires (8k+1) frames: 9, 17, 25, … 97, …)",
             flush=True,
         )
         args.num_frames = valid_frames

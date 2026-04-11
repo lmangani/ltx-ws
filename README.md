@@ -304,7 +304,7 @@ python videofentanyl.py --server ws://localhost:8765/ws \
 | `--port` | `8765` | Port. |
 | `--model` | `FastVideo/LTX2-Distilled-Diffusers` | HuggingFace model ID. |
 | `--num-gpus` | `1` | Device count. |
-| `--num-frames` | `97` | Frames to generate (`(4k+1)` required by LTX). |
+| `--num-frames` | `97` | Frames to generate (`(8k+1)` required by LTX2: 9, 17, 25 … 97). |
 | `--height` | `480` | Output height in pixels. |
 | `--width` | `848` | Output width in pixels. |
 | `--fps` | `24` | Frames per second. |
