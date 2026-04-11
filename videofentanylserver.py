@@ -138,6 +138,7 @@ class LocalVideoGenerator:
         width:          int,
         fps:            int,
         guidance_scale: float,
+        model_dir:      str | None = None,
     ) -> None:
         self.model          = model
         self.num_gpus       = num_gpus
@@ -146,6 +147,7 @@ class LocalVideoGenerator:
         self.width          = width
         self.fps            = fps
         self.guidance_scale = guidance_scale
+        self.model_dir      = model_dir
         self._generator     = None
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
@@ -153,13 +155,11 @@ class LocalVideoGenerator:
     def load(self) -> None:
         """Load model weights.  Blocks until ready.  Call once at startup."""
         from fastvideo import VideoGenerator
-        is_local = Path(self.model).exists()
-        if is_local:
-            log.info("Loading model from local path %s …", self.model)
-        else:
-            log.info("Downloading/loading model %s from HuggingFace …", self.model)
+
+        local_path = self._resolve_model_path()
+        log.info("Loading model from %s …", local_path)
         self._generator = VideoGenerator.from_pretrained(
-            self.model,
+            local_path,
             num_gpus=self.num_gpus,
             # MPS-compatible offload settings: keep everything on-device
             dit_cpu_offload=False,
@@ -169,6 +169,43 @@ class LocalVideoGenerator:
             pin_cpu_memory=False,
         )
         log.info("Model loaded ✓")
+
+    def _resolve_model_path(self) -> str:
+        """
+        Return a local filesystem path for the model.
+
+        * If ``self.model`` is already an existing directory, use it as-is.
+        * Otherwise treat it as a HuggingFace repo ID, download/cache it with
+          ``huggingface_hub.snapshot_download``, and return the local cache dir.
+          Passing a ``model_dir`` overrides the default HF cache location.
+        """
+        if Path(self.model).exists():
+            log.info("Using local model directory: %s", self.model)
+            return self.model
+
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError:
+            log.error(
+                "huggingface_hub is required to download models. "
+                "Install it with:  pip install huggingface_hub"
+            )
+            raise
+
+        log.info(
+            "Downloading model '%s' from HuggingFace (this may take a while on first run) …",
+            self.model,
+        )
+        kwargs: dict = dict(repo_id=self.model)
+        if self.model_dir:
+            kwargs["local_dir"] = self.model_dir
+            log.info("  → saving to: %s", self.model_dir)
+        else:
+            log.info("  → caching in default HuggingFace cache (~/.cache/huggingface/hub)")
+
+        local_path = snapshot_download(**kwargs)
+        log.info("Model available at: %s", local_path)
+        return local_path
 
     # ── generation ────────────────────────────────────────────────────────────
 
@@ -574,6 +611,14 @@ examples:
         ),
     )
     mdl.add_argument(
+        "--model-dir", default=None, dest="model_dir", metavar="DIR",
+        help=(
+            "Directory where the model will be downloaded/cached when --model is a "
+            "HuggingFace model ID. If omitted the default HuggingFace cache is used "
+            "(~/.cache/huggingface/hub). Ignored when --model is already a local path."
+        ),
+    )
+    mdl.add_argument(
         "--num-gpus", type=int, default=DEFAULT_NUM_GPUS, dest="num_gpus",
         help=f"number of devices (default: {DEFAULT_NUM_GPUS})",
     )
@@ -642,7 +687,12 @@ def main() -> None:
 
     # ── Banner ────────────────────────────────────────────────────────────────
     _model_is_local = Path(args.model).exists()
-    _model_source   = f"local  ({args.model})" if _model_is_local else f"HuggingFace  ({args.model})"
+    if _model_is_local:
+        _model_source = f"local  ({args.model})"
+    elif args.model_dir:
+        _model_source = f"HuggingFace → {args.model_dir}  ({args.model})"
+    else:
+        _model_source = f"HuggingFace cache  ({args.model})"
     print(f"\n{'═' * 60}")
     print(f"  FastVideo Local Server  (videofentanylserver)")
     print(f"  Model    : {_model_source}")
@@ -663,6 +713,7 @@ def main() -> None:
         width          = args.width,
         fps            = args.fps,
         guidance_scale = args.guidance_scale,
+        model_dir      = args.model_dir,
     )
     generator.load()
 

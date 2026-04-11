@@ -268,27 +268,32 @@ curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/videofenta
 #### Start the server
 
 ```bash
-# Default settings: ws://0.0.0.0:8765/ws
-# On first run the LTX2-Distilled weights (~9 GB) are downloaded from HuggingFace
+# Default: downloads/caches the model in ~/.cache/huggingface/hub on first run
 python videofentanylserver.py
 
-# Use a previously-downloaded local model folder (skips the HuggingFace download)
+# Download to a specific local folder (downloaded once, reused on subsequent starts)
+python videofentanylserver.py --model-dir ./models/LTX2-Distilled-Diffusers
+
+# Use a model folder that is already fully downloaded (no network access needed)
 python videofentanylserver.py --model ./models/LTX2-Distilled-Diffusers
 
 # Custom resolution / port
 python videofentanylserver.py --port 9000 --height 720 --width 1280 --num-frames 65
 ```
 
-**Model weights** are downloaded automatically from HuggingFace on the first run and
-cached in the default HuggingFace cache directory (`~/.cache/huggingface/hub`).  To use
-a model you have already downloaded to a local directory, pass its path directly to
-`--model`:
+**Model weights** (~9 GB) are resolved in this priority order:
+
+1. **Local directory** (`--model ./path/to/model`) — loaded directly from disk, no network required.
+2. **HF model ID + custom dir** (`--model-dir ./models/…`) — downloads to that folder on first run, then loads from it on subsequent starts.
+3. **HF model ID only** (default) — downloaded and cached in `~/.cache/huggingface/hub` on first run.
+
+In all cases the model is always loaded from a local path before being passed to FastVideo, which avoids a registry identification warning that occurs when passing a raw HuggingFace repo ID directly.
 
 ```bash
-# Download the model once (requires huggingface_hub: pip install huggingface_hub)
-huggingface-cli download FastVideo/LTX2-Distilled-Diffusers --local-dir ./models/LTX2-Distilled-Diffusers
-
-# Then start the server pointing at the local folder
+# One-time download to a custom folder, then use it offline
+pip install huggingface_hub
+python videofentanylserver.py --model-dir ./models/LTX2-Distilled-Diffusers
+# On subsequent runs point directly at the folder:
 python videofentanylserver.py --model ./models/LTX2-Distilled-Diffusers
 ```
 
@@ -317,7 +322,8 @@ python videofentanyl.py --server ws://localhost:8765/ws \
 |---|---|---|
 | `--host` | `0.0.0.0` | Bind address. |
 | `--port` | `8765` | Port. |
-| `--model` | `FastVideo/LTX2-Distilled-Diffusers` | HuggingFace model ID **or** path to a local model directory (e.g. `./models/LTX2-Distilled-Diffusers`). |
+| `--model` | `FastVideo/LTX2-Distilled-Diffusers` | HuggingFace model ID **or** path to a local model directory. When a local path is given it is loaded directly (no network). |
+| `--model-dir` | _(HF cache)_ | Directory to download/cache the model into when `--model` is a HuggingFace ID. Ignored when `--model` is already a local path. |
 | `--num-gpus` | `1` | Device count. |
 | `--num-frames` | `97` | Frames to generate (`(8k+1)` required by LTX2: 9, 17, 25 … 97). |
 | `--height` | `480` | Output height in pixels. |
