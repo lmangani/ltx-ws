@@ -153,7 +153,11 @@ class LocalVideoGenerator:
     def load(self) -> None:
         """Load model weights.  Blocks until ready.  Call once at startup."""
         from fastvideo import VideoGenerator
-        log.info("Loading model %s …", self.model)
+        is_local = Path(self.model).exists()
+        if is_local:
+            log.info("Loading model from local path %s …", self.model)
+        else:
+            log.info("Downloading/loading model %s from HuggingFace …", self.model)
         self._generator = VideoGenerator.from_pretrained(
             self.model,
             num_gpus=self.num_gpus,
@@ -562,7 +566,12 @@ examples:
     mdl = p.add_argument_group("model")
     mdl.add_argument(
         "--model", default=DEFAULT_MODEL,
-        help=f"HuggingFace model ID (default: {DEFAULT_MODEL})",
+        help=(
+            f"HuggingFace model ID or path to a local model directory "
+            f"(default: {DEFAULT_MODEL}). "
+            f"Pass a local path (e.g. ./models/LTX2-Distilled-Diffusers) to skip "
+            f"the HuggingFace download and load weights directly from disk."
+        ),
     )
     mdl.add_argument(
         "--num-gpus", type=int, default=DEFAULT_NUM_GPUS, dest="num_gpus",
@@ -632,9 +641,11 @@ def main() -> None:
         args.num_frames = valid_frames
 
     # ── Banner ────────────────────────────────────────────────────────────────
+    _model_is_local = Path(args.model).exists()
+    _model_source   = f"local  ({args.model})" if _model_is_local else f"HuggingFace  ({args.model})"
     print(f"\n{'═' * 60}")
     print(f"  FastVideo Local Server  (videofentanylserver)")
-    print(f"  Model    : {args.model}")
+    print(f"  Model    : {_model_source}")
     print(f"  Device   : Apple MPS  (FASTVIDEO_ATTENTION_BACKEND="
           f"{os.environ.get('FASTVIDEO_ATTENTION_BACKEND')})")
     print(f"  Endpoint : ws://{args.host}:{args.port}/ws")

@@ -269,13 +269,28 @@ curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/videofenta
 
 ```bash
 # Default settings: ws://0.0.0.0:8765/ws
+# On first run the LTX2-Distilled weights (~9 GB) are downloaded from HuggingFace
 python videofentanylserver.py
+
+# Use a previously-downloaded local model folder (skips the HuggingFace download)
+python videofentanylserver.py --model ./models/LTX2-Distilled-Diffusers
 
 # Custom resolution / port
 python videofentanylserver.py --port 9000 --height 720 --width 1280 --num-frames 65
 ```
 
-The first run downloads the LTX2-Distilled weights (~9 GB) from HuggingFace.
+**Model weights** are downloaded automatically from HuggingFace on the first run and
+cached in the default HuggingFace cache directory (`~/.cache/huggingface/hub`).  To use
+a model you have already downloaded to a local directory, pass its path directly to
+`--model`:
+
+```bash
+# Download the model once (requires huggingface_hub or git-lfs)
+huggingface-cli download FastVideo/LTX2-Distilled-Diffusers --local-dir ./models/LTX2-Distilled-Diffusers
+
+# Then start the server pointing at the local folder
+python videofentanylserver.py --model ./models/LTX2-Distilled-Diffusers
+```
 
 #### Generate videos locally
 
@@ -302,7 +317,7 @@ python videofentanyl.py --server ws://localhost:8765/ws \
 |---|---|---|
 | `--host` | `0.0.0.0` | Bind address. |
 | `--port` | `8765` | Port. |
-| `--model` | `FastVideo/LTX2-Distilled-Diffusers` | HuggingFace model ID. |
+| `--model` | `FastVideo/LTX2-Distilled-Diffusers` | HuggingFace model ID **or** path to a local model directory (e.g. `./models/LTX2-Distilled-Diffusers`). |
 | `--num-gpus` | `1` | Device count. |
 | `--num-frames` | `97` | Frames to generate (`(8k+1)` required by LTX2: 9, 17, 25 … 97). |
 | `--height` | `480` | Output height in pixels. |
