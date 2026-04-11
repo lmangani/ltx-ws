@@ -146,6 +146,7 @@ python videofentanyl.py \
 | `--dry-run` | Show the job queue and exit without connecting. |
 | `--autocontinue` | Extract the last frame of each clip and feed it as the first frame of the next one. Ideal for seamless multi-clip runs in 1080p mode. |
 | `--autoconcat` | After the queue finishes, merge **successful** autocontinue clips with **ffmpeg** (`-c copy`), then **delete** the fragment files. **Requires `--autocontinue`.** If `ffmpeg` is not on your PATH, the tool logs details and leaves all fragments unchanged. |
+| `--server URL` | Override the WebSocket endpoint. Use `ws://localhost:8765/ws` to route all generation through a local `videofentanylserver.py` instance. |
 
 ---
 
@@ -234,6 +235,83 @@ ffmpeg -i input.mp4 -c copy fixed.mp4
 **Generation time**
 - *FastVideo 1080p*: typically 5–10 seconds per clip once a GPU is assigned.
 - *Dreamverse*: typically ~30 seconds per video (6 segments × ~5s each).
+
+---
+
+### Local Server (Apple MPS)
+
+`videofentanylserver.py` runs a fully local WebSocket server that implements the
+same protocol as `wss://1080p.fastvideo.org/ws`, using
+[FastVideo](https://github.com/hao-ai-lab/FastVideo)'s **LTX2-Distilled** model
+on **Apple Silicon (MPS)**.  No internet connection is needed for generation.
+
+#### Install FastVideo (Apple MPS)
+
+```bash
+# Create a Python 3.12 environment (uv recommended)
+uv venv --python 3.12 --seed
+source .venv/bin/activate
+
+# Install FastVideo
+uv pip install fastvideo
+
+# Install videofentanyl dependencies
+pip install websockets av Pillow
+```
+
+#### Download the server script
+
+```bash
+curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/videofentanylserver.py
+```
+
+#### Start the server
+
+```bash
+# Default settings: ws://0.0.0.0:8765/ws
+python videofentanylserver.py
+
+# Custom resolution / port
+python videofentanylserver.py --port 9000 --height 720 --width 1280 --num-frames 65
+```
+
+The first run downloads the LTX2-Distilled weights (~9 GB) from HuggingFace.
+
+#### Generate videos locally
+
+Use the `--server` flag to point the client at your local server:
+
+```bash
+# Text-to-video
+python videofentanyl.py --server ws://localhost:8765/ws \
+    --prompt "a fox running through a snowy forest"
+
+# Image-to-video
+python videofentanyl.py --server ws://localhost:8765/ws \
+    --prompt "the scene comes alive" --image photo.jpg
+
+# Multiple prompts, 3 videos each, with autocontinue
+python videofentanyl.py --server ws://localhost:8765/ws \
+    --prompt "coral reef" --prompt "arctic tundra" \
+    --count 3 --autocontinue --autoconcat
+```
+
+#### Server options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--host` | `0.0.0.0` | Bind address. |
+| `--port` | `8765` | Port. |
+| `--model` | `FastVideo/LTX2-Distilled-Diffusers` | HuggingFace model ID. |
+| `--num-gpus` | `1` | Device count. |
+| `--num-frames` | `97` | Frames to generate (`(4k+1)` required by LTX). |
+| `--height` | `480` | Output height in pixels. |
+| `--width` | `848` | Output width in pixels. |
+| `--fps` | `24` | Frames per second. |
+| `--guidance-scale` | `1.0` | CFG scale (LTX2-Distilled uses 1.0). |
+| `--attention-backend` | `TORCH_SDPA` | Attention backend: `TORCH_SDPA` (MPS/CPU) or `FLASH_ATTN` (CUDA). |
+| `--chunk-size` | `65536` | Binary chunk size in bytes. |
+| `--verbose` / `-v` | off | Per-connection protocol logging. |
 
 ---
 

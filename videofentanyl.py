@@ -146,10 +146,20 @@ MODES: dict[str, dict] = {
 }
 
 
+_SERVER_OVERRIDE: str | None = None   # set by --server flag
+
+
 def _ws_url(mode: str) -> str:
+    if _SERVER_OVERRIDE:
+        return _SERVER_OVERRIDE
     return f"wss://{MODES[mode]['host']}/ws"
 
 def _ws_headers(mode: str) -> dict:
+    if _SERVER_OVERRIDE:
+        from urllib.parse import urlparse
+        parsed = urlparse(_SERVER_OVERRIDE)
+        origin = f"{parsed.scheme.replace('ws', 'http')}://{parsed.netloc}"
+        return {"Origin": origin, "User-Agent": USER_AGENT}
     return {"Origin": f"https://{MODES[mode]['host']}", "User-Agent": USER_AGENT}
 
 
@@ -1227,11 +1237,21 @@ examples:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    p.add_argument(
+        "--server",
+        default=None, metavar="URL",
+        help="override WebSocket endpoint (e.g. ws://localhost:8765/ws); "
+             "use with videofentanylserver.py for fully local generation",
+    )
 
     return p
 
 
 async def async_main(args: argparse.Namespace):
+    global _SERVER_OVERRIDE
+    if args.server:
+        _SERVER_OVERRIDE = args.server
+
     mode    = args.mode
     cfg     = MODES[mode]
 
