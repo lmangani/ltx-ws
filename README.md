@@ -285,7 +285,7 @@ a model you have already downloaded to a local directory, pass its path directly
 `--model`:
 
 ```bash
-# Download the model once (requires huggingface_hub or git-lfs)
+# Download the model once (requires huggingface_hub: pip install huggingface_hub)
 huggingface-cli download FastVideo/LTX2-Distilled-Diffusers --local-dir ./models/LTX2-Distilled-Diffusers
 
 # Then start the server pointing at the local folder
