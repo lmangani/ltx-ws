@@ -19,7 +19,8 @@ Does the full sequence that upstream docs omit:
   6. Patch LTX-2 image-to-video: ``ltx2_pipeline.py`` passes ``vae=`` into latent preparation (never
      ``pipeline=``, so workers that import an older ``LTX2LatentPreparationStage`` from site-packages
      still start); ``ltx2_latent_preparation.py`` VAE-encodes ``image_path`` / ``pil_image`` into the
-     first latent slice when sampling random latents; ``ltx2_denoising.py`` pins that slice each step.
+     first latent slice when sampling random latents; ``ltx2_denoising.py`` pins that slice each step
+     and sets per-token timestep 0 on first-frame tokens (same idea as Lightricks / training conditioning).
   7. Run ``uv pip install -e`` (or ``python -m pip`` if uv is missing).
 
 Run from the videofentanyl repo root (recommended):
@@ -1004,6 +1005,57 @@ LTX2_I2V_VELOCITY_OLD_COMPACT = '            sigma_value = sigma.to(torch.float3
 
 LTX2_I2V_VELOCITY_NEW = '            sigma_value = sigma.to(torch.float32) if isinstance(sigma, torch.Tensor) else torch.tensor(\n                float(sigma),\n                device=latents.device,\n                dtype=torch.float32,\n            )\n            dt = sigma_next - sigma\n            anchor = batch.extra.get("ltx2_i2v_anchor_latents")\n            if anchor is not None and latents.shape[2] > 1:\n                lat_t = latents[:, :, 1:]\n                pred_t = pos_denoised[:, :, 1:]\n                velocity = ((lat_t.float() - pred_t.float()) / sigma_value).to(latents.dtype)\n                latents = latents.clone()\n                latents[:, :, 1:] = (lat_t.float() + velocity.float() * dt).to(latents.dtype)\n                latents[:, :, :1] = anchor.to(device=latents.device, dtype=latents.dtype)\n            else:\n                velocity = ((latents.float() - pos_denoised.float()) / sigma_value).to(latents.dtype)\n                latents = (latents.float() + velocity.float() * dt).to(latents.dtype)\n            if pos_audio is not None and audio_latents is not None:'
 
+# LTX2 i2v: per-token timestep 0 on first latent frame (``LTX2TrainingPipeline._prepare_dit_inputs``).
+LTX2_I2V_TRAINING_TIMESTEP_MARKER = "[LTX2] image-to-video: timestep=0 on first-frame tokens"
+
+LTX2_I2V_TRAINING_TIMESTEP_PRE_OLD = """        timestep_template = torch.ones(
+            (latents.shape[0], token_count),
+            device=latents.device,
+            dtype=torch.float32,
+        )
+        audio_prompt_embeds = batch.extra.get("ltx2_audio_prompt_embeds")"""
+
+LTX2_I2V_TRAINING_TIMESTEP_PRE_NEW = """        timestep_template = torch.ones(
+            (latents.shape[0], token_count),
+            device=latents.device,
+            dtype=torch.float32,
+        )
+        # Image-to-video (first latent temporal slice): match ``LTX2TrainingPipeline``
+        # ``_prepare_dit_inputs`` — conditioned spatial tokens use timestep 0 while the
+        # rest follow ``sigma`` (see ``timesteps = torch.where(mask_patch, 0, sigmas…)``).
+        n_i2v_zero_timestep_tokens = 0
+        if batch.extra.get("ltx2_i2v_anchor_latents") is not None and hasattr(self.transformer, "patchifier"):
+            _, _, _f_lat, h_lat, w_lat = latents.shape
+            _pt = self.transformer.patchifier.patch_size
+            _p1, p_h, p_w = int(_pt[0]), int(_pt[1]), int(_pt[2])
+            if _p1 != 1:
+                logger.warning(
+                    "[LTX2] i2v first-frame timestep mask expects temporal patch size 1; got %s",
+                    _pt,
+                )
+            gh = int(h_lat) // p_h
+            gw = int(w_lat) // p_w
+            n_i2v_zero_timestep_tokens = min(gh * gw, int(token_count))
+            logger.info(
+                "[LTX2] image-to-video: timestep=0 on first-frame tokens (%d of %d) "
+                "(training first-frame conditioning)",
+                n_i2v_zero_timestep_tokens,
+                token_count,
+            )
+        audio_prompt_embeds = batch.extra.get("ltx2_audio_prompt_embeds")"""
+
+LTX2_I2V_TRAINING_TIMESTEP_LOOP_OLD = """            timestep = timestep_template * sigma
+            audio_timestep = (audio_timestep_template * sigma if audio_timestep_template is not None else None)"""
+
+LTX2_I2V_TRAINING_TIMESTEP_LOOP_NEW = """            _i2v_anchor = batch.extra.get("ltx2_i2v_anchor_latents")
+            if _i2v_anchor is not None and latents.shape[2] > 1:
+                latents[:, :, :1] = _i2v_anchor.to(device=latents.device, dtype=latents.dtype)
+            timestep = timestep_template * sigma
+            if n_i2v_zero_timestep_tokens > 0:
+                timestep = timestep.clone()
+                timestep[:, :n_i2v_zero_timestep_tokens] = 0.0
+            audio_timestep = (audio_timestep_template * sigma if audio_timestep_template is not None else None)"""
+
 # Older i2v latent prep ``__init__`` / ``_resolve_vae`` variants → normalize to current target.
 LTX2_LATENT_I2V_INIT_WITH_PIPELINE_OLD = (
     "    def __init__(self, transformer, vae: Any | None = None, pipeline: Any | None = None) -> None:\n"
@@ -1222,6 +1274,37 @@ def patch_ltx2_denoising_i2v_anchor(denoising_py: Path) -> int:
     print(f"Patched {denoising_py} (LTX2 i2v denoise anchor)")
     return 0
 
+
+def patch_ltx2_denoising_i2v_training_timesteps(denoising_py: Path) -> int:
+    """Match ``LTX2TrainingPipeline`` first-frame conditioning: timestep 0 on first-frame tokens."""
+    if not denoising_py.is_file():
+        print(f"Warning: {denoising_py} not found — skip LTX2 i2v timestep patch", file=sys.stderr)
+        return 0
+    text = denoising_py.read_text(encoding="utf-8")
+    if LTX2_I2V_TRAINING_TIMESTEP_MARKER in text:
+        print(f"Already patched: {denoising_py} (LTX2 i2v training timesteps)")
+        return 0
+    if LTX2_I2V_TRAINING_TIMESTEP_PRE_OLD not in text:
+        print(
+            f"Warning: expected timestep_template block not found in {denoising_py} — "
+            "skip LTX2 i2v timestep patch",
+            file=sys.stderr,
+        )
+        return 0
+    text = text.replace(LTX2_I2V_TRAINING_TIMESTEP_PRE_OLD, LTX2_I2V_TRAINING_TIMESTEP_PRE_NEW, 1)
+    if LTX2_I2V_TRAINING_TIMESTEP_LOOP_OLD not in text:
+        print(
+            f"Warning: expected denoise loop timestep line not found in {denoising_py} — "
+            "skip LTX2 i2v timestep patch (partial edit?)",
+            file=sys.stderr,
+        )
+        return 0
+    text = text.replace(LTX2_I2V_TRAINING_TIMESTEP_LOOP_OLD, LTX2_I2V_TRAINING_TIMESTEP_LOOP_NEW, 1)
+    denoising_py.write_text(text, encoding="utf-8")
+    print(f"Patched {denoising_py} (LTX2 i2v training timesteps)")
+    return 0
+
+
 def run(cmd: list[str], *, cwd: Path | None = None) -> None:
     print("+", " ".join(cmd), flush=True)
     subprocess.check_call(cmd, cwd=str(cwd) if cwd else None)
@@ -1342,6 +1425,7 @@ def main() -> int:
         patch_ltx2_pipeline_latent_i2v(ltx2_pipeline_py)
         patch_ltx2_latent_preparation_i2v(latent_prep_py)
         patch_ltx2_denoising_i2v_anchor(denoising_py)
+        patch_ltx2_denoising_i2v_training_timesteps(denoising_py)
     else:
         print("Skipping FastVideo source patches (--no-patch).")
 
