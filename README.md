@@ -252,11 +252,16 @@ on **Apple Silicon (MPS)**.  No internet connection is needed for generation.
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-# Install FastVideo
-uv pip install fastvideo
+# Install FastVideo from source (required for LTX2 support)
+git clone https://github.com/hao-ai-lab/FastVideo.git
+cd FastVideo
+uv pip install -e .
+
+# Optional: install flash-attn (CUDA only; skip on Apple MPS)
+# uv pip install flash-attn --no-build-isolation -v
 
 # Install videofentanyl dependencies
-pip install websockets av Pillow
+uv pip install websockets av Pillow
 ```
 
 #### Download the server script

@@ -189,11 +189,11 @@ class LocalVideoGenerator:
                     installed_ver = "not installed"
                 raise RuntimeError(
                     f"The installed FastVideo ({installed_ver}) does not "
-                    "support the LTX2 model family.  Please upgrade to the "
-                    "latest version:\n\n"
-                    "  pip install --upgrade fastvideo\n\n"
-                    "or install from source:\n\n"
-                    "  pip install git+https://github.com/hao-ai-lab/FastVideo.git\n"
+                    "support the LTX2 model family.  Please install FastVideo "
+                    "from source:\n\n"
+                    "  git clone https://github.com/hao-ai-lab/FastVideo.git\n"
+                    "  cd FastVideo\n"
+                    "  uv pip install -e .\n"
                 ) from None
 
         self._generator = VideoGenerator.from_pretrained(
