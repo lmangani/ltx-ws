@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""
+Install FastVideo for videofentanyl (especially Apple Silicon / MPS).
+
+Does the full sequence that upstream docs omit:
+  1. Initialize the FastVideo git submodule (this repo layout).
+  2. Patch pyproject.toml so ``fastvideo-kernel`` (Triton / Linux CUDA wheels only)
+     is not required on macOS — MPS uses Torch SDPA and does not need it.
+  3. Run ``uv pip install -e`` (or ``python -m pip`` if uv is missing).
+
+Run from the videofentanyl repo root (recommended):
+
+  ./scripts/fastvideo_install
+  python scripts/fastvideo_install
+
+Standalone clone (skip submodule step):
+
+  python scripts/fastvideo_install --path ~/src/FastVideo
+
+Re-run is safe: submodule update and pyproject patch are idempotent.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+MARKER = "platform_system == 'Linux' and platform_machine == 'x86_64'"
+KERNEL_DEP_RE = re.compile(
+    r'^(\s*")fastvideo-kernel==([^"]+)(")\s*,?\s*$',
+    re.MULTILINE,
+)
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def patch_pyproject(pyproject: Path) -> int:
+    """Return 0 on success (including already patched), 1 on error."""
+    text = pyproject.read_text(encoding="utf-8")
+
+    def repl(m: re.Match[str]) -> str:
+        return (
+            f'{m.group(1)}fastvideo-kernel=={m.group(2)}; {MARKER}{m.group(3)},'
+        )
+
+    if "fastvideo-kernel==" not in text:
+        print(
+            f"Error: no fastvideo-kernel dependency in {pyproject} "
+            "(unexpected FastVideo layout).",
+            file=sys.stderr,
+        )
+        return 1
+
+    for line in text.splitlines():
+        if "fastvideo-kernel==" in line and "platform_system" in line:
+            print(f"Already patched: {pyproject}")
+            return 0
+
+    new_text, n = KERNEL_DEP_RE.subn(repl, text, count=1)
+    if n != 1:
+        print(
+            f"Error: could not patch fastvideo-kernel line in {pyproject}",
+            file=sys.stderr,
+        )
+        return 1
+
+    pyproject.write_text(new_text, encoding="utf-8")
+    print(f"Patched {pyproject}")
+    return 0
+
+
+def run(cmd: list[str], *, cwd: Path | None = None) -> None:
+    print("+", " ".join(cmd), flush=True)
+    subprocess.check_call(cmd, cwd=str(cwd) if cwd else None)
+
+
+def main() -> int:
+    root = repo_root()
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--path",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="FastVideo tree (default: third_party/FastVideo under this repo)",
+    )
+    p.add_argument(
+        "--no-submodule",
+        action="store_true",
+        help="Do not run git submodule update (use with --path or after manual init)",
+    )
+    p.add_argument(
+        "--no-install",
+        action="store_true",
+        help="Only submodule + patch; skip pip install",
+    )
+    p.add_argument(
+        "--no-patch",
+        action="store_true",
+        help="Skip pyproject patch (not recommended on macOS)",
+    )
+    args = p.parse_args()
+
+    fv = (args.path or (root / "third_party" / "FastVideo")).resolve()
+    use_submodule = args.path is None and not args.no_submodule
+
+    if use_submodule:
+        gitmodules = root / ".gitmodules"
+        if not gitmodules.is_file():
+            print(
+                "Error: no third_party/FastVideo submodule (.gitmodules missing).\n"
+                "  git submodule add https://github.com/hao-ai-lab/FastVideo.git "
+                "third_party/FastVideo",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--recursive",
+                    "third_party/FastVideo",
+                ]
+            )
+        except subprocess.CalledProcessError:
+            print("Error: git submodule update failed.", file=sys.stderr)
+            return 1
+
+    if not fv.is_dir():
+        print(f"Error: FastVideo directory not found: {fv}", file=sys.stderr)
+        return 1
+
+    pyproject = fv / "pyproject.toml"
+    if not pyproject.is_file():
+        print(f"Error: missing {pyproject}", file=sys.stderr)
+        return 1
+
+    if not args.no_patch:
+        if patch_pyproject(pyproject) != 0:
+            return 1
+    else:
+        print("Skipping pyproject patch (--no-patch).")
+
+    if args.no_install:
+        print("Skipping install (--no-install). Done.")
+        return 0
+
+    if shutil.which("uv"):
+        run(["uv", "pip", "install", "-e", str(fv)], cwd=root)
+    else:
+        print("Note: uv not found; using python -m pip", file=sys.stderr)
+        run([sys.executable, "-m", "pip", "install", "-e", str(fv)], cwd=root)
+
+    print("FastVideo install finished.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

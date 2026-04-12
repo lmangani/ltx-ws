@@ -207,27 +207,22 @@ class LocalVideoGenerator:
                     installed_ver = getattr(_fv, "__version__", "unknown")
                 except ImportError:
                     installed_ver = "not installed"
-                _patch = Path(__file__).resolve().parent / (
-                    "scripts/patch_fastvideo_pyproject_for_apple_silicon.py"
+                _installer = Path(__file__).resolve().parent / "scripts" / "fastvideo_install"
+                _install_hint = (
+                    f"  python {_installer}\n"
+                    "     (initializes submodule, applies macOS Triton workaround, "
+                    "installs editable)\n"
+                    "  # Standalone clone at DIR after git pull:\n"
+                    f"  python {_installer} --no-submodule --path DIR\n\n"
                 )
-                _patch_hint = f"  python {_patch}\n"
                 raise RuntimeError(
                     f"Failed to load LTX2T2VConfig from the installed FastVideo "
                     f"({installed_ver}).  See the ImportError logged above for "
                     "the root cause.\n\n"
                     "The installed FastVideo is likely too old and does not yet "
-                    "include LTX2 support.  To update:\n\n"
-                    "  cd /path/to/FastVideo   # e.g. third_party/FastVideo submodule\n"
-                    "  git pull\n"
-                    "  # On Apple Silicon: patch pyproject first (Triton / fastvideo-kernel).\n"
-                    f"{_patch_hint}"
-                    "  uv pip install -e .\n\n"
-                    "If you have not yet cloned FastVideo from source, run:\n\n"
-                    "  git clone https://github.com/hao-ai-lab/FastVideo.git\n"
-                    "  # or:  git submodule update --init third_party/FastVideo\n"
-                    f"{_patch_hint}"
-                    "  cd FastVideo   # or third_party/FastVideo\n"
-                    "  uv pip install -e .\n\n"
+                    "include LTX2 support.  Reinstall from a fresh checkout using "
+                    "the helper script from this repo:\n\n"
+                    f"{_install_hint}"
                     "To confirm the correct version is active afterwards:\n\n"
                     "  python -c \"import fastvideo; print(fastvideo.__version__)\"\n"
                     "  python -c \"from fastvideo.configs.pipelines.ltx2 import "
