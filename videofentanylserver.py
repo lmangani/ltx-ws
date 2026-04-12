@@ -171,39 +171,60 @@ class LocalVideoGenerator:
         extra_kwargs: dict = {}
         _model_lower = (self.model or local_path).lower()
         if "ltx2" in _model_lower or "ltx-2" in _model_lower:
+            _ltx2_config_cls = None
+            _ltx2_import_err: ImportError | None = None
+
+            # Try the direct submodule path first (FastVideo ≥ LTX2 era).
             try:
-                from fastvideo.configs.pipelines.ltx2 import LTX2T2VConfig
-                extra_kwargs["pipeline_config"] = LTX2T2VConfig()
+                from fastvideo.configs.pipelines.ltx2 import LTX2T2VConfig as _LTX2T2VConfig
+                _ltx2_config_cls = _LTX2T2VConfig
+            except ImportError as _err:
+                _ltx2_import_err = _err
+                # Fall back to the package __init__ re-export in case the
+                # symbol is available there even though the direct path failed.
+                try:
+                    from fastvideo.configs.pipelines import LTX2T2VConfig as _LTX2T2VConfig2
+                    _ltx2_config_cls = _LTX2T2VConfig2
+                except ImportError:
+                    pass  # both paths failed; handled below
+
+            if _ltx2_config_cls is not None:
+                extra_kwargs["pipeline_config"] = _ltx2_config_cls()
                 log.info(
                     "Providing explicit LTX2T2VConfig to guard against "
                     "missing registry entry in installed FastVideo version."
                 )
-            except ImportError as _ltx2_err:
-                # LTX2T2VConfig is absent or one of its transitive deps failed
-                # to import (common on macOS/MPS where CUDA-specific packages
-                # are absent).  Log the real cause first so the user can see
-                # exactly what's missing, then raise with context.
+            else:
+                # Neither import path worked.  Log the root cause so the user
+                # can see exactly which module is missing, then abort with
+                # clear upgrade instructions.
                 log.warning(
-                    "Could not import LTX2T2VConfig: %s", _ltx2_err,
-                    exc_info=True,
+                    "Could not import LTX2T2VConfig: %s", _ltx2_import_err,
+                    exc_info=_ltx2_import_err,
                 )
                 try:
-                    import fastvideo
-                    installed_ver = getattr(fastvideo, "__version__", "unknown")
+                    import fastvideo as _fv
+                    installed_ver = getattr(_fv, "__version__", "unknown")
                 except ImportError:
                     installed_ver = "not installed"
                 raise RuntimeError(
                     f"Failed to load LTX2T2VConfig from the installed FastVideo "
-                    f"({installed_ver}).  See the ImportError above for the "
-                    "root cause.\n\n"
-                    "If FastVideo is not yet installed from source, run:\n\n"
+                    f"({installed_ver}).  See the ImportError logged above for "
+                    "the root cause.\n\n"
+                    "The installed FastVideo is likely too old and does not yet "
+                    "include LTX2 support.  To update:\n\n"
+                    "  cd /path/to/FastVideo   # your FastVideo clone\n"
+                    "  git pull\n"
+                    "  uv pip install -e .\n\n"
+                    "If you have not yet cloned FastVideo from source, run:\n\n"
                     "  git clone https://github.com/hao-ai-lab/FastVideo.git\n"
                     "  cd FastVideo\n"
                     "  uv pip install -e .\n\n"
-                    "If it is already installed from source, verify that the "
-                    "correct virtual environment is active and that all "
-                    "dependencies installed without errors."
-                ) from _ltx2_err
+                    "To confirm the correct version is active afterwards:\n\n"
+                    "  python -c \"import fastvideo; print(fastvideo.__version__)\"\n"
+                    "  python -c \"from fastvideo.configs.pipelines.ltx2 import "
+                    "LTX2T2VConfig; print('OK')\""
+                ) from _ltx2_import_err
 
         self._generator = VideoGenerator.from_pretrained(
             local_path,
