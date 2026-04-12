@@ -210,7 +210,6 @@ def patch_decoding_mps_ipc(decoding_py: Path) -> int:
 # --- multiproc_executor.py: sanitize tensors before pipe.send ----------------------------
 
 MULTIPROC_IPC_MARKER = "_tensor_for_worker_ipc_send"
-MULTIPROC_DEEP_MARKER = "_deep_ipc_safe"
 
 MULTIPROC_SHALLOW_SANITIZE = """def _sanitize_worker_ipc_tensors(
     output_tensor: Any,
@@ -229,15 +228,22 @@ MULTIPROC_SHALLOW_SANITIZE = """def _sanitize_worker_ipc_tensors(
 """
 
 MULTIPROC_DEEP_SANITIZE = """def _deep_ipc_safe(obj: Any) -> Any:
-    \"\"\"Move every ``torch.Tensor`` (nested dict/list/tuple) to CPU for pickling.\"\"\"
+    \"\"\"Move every ``torch.Tensor`` to CPU for pickling (nested Mapping/list/tuple/dataclass).\"\"\"
     if isinstance(obj, torch.Tensor):
         return _tensor_for_worker_ipc_send(obj)
-    if isinstance(obj, dict):
+    if isinstance(obj, Mapping):
         return {k: _deep_ipc_safe(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_deep_ipc_safe(v) for v in obj]
     if isinstance(obj, tuple):
         return tuple(_deep_ipc_safe(v) for v in obj)
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return _deep_ipc_safe(asdict(obj))
+    stages = getattr(obj, "stages", None)
+    if stages is not None and isinstance(stages, Mapping) and type(obj).__name__ == "PipelineLoggingInfo":
+        fresh = type(obj)()
+        fresh.stages = _deep_ipc_safe(stages)
+        return fresh
     return obj
 
 
@@ -250,6 +256,43 @@ def _sanitize_worker_ipc_tensors(
     if not isinstance(ex, dict):
         ex = dict(extra or {})
     return out, ex
+
+"""
+
+MULTIPROC_SANITIZE_DEEP_ONLY = "def _sanitize_worker_ipc_tensors" + MULTIPROC_DEEP_SANITIZE.split(
+    "def _sanitize_worker_ipc_tensors",
+    1,
+)[1]
+
+# Older videofentanyl installs: dict-only ``_deep_ipc_safe`` (OrderedDict is a dict subclass,
+# but ``PipelineLoggingInfo`` / nested metrics need Mapping + explicit logging wrapper).
+MULTIPROC_DEEP_FN_LEGACY_A = """def _deep_ipc_safe(obj: Any) -> Any:
+    \"\"\"Move every ``torch.Tensor`` (nested dict/list/tuple) to CPU for pickling.\"\"\"
+    if isinstance(obj, torch.Tensor):
+        return _tensor_for_worker_ipc_send(obj)
+    if isinstance(obj, dict):
+        return {k: _deep_ipc_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deep_ipc_safe(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_deep_ipc_safe(v) for v in obj)
+    return obj
+
+
+"""
+
+MULTIPROC_DEEP_FN_LEGACY_B = """def _deep_ipc_safe(obj: Any) -> Any:
+    \"\"\"Move every ``torch.Tensor`` (including nested dict/list/tuple) to CPU for pickling.\"\"\"
+    if isinstance(obj, torch.Tensor):
+        return _tensor_for_worker_ipc_send(obj)
+    if isinstance(obj, dict):
+        return {k: _deep_ipc_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deep_ipc_safe(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_deep_ipc_safe(v) for v in obj)
+    return obj
+
 
 """
 
@@ -277,7 +320,8 @@ MULTIPROC_SEND_OLD = """                        result = output_batch.output
                             "extra": extra,
                         })"""
 
-MULTIPROC_SEND_NEW = """                        result = output_batch.output
+# Patched send without wrapping ``logging_info`` (fails if stage metrics hold tensors).
+MULTIPROC_SEND_BARE = """                        result = output_batch.output
                         extra = dict(output_batch.extra or {})
                         extra["peak_memory_mb"] = (torch.cuda.max_memory_allocated() / (1024 * 1024))
                         result, extra = _sanitize_worker_ipc_tensors(result, extra)
@@ -287,6 +331,35 @@ MULTIPROC_SEND_NEW = """                        result = output_batch.output
                             "extra": extra,
                         })"""
 
+MULTIPROC_SEND_WRAPPED = """                        result = output_batch.output
+                        extra = dict(output_batch.extra or {})
+                        extra["peak_memory_mb"] = (torch.cuda.max_memory_allocated() / (1024 * 1024))
+                        result, extra = _sanitize_worker_ipc_tensors(result, extra)
+                        self.pipe.send(
+                            _deep_ipc_safe({
+                                "output_batch": result,
+                                "logging_info": logging_info,
+                                "extra": extra,
+                            }),
+                        )"""
+
+
+def _multiproc_ensure_ipc_imports(text: str) -> str:
+    """Ensure ``Mapping`` / ``asdict`` / ``is_dataclass`` are importable for ``_deep_ipc_safe``."""
+    if "Callable, Mapping" not in text and "from collections.abc import Callable\n" in text:
+        text = text.replace(
+            "from collections.abc import Callable\n",
+            "from collections.abc import Callable, Mapping\n",
+            1,
+        )
+    if "asdict, dataclass, is_dataclass" not in text and "from dataclasses import dataclass\n" in text:
+        text = text.replace(
+            "from dataclasses import dataclass\n",
+            "from dataclasses import asdict, dataclass, is_dataclass\n",
+            1,
+        )
+    return text
+
 
 def patch_multiproc_executor_mps_ipc(multiproc_py: Path) -> int:
     """Sanitize worker RPC payloads so MPS tensors are not pickled on pipes."""
@@ -294,21 +367,41 @@ def patch_multiproc_executor_mps_ipc(multiproc_py: Path) -> int:
         print(f"Warning: {multiproc_py} not found — skip multiproc IPC patch", file=sys.stderr)
         return 0
     text = multiproc_py.read_text(encoding="utf-8")
-    if MULTIPROC_DEEP_MARKER in text:
-        print(f"Already patched: {multiproc_py} (deep worker IPC tensor sanitize)")
-        return 0
-    if MULTIPROC_IPC_MARKER in text and MULTIPROC_SHALLOW_SANITIZE in text:
-        text = text.replace(MULTIPROC_SHALLOW_SANITIZE, MULTIPROC_DEEP_SANITIZE, 1)
+    orig = text
+
+    if MULTIPROC_SHALLOW_SANITIZE in text:
+        text = text.replace(MULTIPROC_SHALLOW_SANITIZE, MULTIPROC_SANITIZE_DEEP_ONLY, 1)
+        text = _multiproc_ensure_ipc_imports(text)
+
+    for legacy in (MULTIPROC_DEEP_FN_LEGACY_A, MULTIPROC_DEEP_FN_LEGACY_B):
+        if legacy in text:
+            text = text.replace(legacy, MULTIPROC_DEEP_SANITIZE.split("def _sanitize_worker_ipc_tensors", 1)[0], 1)
+            text = _multiproc_ensure_ipc_imports(text)
+            break
+
+    if MULTIPROC_SEND_BARE in text:
+        text = text.replace(MULTIPROC_SEND_BARE, MULTIPROC_SEND_WRAPPED, 1)
+
+    if text != orig:
         multiproc_py.write_text(text, encoding="utf-8")
-        print(f"Upgraded {multiproc_py} (shallow → deep IPC tensor sanitize)")
+        print(f"Upgraded {multiproc_py} (MPS worker IPC)")
         return 0
+
     if MULTIPROC_IPC_MARKER in text:
+        if (
+            "isinstance(obj, Mapping)" in text
+            and "_deep_ipc_safe({" in text
+            and MULTIPROC_SHALLOW_SANITIZE not in text
+        ):
+            print(f"Already patched: {multiproc_py} (MPS worker IPC)")
+            return 0
         print(
-            f"Warning: {multiproc_py} has IPC helpers but not the expected shallow block — "
-            "skip multiproc IPC patch",
+            f"Warning: {multiproc_py} has partial IPC helpers — expected Mapping-based "
+            "`_deep_ipc_safe` and wrapped `pipe.send`; skip further multiproc IPC patch",
             file=sys.stderr,
         )
         return 0
+
     if MULTIPROC_SEND_OLD not in text:
         print(
             f"Warning: expected execute_forward pipe.send block not found in {multiproc_py} — "
@@ -316,17 +409,31 @@ def patch_multiproc_executor_mps_ipc(multiproc_py: Path) -> int:
             file=sys.stderr,
         )
         return 0
-    anchor = "logger = init_logger(__name__)\n\n\ndef _make_queue_log_handler"
-    insert = "logger = init_logger(__name__)\n" + MULTIPROC_HELPERS + "def _make_queue_log_handler"
-    if anchor not in text:
+
+    anchors_inserts = (
+        (
+            "logger = init_logger(__name__)\n\n\ndef _make_queue_log_handler",
+            "logger = init_logger(__name__)\n\n\n" + MULTIPROC_HELPERS + "def _make_queue_log_handler",
+        ),
+        (
+            "logger = init_logger(__name__)\n\ndef _make_queue_log_handler",
+            "logger = init_logger(__name__)\n\n" + MULTIPROC_HELPERS + "def _make_queue_log_handler",
+        ),
+    )
+    for anchor, insert in anchors_inserts:
+        if anchor in text:
+            text = text.replace(anchor, insert, 1)
+            break
+    else:
         print(
             f"Warning: could not find logger anchor before _make_queue_log_handler in {multiproc_py} — "
             "skip multiproc IPC patch",
             file=sys.stderr,
         )
         return 0
-    text = text.replace(anchor, insert, 1)
-    text = text.replace(MULTIPROC_SEND_OLD, MULTIPROC_SEND_NEW, 1)
+
+    text = text.replace(MULTIPROC_SEND_OLD, MULTIPROC_SEND_WRAPPED, 1)
+    text = _multiproc_ensure_ipc_imports(text)
     multiproc_py.write_text(text, encoding="utf-8")
     print(f"Patched {multiproc_py} (MPS-safe worker IPC)")
     return 0
