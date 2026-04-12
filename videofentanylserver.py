@@ -92,10 +92,13 @@ websockets = _ensure("websockets")
 
 def _prepend_repo_fastvideo_to_sys_path() -> None:
     """
-    Prefer this repo's ``third_party/FastVideo`` on ``sys.path`` (and ``PYTHONPATH``) so the
-    parent process and multiprocessing **spawn** children import a single patched tree.
-    Without this, ``ltx2_pipeline`` can load from the submodule while ``LTX2LatentPreparationStage``
-    still comes from another editable / site-packages ``fastvideo`` checkout.
+    Prefer this repo's ``third_party/FastVideo`` on ``sys.path`` (and ``PYTHONPATH``).
+
+    Multiprocessing **spawn** workers do not import this module first; they may resolve
+    ``fastvideo`` from a venv while pipeline sources live under this repo. Prepended
+    ``PYTHONPATH`` improves (but does not guarantee) a single tree; patched
+    ``ltx2_pipeline`` therefore must not pass ctor kwargs that only exist in a submodule
+    copy of ``LTX2LatentPreparationStage`` (see ``scripts/fastvideo_install``).
     """
     root = Path(__file__).resolve().parent
     fv = root / "third_party" / "FastVideo"

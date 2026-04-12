@@ -15,8 +15,9 @@ Does the full sequence that upstream docs omit:
      sent over multiprocessing pipes).
   5. Patch ``multiproc_executor.py``: sanitize tensors in ``execute_forward`` replies
      before ``pipe.send`` (belt-and-suspenders for MPS IPC).
-  6. Patch LTX-2 image-to-video: ``ltx2_pipeline.py`` passes ``vae=`` and ``pipeline=`` into latent
-     preparation; ``ltx2_latent_preparation.py`` VAE-encodes ``image_path`` / ``pil_image`` into the
+  6. Patch LTX-2 image-to-video: ``ltx2_pipeline.py`` passes ``vae=`` into latent preparation (never
+     ``pipeline=``, so workers that import an older ``LTX2LatentPreparationStage`` from site-packages
+     still start); ``ltx2_latent_preparation.py`` VAE-encodes ``image_path`` / ``pil_image`` into the
      first latent slice when sampling random latents; ``ltx2_denoising.py`` pins that slice each step.
   7. Run ``uv pip install -e`` (or ``python -m pip`` if uv is missing).
 
@@ -615,9 +616,11 @@ LTX2_LATENT_I2V_IMPORTS_NEW = 'from __future__ import annotations\n\nfrom pathli
 
 LTX2_PIPELINE_LATENT_STAGE_OLD = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(transformer=self.get_module("transformer"), ),\n        )'
 
-LTX2_PIPELINE_LATENT_STAGE_VAE_ONLY = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(\n                transformer=self.get_module("transformer"),\n                vae=self.get_module("vae"),\n            ),\n        )'
+LTX2_PIPELINE_LATENT_STAGE_NEW = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(\n                transformer=self.get_module("transformer"),\n                vae=self.get_module("vae"),\n            ),\n        )'
 
-LTX2_PIPELINE_LATENT_STAGE_NEW = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(\n                transformer=self.get_module("transformer"),\n                vae=self.get_module("vae"),\n                pipeline=self,\n            ),\n        )'
+# Older videofentanyl patches passed ``pipeline=self``; workers can import latent prep from another
+# ``fastvideo`` install that does not accept that kwarg — strip it back to ``vae=`` only.
+LTX2_PIPELINE_LATENT_STAGE_WITH_PIPELINE = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(\n                transformer=self.get_module("transformer"),\n                vae=self.get_module("vae"),\n                pipeline=self,\n            ),\n        )'
 
 
 LTX2_LATENT_I2V_BODY_OLD = "".join((
@@ -1059,30 +1062,30 @@ LTX2_LATENT_I2V_RELOAD_GAP_NEW = (
 
 
 def patch_ltx2_pipeline_latent_i2v(ltx2_pipeline_py: Path) -> int:
-    """Wire VAE + optional ``pipeline=`` into ``LTX2LatentPreparationStage`` for image-to-video (idempotent)."""
+    """Wire ``vae=`` into ``LTX2LatentPreparationStage`` only (no ``pipeline=``; idempotent)."""
     if not ltx2_pipeline_py.is_file():
         print(f"Warning: {ltx2_pipeline_py} not found — skip LTX2 pipeline i2v patch", file=sys.stderr)
         return 0
     text = ltx2_pipeline_py.read_text(encoding="utf-8")
     if LTX2_PIPELINE_LATENT_STAGE_NEW in text:
-        print(f"Already patched: {ltx2_pipeline_py} (LTX2 latent stage VAE + pipeline)")
+        print(f"Already patched: {ltx2_pipeline_py} (LTX2 latent stage VAE, no pipeline=)")
         return 0
-    if LTX2_PIPELINE_LATENT_STAGE_VAE_ONLY in text:
+    if LTX2_PIPELINE_LATENT_STAGE_WITH_PIPELINE in text:
         ltx2_pipeline_py.write_text(
-            text.replace(LTX2_PIPELINE_LATENT_STAGE_VAE_ONLY, LTX2_PIPELINE_LATENT_STAGE_NEW, 1),
+            text.replace(LTX2_PIPELINE_LATENT_STAGE_WITH_PIPELINE, LTX2_PIPELINE_LATENT_STAGE_NEW, 1),
             encoding="utf-8",
         )
-        print(f"Patched {ltx2_pipeline_py} (LTX2 latent prep: added pipeline=self after vae=)")
+        print(f"Migrated {ltx2_pipeline_py} (removed pipeline= from LTX2LatentPreparationStage ctor)")
         return 0
-    m = re.search(
-        r'(stage_name="latent_preparation_stage"[\s\S]{0,450}?)'
-        r'(vae=self\.get_module\("vae"\),)\s*\n(\s*\)\s*,)',
+    stripped, n = re.subn(
+        r'(\n[ \t]*vae=self\.get_module\("vae"\),)\s*\n[ \t]*pipeline=self,\s*\n',
+        r"\1\n",
         text,
+        count=1,
     )
-    if m is not None and "pipeline=self" not in m.group(0):
-        insert = m.group(1) + m.group(2) + "\n                pipeline=self,\n" + m.group(3)
-        ltx2_pipeline_py.write_text(text[: m.start()] + insert + text[m.end() :], encoding="utf-8")
-        print(f"Patched {ltx2_pipeline_py} (LTX2 latent prep: fuzzy-inserted pipeline=self after vae=)")
+    if n:
+        ltx2_pipeline_py.write_text(stripped, encoding="utf-8")
+        print(f"Migrated {ltx2_pipeline_py} (regex-removed pipeline= after vae= in latent prep stage)")
         return 0
     if LTX2_PIPELINE_LATENT_STAGE_OLD not in text:
         print(
@@ -1095,7 +1098,7 @@ def patch_ltx2_pipeline_latent_i2v(ltx2_pipeline_py: Path) -> int:
         text.replace(LTX2_PIPELINE_LATENT_STAGE_OLD, LTX2_PIPELINE_LATENT_STAGE_NEW, 1),
         encoding="utf-8",
     )
-    print(f"Patched {ltx2_pipeline_py} (LTX2 latent prep receives VAE + pipeline for i2v)")
+    print(f"Patched {ltx2_pipeline_py} (LTX2 latent prep receives VAE for i2v)")
     return 0
 
 
