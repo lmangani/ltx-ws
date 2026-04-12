@@ -13,8 +13,9 @@ Does the full sequence that upstream docs omit:
      ``videofentanylserver`` keepalives.
   4. Patch ``decoding.py``: decoded ``batch.output`` on CPU (MPS tensors cannot be
      sent over multiprocessing pipes).
-  5. Patch ``multiproc_executor.py``: sanitize tensors in ``execute_forward`` replies
-     before ``pipe.send`` (belt-and-suspenders for MPS IPC).
+  5. Patch ``multiproc_executor.py``: prepend ``VIDEOFENTANYL_FASTVIDEO_SRC`` on ``sys.path`` in
+     worker processes (spawn never imports ``videofentanylserver``); sanitize tensors in
+     ``execute_forward`` replies before ``pipe.send`` (belt-and-suspenders for MPS IPC).
   6. Patch LTX-2 image-to-video: ``ltx2_pipeline.py`` passes ``vae=`` into latent preparation (never
      ``pipeline=``, so workers that import an older ``LTX2LatentPreparationStage`` from site-packages
      still start); ``ltx2_latent_preparation.py`` VAE-encodes ``image_path`` / ``pil_image`` into the
@@ -231,7 +232,46 @@ def patch_decoding_mps_ipc(decoding_py: Path) -> int:
     return 0
 
 
-# --- multiproc_executor.py: sanitize tensors before pipe.send ----------------------------
+# --- multiproc_executor.py: worker sys.path (I2V / patched LTX2) + sanitize tensors --------
+
+MULTIPROC_OSQUEUE_VFOLD = "import os\nimport queue\n"
+
+MULTIPROC_OSQUEUE_VFNEW = (
+    "import os\n"
+    "import sys\n"
+    "\n"
+    "# videofentanyl: spawn workers never import videofentanylserver; align ``sys.path`` with the repo\n"
+    "# submodule before any ``fastvideo`` import so patched LTX2 latent prep (VAE i2v) matches the parent.\n"
+    "_FV_SRC = os.environ.get(\"VIDEOFENTANYL_FASTVIDEO_SRC\")\n"
+    "if _FV_SRC and os.path.isdir(os.path.join(_FV_SRC, \"fastvideo\")) and _FV_SRC not in sys.path:\n"
+    "    sys.path.insert(0, _FV_SRC)\n"
+    "\n"
+    "import queue\n"
+)
+
+MULTIPROC_FV_SRC_MARKER = '_FV_SRC = os.environ.get("VIDEOFENTANYL_FASTVIDEO_SRC")'
+
+
+def patch_multiproc_executor_videofentanyl_fv_src(multiproc_py: Path) -> int:
+    """Prepend repo FastVideo on worker ``sys.path`` before ``fastvideo`` imports (idempotent)."""
+    if not multiproc_py.is_file():
+        print(f"Warning: {multiproc_py} not found — skip multiproc worker src patch", file=sys.stderr)
+        return 0
+    text = multiproc_py.read_text(encoding="utf-8")
+    if MULTIPROC_FV_SRC_MARKER in text:
+        print(f"Already patched: {multiproc_py} (worker VIDEOFENTANYL_FASTVIDEO_SRC sys.path)")
+        return 0
+    if MULTIPROC_OSQUEUE_VFOLD not in text:
+        print(
+            f"Warning: expected `import os` / `import queue` block not found in {multiproc_py} — "
+            "skip multiproc worker src patch",
+            file=sys.stderr,
+        )
+        return 0
+    multiproc_py.write_text(text.replace(MULTIPROC_OSQUEUE_VFOLD, MULTIPROC_OSQUEUE_VFNEW, 1), encoding="utf-8")
+    print(f"Patched {multiproc_py} (worker prepends VIDEOFENTANYL_FASTVIDEO_SRC for patched FastVideo)")
+    return 0
+
 
 MULTIPROC_IPC_MARKER = "_tensor_for_worker_ipc_send"
 
@@ -1297,6 +1337,7 @@ def main() -> int:
             return 1
         patch_ltx2_denoising_progress(denoising_py)
         patch_decoding_mps_ipc(decoding_py)
+        patch_multiproc_executor_videofentanyl_fv_src(multiproc_py)
         patch_multiproc_executor_mps_ipc(multiproc_py)
         patch_ltx2_pipeline_latent_i2v(ltx2_pipeline_py)
         patch_ltx2_latent_preparation_i2v(latent_prep_py)

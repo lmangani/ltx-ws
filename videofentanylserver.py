@@ -114,6 +114,9 @@ def _prepend_repo_fastvideo_to_sys_path() -> None:
             os.environ["PYTHONPATH"] = s + os.pathsep + prev
     else:
         os.environ["PYTHONPATH"] = s
+    # Multiprocessing spawn workers import ``multiproc_executor`` before videofentanylserver;
+    # they read this and prepend the same tree (see FastVideo worker patch).
+    os.environ["VIDEOFENTANYL_FASTVIDEO_SRC"] = s
 
 
 _prepend_repo_fastvideo_to_sys_path()
@@ -229,12 +232,12 @@ def _apply_pytorch_mps_runtime_tuning() -> None:
 
 # ── Image helpers ──────────────────────────────────────────────────────────────
 
-def _resolve_initial_image_payload(msg: dict, session: dict) -> dict | None:
+def _resolve_initial_image_payload(msg: dict, session: dict) -> dict | str | None:
     """
-    Pick the first non-empty image payload dict from the generate message, then session.
+    Pick the first non-empty image payload from the generate message, then session.
 
-    Accepts several keys so autocontinue / custom clients match FastVideo-style
-    ``inputs.image_path`` flows once decoded to a temp file for ``GenerationRequest``.
+    Returns a ``dict`` (data URL / base64) or a ``str`` (filesystem path or ``http(s)`` URL)
+    for ``GenerationRequest`` / ``InputConfig(image_path=…)``, matching FastVideo I2V usage.
     """
     keys = (
         "initial_image",
@@ -243,10 +246,25 @@ def _resolve_initial_image_payload(msg: dict, session: dict) -> dict | None:
         "continuationFrame",
         "start_image",
         "startImage",
+        # FastVideo-style / OpenAPI-style keys used by other clients
+        "input_reference",
+        "inputReference",
+        "reference_image",
+        "referenceImage",
+        "inputs",
     )
     for source in (msg, session):
         for key in keys:
             raw = source.get(key)
+            if key == "inputs" and isinstance(raw, dict):
+                nested = raw.get("image_path") or raw.get("imagePath")
+                if isinstance(nested, str) and nested.strip():
+                    p = nested.strip()
+                    if os.path.isfile(p) or p.startswith(("http://", "https://")):
+                        return p
+                    return {"data_url": nested, "mime_type": "image/jpeg"}
+                if isinstance(nested, dict) and nested:
+                    return nested
             if isinstance(raw, dict) and raw:
                 return raw
     return None
@@ -254,15 +272,28 @@ def _resolve_initial_image_payload(msg: dict, session: dict) -> dict | None:
 
 def _decode_initial_image(image_data: dict) -> str:
     """
-    Decode an initial_image payload dict (name/mime_type/data_url) to a temp
-    file and return its path.  Caller is responsible for deleting the file.
+    Turn an ``initial_image`` dict into something ``InputConfig(image_path=…)`` accepts:
+    ``https?://`` URL, existing filesystem path, or base64 / data-URL written to a temp file.
+    Caller should delete only temp files created here (names contain ``fvserver_img_``).
     """
-    data_url: str = image_data.get("data_url", "")
+    data_url: str = (image_data.get("data_url") or "").strip()
+    if data_url.startswith(("http://", "https://")):
+        return data_url
+    if data_url.startswith("file://"):
+        from urllib.parse import unquote
+        from urllib.request import url2pathname
+
+        path = url2pathname(unquote(data_url[7:]))
+        if os.path.isfile(path):
+            return path
+    if data_url and os.path.isfile(data_url):
+        return data_url
+
     if data_url.startswith("data:"):
         header, encoded = data_url.split(",", 1)
         mime = header.split(";")[0].split(":")[1]
     else:
-        mime    = image_data.get("mime_type", "image/jpeg")
+        mime = image_data.get("mime_type", "image/jpeg")
         encoded = data_url
 
     ext = mimetypes.guess_extension(mime) or ".jpg"
@@ -546,7 +577,7 @@ class LocalVideoGenerator:
     async def generate(
         self,
         prompt:           str,
-        image_data:       dict | None = None,
+        image_data:       dict | str | None = None,
         seed:             int = 1024,
         num_frames:       int | None = None,
         height:           int | None = None,
@@ -614,7 +645,7 @@ class LocalVideoGenerator:
     def _generate_sync(
         self,
         prompt:           str,
-        image_data:       dict | None,
+        image_data:       dict | str | None,
         seed:             int,
         num_frames:       int,
         height:           int,
@@ -653,7 +684,11 @@ class LocalVideoGenerator:
         self._reset_model_progress()
 
         try:
-            if isinstance(image_data, dict) and image_data:
+            if isinstance(image_data, str) and image_data.strip():
+                p = image_data.strip()
+                if os.path.isfile(p) or p.startswith(("http://", "https://")):
+                    tmp_image = p
+            elif isinstance(image_data, dict) and image_data:
                 tmp_image = _decode_initial_image(image_data)
 
             # LTX2 text_encoding asserts isinstance(negative_prompt, str); schema default is None.
@@ -704,7 +739,7 @@ class LocalVideoGenerator:
             return video_path
 
         finally:
-            if tmp_image:
+            if tmp_image and os.path.isfile(tmp_image) and "fvserver_img_" in tmp_image:
                 try:
                     os.unlink(tmp_image)
                 except OSError:
