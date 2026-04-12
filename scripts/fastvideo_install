@@ -13,7 +13,10 @@ Does the full sequence that upstream docs omit:
      sent over multiprocessing pipes).
   5. Patch ``multiproc_executor.py``: sanitize tensors in ``execute_forward`` replies
      before ``pipe.send`` (belt-and-suspenders for MPS IPC).
-  6. Run ``uv pip install -e`` (or ``python -m pip`` if uv is missing).
+  6. Patch LTX-2 image-to-video: ``ltx2_pipeline.py`` passes the VAE into latent preparation;
+     ``ltx2_latent_preparation.py`` VAE-encodes ``image_path`` / ``pil_image`` into the first
+     latent slice when sampling random latents; ``ltx2_denoising.py`` pins that slice each step.
+  7. Run ``uv pip install -e`` (or ``python -m pip`` if uv is missing).
 
 Run from the videofentanyl repo root (recommended):
 
@@ -583,6 +586,407 @@ def patch_ltx2_denoising_mps(denoising_py: Path) -> int:
     return 0
 
 
+
+# --- LTX2 image-to-video (image_path / pil_image first-frame anchor) -------------------------
+
+LTX2_LATENT_I2V_IMPORTS_OLD = 'from pathlib import Path\n\nimport torch\nfrom diffusers.utils.torch_utils import randn_tensor\n\nfrom fastvideo.distributed import get_local_torch_device\nfrom fastvideo.fastvideo_args import FastVideoArgs\nfrom fastvideo.logger import init_logger\nfrom fastvideo.pipelines.pipeline_batch_info import ForwardBatch'
+
+LTX2_LATENT_I2V_IMPORTS_NEW = 'from __future__ import annotations\n\nfrom pathlib import Path\nfrom typing import Any\n\nimport torch\nfrom diffusers.utils.torch_utils import randn_tensor\nfrom PIL import Image\n\nfrom fastvideo.distributed import get_local_torch_device\nfrom fastvideo.fastvideo_args import FastVideoArgs\nfrom fastvideo.image_processor import ImageProcessor\nfrom fastvideo.logger import init_logger\nfrom fastvideo.models.vaes.common import DiagonalGaussianDistribution\nfrom fastvideo.pipelines.pipeline_batch_info import ForwardBatch'
+
+LTX2_PIPELINE_LATENT_STAGE_OLD = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(transformer=self.get_module("transformer"), ),\n        )'
+
+LTX2_PIPELINE_LATENT_STAGE_NEW = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(\n                transformer=self.get_module("transformer"),\n                vae=self.get_module("vae"),\n            ),\n        )'
+
+LTX2_LATENT_I2V_BODY_OLD = "".join((
+    '    def __init__(self, transformer) -> None:\n',
+    '        super().__init__()\n',
+    '        self.transformer = transformer\n',
+    '\n',
+    '    def forward(\n',
+    '        self,\n',
+    '        batch: ForwardBatch,\n',
+    '        fastvideo_args: FastVideoArgs,\n',
+    '    ) -> ForwardBatch:\n',
+    '        latent_num_frames = (batch.num_frames -\n',
+    '                             1) // fastvideo_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio + 1\n',
+    '        if not batch.prompt_embeds:\n',
+    '            batch_size = 1\n',
+    '        elif isinstance(batch.prompt, list):\n',
+    '            batch_size = len(batch.prompt)\n',
+    '        elif batch.prompt is not None:\n',
+    '            batch_size = 1\n',
+    '        else:\n',
+    '            batch_size = batch.prompt_embeds[0].shape[0]\n',
+    '\n',
+    '        batch_size *= batch.num_videos_per_prompt\n',
+    '\n',
+    '        if not batch.prompt_embeds:\n',
+    '            transformer_dtype = next(self.transformer.parameters()).dtype\n',
+    '            device = get_local_torch_device()\n',
+    '            dummy_prompt = torch.zeros(\n',
+    '                batch_size,\n',
+    '                0,\n',
+    '                self.transformer.hidden_size,\n',
+    '                device=device,\n',
+    '                dtype=transformer_dtype,\n',
+    '            )\n',
+    '            batch.prompt_embeds = [dummy_prompt]\n',
+    '            batch.negative_prompt_embeds = []\n',
+    '            batch.do_classifier_free_guidance = False\n',
+    '\n',
+    '        dtype = batch.prompt_embeds[0].dtype\n',
+    '        device = get_local_torch_device()\n',
+    '        generator = batch.generator\n',
+    '        latents = batch.latents\n',
+    '        num_frames = latent_num_frames if latent_num_frames is not None else batch.num_frames\n',
+    '        height = batch.height\n',
+    '        width = batch.width\n',
+    '        latent_path = fastvideo_args.ltx2_initial_latent_path\n',
+    '\n',
+    '        if height is None or width is None:\n',
+    '            raise ValueError("Height and width must be provided")\n',
+    '\n',
+    '        spatial_ratio = fastvideo_args.pipeline_config.vae_config.arch_config.spatial_compression_ratio\n',
+    '        if height % spatial_ratio != 0 or width % spatial_ratio != 0:\n',
+    '            raise ValueError(f"Height and width must be divisible by {spatial_ratio} "\n',
+    '                             f"but are {height} and {width}.")\n',
+    '        shape = (\n',
+    '            batch_size,\n',
+    '            self.transformer.num_channels_latents,\n',
+    '            num_frames,\n',
+    '            height // spatial_ratio,\n',
+    '            width // spatial_ratio,\n',
+    '        )\n',
+    '\n',
+    '        if isinstance(generator, list) and len(generator) != batch_size:\n',
+    '            raise ValueError(f"You have passed a list of generators of length {len(generator)}, "\n',
+    '                             f"but requested an effective batch size of {batch_size}.")\n',
+    '\n',
+    '        if latents is None:\n',
+    '            if latent_path:\n',
+    '                loaded_latents = self._load_initial_latent(latent_path, device, dtype)\n',
+    '                if loaded_latents is not None:\n',
+    '                    latents = loaded_latents\n',
+    '                else:\n',
+    '                    latents = randn_tensor(\n',
+    '                        shape,\n',
+    '                        generator=generator,\n',
+    '                        device=device,\n',
+    '                        dtype=dtype,\n',
+    '                    )\n',
+    '                    self._save_initial_latent(latent_path, latents)\n',
+    '            else:\n',
+    '                latents = randn_tensor(\n',
+    '                    shape,\n',
+    '                    generator=generator,\n',
+    '                    device=device,\n',
+    '                    dtype=dtype,\n',
+    '                )\n',
+    '        else:\n',
+    '            latents = latents.to(device)\n',
+    '\n',
+    '        batch.latents = latents\n',
+    '        batch.raw_latent_shape = shape\n',
+    '        return batch\n',
+))
+
+
+LTX2_LATENT_I2V_BODY_NEW = "".join((
+    '    def __init__(self, transformer, vae: Any | None = None) -> None:\n',
+    '        super().__init__()\n',
+    '        self.transformer = transformer\n',
+    '        self.vae = vae\n',
+    '\n',
+    '    def forward(\n',
+    '        self,\n',
+    '        batch: ForwardBatch,\n',
+    '        fastvideo_args: FastVideoArgs,\n',
+    '    ) -> ForwardBatch:\n',
+    '        latent_num_frames = (batch.num_frames -\n',
+    '                             1) // fastvideo_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio + 1\n',
+    '        if not batch.prompt_embeds:\n',
+    '            batch_size = 1\n',
+    '        elif isinstance(batch.prompt, list):\n',
+    '            batch_size = len(batch.prompt)\n',
+    '        elif batch.prompt is not None:\n',
+    '            batch_size = 1\n',
+    '        else:\n',
+    '            batch_size = batch.prompt_embeds[0].shape[0]\n',
+    '\n',
+    '        batch_size *= batch.num_videos_per_prompt\n',
+    '\n',
+    '        if not batch.prompt_embeds:\n',
+    '            transformer_dtype = next(self.transformer.parameters()).dtype\n',
+    '            device = get_local_torch_device()\n',
+    '            dummy_prompt = torch.zeros(\n',
+    '                batch_size,\n',
+    '                0,\n',
+    '                self.transformer.hidden_size,\n',
+    '                device=device,\n',
+    '                dtype=transformer_dtype,\n',
+    '            )\n',
+    '            batch.prompt_embeds = [dummy_prompt]\n',
+    '            batch.negative_prompt_embeds = []\n',
+    '            batch.do_classifier_free_guidance = False\n',
+    '\n',
+    '        dtype = batch.prompt_embeds[0].dtype\n',
+    '        device = get_local_torch_device()\n',
+    '        generator = batch.generator\n',
+    '        latents = batch.latents\n',
+    '        num_frames = latent_num_frames if latent_num_frames is not None else batch.num_frames\n',
+    '        height = batch.height\n',
+    '        width = batch.width\n',
+    '        latent_path = fastvideo_args.ltx2_initial_latent_path\n',
+    '\n',
+    '        if height is None or width is None:\n',
+    '            raise ValueError("Height and width must be provided")\n',
+    '\n',
+    '        spatial_ratio = fastvideo_args.pipeline_config.vae_config.arch_config.spatial_compression_ratio\n',
+    '        if height % spatial_ratio != 0 or width % spatial_ratio != 0:\n',
+    '            raise ValueError(f"Height and width must be divisible by {spatial_ratio} "\n',
+    '                             f"but are {height} and {width}.")\n',
+    '        shape = (\n',
+    '            batch_size,\n',
+    '            self.transformer.num_channels_latents,\n',
+    '            num_frames,\n',
+    '            height // spatial_ratio,\n',
+    '            width // spatial_ratio,\n',
+    '        )\n',
+    '\n',
+    '        if isinstance(generator, list) and len(generator) != batch_size:\n',
+    '            raise ValueError(f"You have passed a list of generators of length {len(generator)}, "\n',
+    '                             f"but requested an effective batch size of {batch_size}.")\n',
+    '\n',
+    '        sampled_random = False\n',
+    '        if latents is None:\n',
+    '            if latent_path:\n',
+    '                loaded_latents = self._load_initial_latent(latent_path, device, dtype)\n',
+    '                if loaded_latents is not None:\n',
+    '                    latents = loaded_latents\n',
+    '                else:\n',
+    '                    latents = randn_tensor(\n',
+    '                        shape,\n',
+    '                        generator=generator,\n',
+    '                        device=device,\n',
+    '                        dtype=dtype,\n',
+    '                    )\n',
+    '                    self._save_initial_latent(latent_path, latents)\n',
+    '            else:\n',
+    '                latents = randn_tensor(\n',
+    '                    shape,\n',
+    '                    generator=generator,\n',
+    '                    device=device,\n',
+    '                    dtype=dtype,\n',
+    '                )\n',
+    '                sampled_random = True\n',
+    '        else:\n',
+    '            latents = latents.to(device)\n',
+    '\n',
+    '        batch.extra.pop("ltx2_i2v_anchor_latents", None)\n',
+    '        if (\n',
+    '            latent_path is None\n',
+    '            and sampled_random\n',
+    '            and batch.pil_image is not None\n',
+    '            and self.vae is not None\n',
+    '            and shape[2] > 1\n',
+    '        ):\n',
+    '            latents = self._blend_start_image_into_latents(\n',
+    '                latents,\n',
+    '                batch.pil_image,\n',
+    '                batch_size=batch_size,\n',
+    '                height=int(height),\n',
+    '                width=int(width),\n',
+    '                spatial_ratio=int(spatial_ratio),\n',
+    '                device=device,\n',
+    '                dtype=dtype,\n',
+    '            )\n',
+    '            z0 = latents[:, :, :1].detach().clone()\n',
+    '            batch.extra["ltx2_i2v_anchor_latents"] = z0\n',
+    '            logger.info("[LTX2] image-to-video: first latent slice fixed from start image")\n',
+    '\n',
+    '        batch.latents = latents\n',
+    '        batch.raw_latent_shape = shape\n',
+    '        return batch\n',
+    '\n',
+    '    @staticmethod\n',
+    '    def _cfg_get(cfg: Any, name: str) -> Any:\n',
+    '        if cfg is None:\n',
+    '            return None\n',
+    '        if isinstance(cfg, dict):\n',
+    '            return cfg.get(name)\n',
+    '        return getattr(cfg, name, None)\n',
+    '\n',
+    '    def _normalize_video_latent(self, z: torch.Tensor, vae: Any) -> torch.Tensor:\n',
+    '        """Match diffusers LTX2 ``_normalize_latents`` (inverse of decode-time denorm)."""\n',
+    '        cfg = getattr(vae, "config", None)\n',
+    '        latents_mean = self._cfg_get(cfg, "latents_mean")\n',
+    '        latents_std = self._cfg_get(cfg, "latents_std")\n',
+    '        if latents_mean is not None and latents_std is not None:\n',
+    '            mean = torch.as_tensor(latents_mean, device=z.device, dtype=z.dtype).view(1, -1, 1, 1, 1)\n',
+    '            std = torch.as_tensor(latents_std, device=z.device, dtype=z.dtype).view(1, -1, 1, 1, 1)\n',
+    '            sf = float(self._cfg_get(cfg, "scaling_factor") or 1.0)\n',
+    '            return (z - mean) * sf / std\n',
+    '        if hasattr(vae, "scaling_factor"):\n',
+    '            sf = vae.scaling_factor\n',
+    '            if isinstance(sf, torch.Tensor):\n',
+    '                sf = sf.to(z.device, z.dtype)\n',
+    '            return z / sf\n',
+    '        return z\n',
+    '\n',
+    '    def _encode_start_image_latent(\n',
+    '        self,\n',
+    '        pil_image: Image.Image,\n',
+    '        *,\n',
+    '        batch_size: int,\n',
+    '        height: int,\n',
+    '        width: int,\n',
+    '        spatial_ratio: int,\n',
+    '        device: torch.device,\n',
+    '        dtype: torch.dtype,\n',
+    '    ) -> torch.Tensor:\n',
+    '        """Encode a single RGB frame to one latent temporal slice (normalized)."""\n',
+    '        if not isinstance(pil_image, Image.Image):\n',
+    '            raise TypeError(f"LTX2 i2v expects PIL.Image from image_path; got {type(pil_image)}")\n',
+    '        img = pil_image.convert("RGB") if pil_image.mode != "RGB" else pil_image\n',
+    '        processor = ImageProcessor(vae_scale_factor=spatial_ratio)\n',
+    '        pixel = processor.preprocess(img, height, width).to(device=device, dtype=dtype)\n',
+    '        video = pixel.unsqueeze(2)\n',
+    '        if batch_size != 1:\n',
+    '            video = video.expand(batch_size, -1, -1, -1, -1).contiguous()\n',
+    '        self.vae.to(device)\n',
+    '        with torch.no_grad():\n',
+    '            enc = self.vae.encode(video)\n',
+    '        if isinstance(enc, DiagonalGaussianDistribution):\n',
+    '            z0 = enc.mode()\n',
+    '        elif hasattr(enc, "latent_dist"):\n',
+    '            z0 = enc.latent_dist.mode()\n',
+    '        else:\n',
+    '            z0 = enc\n',
+    '        return self._normalize_video_latent(z0, self.vae)\n',
+    '\n',
+    '    def _blend_start_image_into_latents(\n',
+    '        self,\n',
+    '        noise_latents: torch.Tensor,\n',
+    '        pil_image: Image.Image,\n',
+    '        *,\n',
+    '        batch_size: int,\n',
+    '        height: int,\n',
+    '        width: int,\n',
+    '        spatial_ratio: int,\n',
+    '        device: torch.device,\n',
+    '        dtype: torch.dtype,\n',
+    '    ) -> torch.Tensor:\n',
+    '        """Aligns with diffusers ``LTX2ImageToVideoPipeline.prepare_latents`` (first slice + noise)."""\n',
+    '        z_first = self._encode_start_image_latent(\n',
+    '            pil_image,\n',
+    '            batch_size=batch_size,\n',
+    '            height=height,\n',
+    '            width=width,\n',
+    '            spatial_ratio=spatial_ratio,\n',
+    '            device=device,\n',
+    '            dtype=dtype,\n',
+    '        )\n',
+    '        mask = torch.zeros(\n',
+    '            (batch_size, 1, noise_latents.shape[2], noise_latents.shape[3], noise_latents.shape[4]),\n',
+    '            device=device,\n',
+    '            dtype=noise_latents.dtype,\n',
+    '        )\n',
+    '        mask[:, :, 0] = 1.0\n',
+    '        init = torch.zeros_like(noise_latents)\n',
+    '        init[:, :, :1] = z_first\n',
+    '        return init * mask + noise_latents * (1.0 - mask)\n',
+))
+
+
+LTX2_I2V_VELOCITY_OLD = '            sigma_value = sigma.to(torch.float32) if isinstance(sigma, torch.Tensor) else torch.tensor(\n                float(sigma),\n                device=latents.device,\n                dtype=torch.float32,\n            )\n            dt = sigma_next - sigma\n            velocity = ((latents.float() - pos_denoised.float()) / sigma_value).to(latents.dtype)\n\n            latents = (latents.float() + velocity.float() * dt).to(latents.dtype)\n            if pos_audio is not None and audio_latents is not None:'
+
+LTX2_I2V_VELOCITY_OLD_COMPACT = '            sigma_value = sigma.to(torch.float32) if isinstance(sigma, torch.Tensor) else torch.tensor(\n                float(sigma),\n                device=latents.device,\n                dtype=torch.float32,\n            )\n            dt = sigma_next - sigma\n            velocity = ((latents.float() - pos_denoised.float()) / sigma_value).to(latents.dtype)\n            latents = (latents.float() + velocity.float() * dt).to(latents.dtype)\n            if pos_audio is not None and audio_latents is not None:'
+
+LTX2_I2V_VELOCITY_NEW = '            sigma_value = sigma.to(torch.float32) if isinstance(sigma, torch.Tensor) else torch.tensor(\n                float(sigma),\n                device=latents.device,\n                dtype=torch.float32,\n            )\n            dt = sigma_next - sigma\n            anchor = batch.extra.get("ltx2_i2v_anchor_latents")\n            if anchor is not None and latents.shape[2] > 1:\n                lat_t = latents[:, :, 1:]\n                pred_t = pos_denoised[:, :, 1:]\n                velocity = ((lat_t.float() - pred_t.float()) / sigma_value).to(latents.dtype)\n                latents = latents.clone()\n                latents[:, :, 1:] = (lat_t.float() + velocity.float() * dt).to(latents.dtype)\n                latents[:, :, :1] = anchor.to(device=latents.device, dtype=latents.dtype)\n            else:\n                velocity = ((latents.float() - pos_denoised.float()) / sigma_value).to(latents.dtype)\n                latents = (latents.float() + velocity.float() * dt).to(latents.dtype)\n            if pos_audio is not None and audio_latents is not None:'
+
+
+def patch_ltx2_pipeline_latent_i2v(ltx2_pipeline_py: Path) -> int:
+    """Wire VAE into ``LTX2LatentPreparationStage`` for image-to-video (idempotent)."""
+    if not ltx2_pipeline_py.is_file():
+        print(f"Warning: {ltx2_pipeline_py} not found — skip LTX2 pipeline i2v patch", file=sys.stderr)
+        return 0
+    text = ltx2_pipeline_py.read_text(encoding="utf-8")
+    if (
+        'stage_name="latent_preparation_stage"' in text
+        and 'vae=self.get_module("vae")' in text
+        and "LTX2LatentPreparationStage" in text
+    ):
+        print(f"Already patched: {ltx2_pipeline_py} (LTX2 latent stage VAE)")
+        return 0
+    if LTX2_PIPELINE_LATENT_STAGE_OLD not in text:
+        print(
+            f"Warning: expected latent_preparation_stage block not found in {ltx2_pipeline_py} — "
+            "skip LTX2 pipeline i2v patch",
+            file=sys.stderr,
+        )
+        return 0
+    ltx2_pipeline_py.write_text(
+        text.replace(LTX2_PIPELINE_LATENT_STAGE_OLD, LTX2_PIPELINE_LATENT_STAGE_NEW, 1),
+        encoding="utf-8",
+    )
+    print(f"Patched {ltx2_pipeline_py} (LTX2 latent prep receives VAE for i2v)")
+    return 0
+
+
+def patch_ltx2_latent_preparation_i2v(latent_py: Path) -> int:
+    """VAE first-frame conditioning for ``image_path`` / ``batch.pil_image`` (idempotent)."""
+    if not latent_py.is_file():
+        print(f"Warning: {latent_py} not found — skip LTX2 latent i2v patch", file=sys.stderr)
+        return 0
+    text = latent_py.read_text(encoding="utf-8")
+    if "def _blend_start_image_into_latents" in text:
+        print(f"Already patched: {latent_py} (LTX2 i2v latent prep)")
+        return 0
+    if LTX2_LATENT_I2V_IMPORTS_OLD not in text:
+        print(
+            f"Warning: expected latent prep import block not found in {latent_py} — "
+            "skip LTX2 latent i2v patch",
+            file=sys.stderr,
+        )
+        return 0
+    if LTX2_LATENT_I2V_BODY_OLD not in text:
+        print(
+            f"Warning: expected latent prep __init__/forward block not found in {latent_py} — "
+            "skip LTX2 latent i2v patch",
+            file=sys.stderr,
+        )
+        return 0
+    text = text.replace(LTX2_LATENT_I2V_IMPORTS_OLD, LTX2_LATENT_I2V_IMPORTS_NEW, 1)
+    text = text.replace(LTX2_LATENT_I2V_BODY_OLD, LTX2_LATENT_I2V_BODY_NEW, 1)
+    latent_py.write_text(text, encoding="utf-8")
+    print(f"Patched {latent_py} (LTX2 image-to-video latent prep)")
+    return 0
+
+
+def patch_ltx2_denoising_i2v_anchor(denoising_py: Path) -> int:
+    """Pin first latent slice during denoise when ``ltx2_i2v_anchor_latents`` is set (idempotent)."""
+    if not denoising_py.is_file():
+        print(f"Warning: {denoising_py} not found — skip LTX2 denoise i2v patch", file=sys.stderr)
+        return 0
+    text = denoising_py.read_text(encoding="utf-8")
+    if 'anchor = batch.extra.get("ltx2_i2v_anchor_latents")' in text:
+        print(f"Already patched: {denoising_py} (LTX2 i2v denoise anchor)")
+        return 0
+    if LTX2_I2V_VELOCITY_OLD in text:
+        text = text.replace(LTX2_I2V_VELOCITY_OLD, LTX2_I2V_VELOCITY_NEW, 1)
+    elif LTX2_I2V_VELOCITY_OLD_COMPACT in text:
+        text = text.replace(LTX2_I2V_VELOCITY_OLD_COMPACT, LTX2_I2V_VELOCITY_NEW, 1)
+    else:
+        print(
+            f"Warning: expected sigma/velocity update block not found in {denoising_py} — "
+            "skip LTX2 denoise i2v patch",
+            file=sys.stderr,
+        )
+        return 0
+    denoising_py.write_text(text, encoding="utf-8")
+    print(f"Patched {denoising_py} (LTX2 i2v denoise anchor)")
+    return 0
+
 def run(cmd: list[str], *, cwd: Path | None = None) -> None:
     print("+", " ".join(cmd), flush=True)
     subprocess.check_call(cmd, cwd=str(cwd) if cwd else None)
@@ -657,6 +1061,8 @@ def main() -> int:
     denoising_py = fv / "fastvideo" / "pipelines" / "stages" / "ltx2_denoising.py"
     decoding_py = fv / "fastvideo" / "pipelines" / "stages" / "decoding.py"
     multiproc_py = fv / "fastvideo" / "worker" / "multiproc_executor.py"
+    ltx2_pipeline_py = fv / "fastvideo" / "pipelines" / "basic" / "ltx2" / "ltx2_pipeline.py"
+    latent_prep_py = fv / "fastvideo" / "pipelines" / "stages" / "ltx2_latent_preparation.py"
 
     if not args.no_patch:
         if patch_pyproject(pyproject) != 0:
@@ -666,6 +1072,9 @@ def main() -> int:
         patch_ltx2_denoising_progress(denoising_py)
         patch_decoding_mps_ipc(decoding_py)
         patch_multiproc_executor_mps_ipc(multiproc_py)
+        patch_ltx2_pipeline_latent_i2v(ltx2_pipeline_py)
+        patch_ltx2_latent_preparation_i2v(latent_prep_py)
+        patch_ltx2_denoising_i2v_anchor(denoising_py)
     else:
         print("Skipping FastVideo source patches (--no-patch).")
 
