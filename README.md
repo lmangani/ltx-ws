@@ -256,7 +256,13 @@ pulls **Triton**. Triton and the published `fastvideo-kernel` wheels target
 The **MPS** code path in FastVideo uses **Torch SDPA** only and does not need
 `fastvideo-kernel` for LTX2 inference in `videofentanylserver.py`. Use
 `scripts/fastvideo_install` so the submodule, **pyproject** workaround (gate
-`fastvideo-kernel` to Linux x86_64), and **editable install** happen in one step.
+`fastvideo-kernel` to Linux x86_64), **patches LTX2 denoising** so
+`torch.autocast` uses **`mps` + `float16`** on Apple Silicon (upstream uses
+`device_type="cuda"`, which triggers *“CUDA is not available … Disabling autocast”*
+and turns off mixed-precision in that block), then runs **editable install**.
+
+After `git pull` inside your FastVideo clone, re-run
+`python scripts/fastvideo_install --no-install` (from this repo) to re-apply patches.
 
 ```bash
 # From the videofentanyl repo root (recommended: uses third_party/FastVideo submodule)

@@ -6,7 +6,9 @@ Does the full sequence that upstream docs omit:
   1. Initialize the FastVideo git submodule (this repo layout).
   2. Patch pyproject.toml so ``fastvideo-kernel`` (Triton / Linux CUDA wheels only)
      is not required on macOS — MPS uses Torch SDPA and does not need it.
-  3. Run ``uv pip install -e`` (or ``python -m pip`` if uv is missing).
+  3. Patch ``ltx2_denoising.py`` so ``torch.autocast`` uses ``device_type="mps"`` and
+     ``float16`` on Apple Silicon (upstream hard-codes ``cuda``, which warns and no-ops).
+  4. Run ``uv pip install -e`` (or ``python -m pip`` if uv is missing).
 
 Run from the videofentanyl repo root (recommended):
 
@@ -17,7 +19,7 @@ Standalone clone (skip submodule step):
 
   python scripts/fastvideo_install --path ~/src/FastVideo
 
-Re-run is safe: submodule update and pyproject patch are idempotent.
+Re-run is safe: submodule update and patches are idempotent.
 """
 from __future__ import annotations
 
@@ -75,6 +77,62 @@ def patch_pyproject(pyproject: Path) -> int:
     return 0
 
 
+LTX2_DENOISING_OLD = """            with torch.autocast(
+                    device_type="cuda",
+                    dtype=target_dtype,
+                    enabled=autocast_enabled,
+            ), set_forward_context(
+                    current_timestep=sigma.item(),
+                    attn_metadata=attn_metadata,
+                    forward_batch=batch,
+            ):
+"""
+
+LTX2_DENOISING_NEW = """            # videofentanyl: MPS/CUDA-native autocast (upstream hard-coded cuda).
+            _fv_ac_dev = latents.device.type
+            _fv_ac_dtype = target_dtype
+            _fv_ac_on = bool(autocast_enabled)
+            if _fv_ac_dev == "mps":
+                # MPS autocast uses float16; weights stay bf16 where not under autocast.
+                _fv_ac_dtype = torch.float16
+            elif _fv_ac_dev != "cuda":
+                _fv_ac_on = False
+            _fv_ac_device_type = _fv_ac_dev if _fv_ac_dev in ("cuda", "mps") else "cuda"
+            _fv_ac_apply = _fv_ac_on and _fv_ac_dev in ("cuda", "mps")
+            with torch.autocast(
+                    device_type=_fv_ac_device_type,
+                    dtype=_fv_ac_dtype,
+                    enabled=_fv_ac_apply,
+            ), set_forward_context(
+                    current_timestep=sigma.item(),
+                    attn_metadata=attn_metadata,
+                    forward_batch=batch,
+            ):
+"""
+
+
+def patch_ltx2_denoising_mps(denoising_py: Path) -> int:
+    """Patch LTX2 denoising autocast for MPS (idempotent). Returns 0 on success."""
+    marker = "videofentanyl: MPS/CUDA-native autocast"
+    if not denoising_py.is_file():
+        print(f"Warning: {denoising_py} not found — skip denoising patch", file=sys.stderr)
+        return 0
+    text = denoising_py.read_text(encoding="utf-8")
+    if marker in text:
+        print(f"Already patched: {denoising_py}")
+        return 0
+    if LTX2_DENOISING_OLD not in text:
+        print(
+            f"Warning: expected autocast block not found in {denoising_py} — "
+            "upstream layout may have changed; skip denoising patch",
+            file=sys.stderr,
+        )
+        return 0
+    denoising_py.write_text(text.replace(LTX2_DENOISING_OLD, LTX2_DENOISING_NEW, 1), encoding="utf-8")
+    print(f"Patched {denoising_py} (MPS/CUDA autocast)")
+    return 0
+
+
 def run(cmd: list[str], *, cwd: Path | None = None) -> None:
     print("+", " ".join(cmd), flush=True)
     subprocess.check_call(cmd, cwd=str(cwd) if cwd else None)
@@ -103,7 +161,7 @@ def main() -> int:
     p.add_argument(
         "--no-patch",
         action="store_true",
-        help="Skip pyproject patch (not recommended on macOS)",
+        help="Skip pyproject + ltx2_denoising patches (not recommended on macOS)",
     )
     args = p.parse_args()
 
@@ -146,11 +204,15 @@ def main() -> int:
         print(f"Error: missing {pyproject}", file=sys.stderr)
         return 1
 
+    denoising_py = fv / "fastvideo" / "pipelines" / "stages" / "ltx2_denoising.py"
+
     if not args.no_patch:
         if patch_pyproject(pyproject) != 0:
             return 1
+        if patch_ltx2_denoising_mps(denoising_py) != 0:
+            return 1
     else:
-        print("Skipping pyproject patch (--no-patch).")
+        print("Skipping FastVideo source patches (--no-patch).")
 
     if args.no_install:
         print("Skipping install (--no-install). Done.")
