@@ -130,7 +130,8 @@ python videofentanyl.py --mode dreamverse --prompt "test" --output-dir ./videos 
 | `--output-dir DIR` | `-o` | `.` | Save directory. |
 | `--prefix STR` | | `video` / `dreamverse` | Filename prefix (per-mode default). |
 | `--ext EXT` | | `mp4` | File extension. |
-| `--timeout SECS` | `-t` | `240` (fastvideo) / `480` (dreamverse) | Per-video timeout. |
+| `--timeout SECS` | `-t` | _(none)_ | Optional wall-clock cap; omit to wait for completion, idle silence, or server close. |
+| `--idle-timeout SECS` | | `120` / `300` with `--server` | Fail if no WebSocket traffic this long (keepalives count). |
 | `--delay SECS` | `-d` | `1.0` (fastvideo) / `2.0` (dreamverse) | Pause between jobs. |
 | `--retries N` | `-r` | `1` | Max attempts (exponential backoff). |
 | `--verbose` | `-v` | off | Full WebSocket protocol trace. |
@@ -226,8 +227,8 @@ to resolve immediately.
 ffmpeg -i input.mp4 -c copy fixed.mp4
 ```
 
-**Timeout on dreamverse** — long videos take 60–120s. Default timeout is 480s.
-If you're hitting it, increase: `--timeout 600`
+**Stall / hung session** — default has no wall-clock limit; stalls are detected via
+`--idle-timeout` (no traffic). For a hard cap, pass `--timeout SECS`.
 
 **Queue gets stuck on retry** — check `--retries` is > 1. Default is 1 attempt
 (no retry). Use `--retries 3` for resilience.

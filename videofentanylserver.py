@@ -16,7 +16,7 @@ USAGE
       --prompt "a fox running through snow"
 
   # Custom device settings
-  python videofentanylserver.py --port 9000 --num-frames 65 --height 480 --width 848
+  python videofentanylserver.py --port 9000 --num-frames 65 --height 480 --width 832
 
 PROTOCOL — FastVideo (1080p) — server side
 ─────────────────────────────────────────────
@@ -26,6 +26,7 @@ PROTOCOL — FastVideo (1080p) — server side
   → gpu_assigned       (device ready)
   → ltx2_stream_start
   → ltx2_segment_start
+  → generation_keepalive (periodic JSON while the model runs; elapsed_s / phase)
   → [binary chunks]    (raw MP4 video data)
   → ltx2_segment_complete
   → ltx2_stream_complete
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import base64
 import json
 import logging
@@ -80,13 +82,21 @@ DEFAULT_MODEL          = "FastVideo/LTX2-Distilled-Diffusers"
 DEFAULT_NUM_GPUS       = 1
 DEFAULT_NUM_FRAMES     = 97    # ~4 s @ 24 fps; LTX requires (8k+1) frames: 9, 17, 25, … 97, 105, …
 DEFAULT_HEIGHT         = 480
-DEFAULT_WIDTH          = 848
+# LTX2 latent prep requires height and width divisible by 32 (848 is invalid).
+DEFAULT_WIDTH          = 832
 DEFAULT_FPS            = 24
 DEFAULT_GUIDANCE_SCALE = 1.0   # LTX2-Distilled uses cfg=1.0
+# Distilled LTX2 is meant for few-step sampling; FastVideo's schema default (50)
+# is oriented at CUDA servers and is far too slow on Apple MPS (~tens of s/step).
+DEFAULT_INFER_STEPS    = 12
 DEFAULT_CHUNK_SIZE     = 64 * 1024  # 64 KB per WebSocket binary message
+# JSON keepalives during long MPS runs so clients can use an idle timeout instead
+# of a short wall-clock cap (see videofentanyl.py).
+GENERATION_KEEPALIVE_INTERVAL_S = 15.0
 
 # LTX2 frame requirement: num_frames must satisfy (frames - 1) % 8 == 0
 # e.g. 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 121, 129
+LTX2_SPATIAL_ALIGN = 32
 
 logging.basicConfig(
     level=logging.INFO,
@@ -94,6 +104,28 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("fvserver")
+
+
+def _apply_pytorch_mps_runtime_tuning() -> None:
+    """Best-effort runtime knobs for Metal / MPS (no-op if torch or MPS missing)."""
+    try:
+        import torch
+    except ImportError:
+        return
+    log.info("PyTorch %s", torch.__version__)
+    if not getattr(torch.backends, "mps", None) or not torch.backends.mps.is_available():
+        return
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+    # Prefer bf16 accumulation where the build supports it (reduces upcasts).
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and hasattr(mps, "allow_fp16_accumulation_in_bf16"):
+        try:
+            mps.allow_fp16_accumulation_in_bf16 = True  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
 
 # ── Image helpers ──────────────────────────────────────────────────────────────
@@ -137,8 +169,11 @@ class LocalVideoGenerator:
         height:         int,
         width:          int,
         fps:            int,
-        guidance_scale: float,
-        model_dir:      str | None = None,
+        guidance_scale:           float,
+        model_dir:                str | None = None,
+        inference_steps:        int = DEFAULT_INFER_STEPS,
+        enable_stage_verification: bool = False,
+        enable_torch_compile:   bool = False,
     ) -> None:
         self.model          = model
         self.num_gpus       = num_gpus
@@ -148,12 +183,18 @@ class LocalVideoGenerator:
         self.fps            = fps
         self.guidance_scale = guidance_scale
         self.model_dir      = model_dir
+        self.inference_steps = inference_steps
+        self.enable_stage_verification = enable_stage_verification
+        self.enable_torch_compile = enable_torch_compile
         self._generator     = None
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     def load(self) -> None:
-        """Load model weights.  Blocks until ready.  Call once at startup."""
+        """Load model weights.  Blocks until ready.  Safe to call more than once."""
+        if self._generator is not None:
+            return
+
         from fastvideo import VideoGenerator
 
         local_path = self._resolve_model_path()
@@ -238,6 +279,9 @@ class LocalVideoGenerator:
             text_encoder_cpu_offload=False,
             image_encoder_cpu_offload=False,
             pin_cpu_memory=False,
+            # Throughput: skip per-stage verification (FastVideo default is True).
+            enable_stage_verification=self.enable_stage_verification,
+            enable_torch_compile=self.enable_torch_compile,
             **extra_kwargs,
         )
         log.info("Model loaded ✓")
@@ -283,12 +327,13 @@ class LocalVideoGenerator:
 
     async def generate(
         self,
-        prompt:       str,
-        image_data:   dict | None = None,
-        seed:         int = 1024,
-        num_frames:   int | None = None,
-        height:       int | None = None,
-        width:        int | None = None,
+        prompt:           str,
+        image_data:       dict | None = None,
+        seed:             int = 1024,
+        num_frames:       int | None = None,
+        height:           int | None = None,
+        width:            int | None = None,
+        negative_prompt:  str = "",
     ) -> str:
         """
         Generate a video asynchronously (runs `_generate_sync` in a thread
@@ -306,18 +351,35 @@ class LocalVideoGenerator:
             num_frames or self.num_frames,
             height     or self.height,
             width      or self.width,
+            negative_prompt,
         )
 
     def _generate_sync(
         self,
-        prompt:     str,
-        image_data: dict | None,
-        seed:       int,
-        num_frames: int,
-        height:     int,
-        width:      int,
+        prompt:           str,
+        image_data:       dict | None,
+        seed:             int,
+        num_frames:       int,
+        height:           int,
+        width:            int,
+        negative_prompt:  str,
     ) -> str:
         """Synchronous generation — executed in a thread-pool worker."""
+        self.load()
+
+        ah = _align_ltx2_spatial(height)
+        aw = _align_ltx2_spatial(width)
+        if ah != height or aw != width:
+            log.warning(
+                "LTX2 requires H×W divisible by %s; adjusted %s×%s → %s×%s",
+                LTX2_SPATIAL_ALIGN,
+                height,
+                width,
+                ah,
+                aw,
+            )
+            height, width = ah, aw
+
         from fastvideo.api.schema import (
             GenerationRequest,
             InputConfig,
@@ -333,10 +395,13 @@ class LocalVideoGenerator:
             if image_data:
                 tmp_image = _decode_initial_image(image_data)
 
+            # LTX2 text_encoding asserts isinstance(negative_prompt, str); schema default is None.
             request = GenerationRequest(
                 prompt=prompt,
+                negative_prompt=negative_prompt,
                 inputs=InputConfig(image_path=tmp_image),
                 sampling=SamplingConfig(
+                    num_inference_steps=self.inference_steps,
                     num_frames=num_frames,
                     height=height,
                     width=width,
@@ -434,6 +499,9 @@ class RequestHandler:
 
     async def _handle_generate(self, msg: dict) -> None:
         prompt = msg.get("prompt", "").strip()
+        raw_neg = msg.get("negative_prompt")
+        negative_prompt = raw_neg.strip() if isinstance(raw_neg, str) else ""
+
         if not prompt:
             await self._send_json(
                 type="error",
@@ -454,7 +522,7 @@ class RequestHandler:
         await self._send_json(
             type="gpu_assigned",
             gpu_id="mps:0",
-            session_timeout=600,
+            session_timeout=7200,
         )
         self._dbg("→ gpu_assigned")
 
@@ -474,13 +542,36 @@ class RequestHandler:
         )
         self._dbg("→ ltx2_segment_start (segment 0/1)")
 
-        # ── generate ──────────────────────────────────────────────────────────
+        # ── generate (keepalive JSON so clients can use idle-based timeouts) ───
         video_path: str | None = None
+
+        async def _keepalive() -> None:
+            while True:
+                await asyncio.sleep(GENERATION_KEEPALIVE_INTERVAL_S)
+                try:
+                    await self._send_json(
+                        type="generation_keepalive",
+                        elapsed_s=round(time.time() - t_start, 1),
+                        phase="generating",
+                    )
+                except Exception:
+                    break
+
         try:
-            video_path = await self.generator.generate(
-                prompt=prompt,
-                image_data=initial_image,
+            gen_task = asyncio.create_task(
+                self.generator.generate(
+                    prompt=prompt,
+                    image_data=initial_image,
+                    negative_prompt=negative_prompt,
+                )
             )
+            ka_task = asyncio.create_task(_keepalive())
+            try:
+                video_path = await gen_task
+            finally:
+                ka_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await ka_task
         except Exception as exc:
             log.error("Generation failed: %s", exc)
             await self._send_json(
@@ -624,6 +715,15 @@ class VideoServer:
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
+def _align_ltx2_spatial(n: int, align: int = LTX2_SPATIAL_ALIGN) -> int:
+    """Round height or width to the nearest multiple of ``align`` (minimum ``align``)."""
+    if n < align:
+        return align
+    lower = (n // align) * align
+    upper = lower + align
+    return lower if (n - lower) <= (upper - n) else upper
+
+
 def _nearest_valid_frames(n: int) -> int:
     """Round n to the nearest value satisfying (frames - 1) % 8 == 0, min 9.
 
@@ -707,11 +807,17 @@ examples:
     )
     vid.add_argument(
         "--height", type=int, default=DEFAULT_HEIGHT,
-        help=f"output height px (default: {DEFAULT_HEIGHT})",
+        help=(
+            f"output height px (default: {DEFAULT_HEIGHT}); "
+            f"rounded to nearest multiple of {LTX2_SPATIAL_ALIGN} for LTX2"
+        ),
     )
     vid.add_argument(
         "--width", type=int, default=DEFAULT_WIDTH,
-        help=f"output width px (default: {DEFAULT_WIDTH})",
+        help=(
+            f"output width px (default: {DEFAULT_WIDTH}); "
+            f"rounded to nearest multiple of {LTX2_SPATIAL_ALIGN} for LTX2"
+        ),
     )
     vid.add_argument(
         "--fps", type=int, default=DEFAULT_FPS,
@@ -721,6 +827,26 @@ examples:
         "--guidance-scale", type=float, default=DEFAULT_GUIDANCE_SCALE,
         dest="guidance_scale",
         help=f"CFG guidance scale (default: {DEFAULT_GUIDANCE_SCALE})",
+    )
+
+    perf = p.add_argument_group("performance (especially Apple MPS)")
+    perf.add_argument(
+        "--infer-steps", type=int, default=DEFAULT_INFER_STEPS, dest="infer_steps",
+        metavar="N",
+        help=(
+            f"denoising steps (default: {DEFAULT_INFER_STEPS}, minimum 1). "
+            "Distilled LTX2 is intended for low step counts; 50 matches FastVideo's "
+            "generic default but is often impractical on MPS — raise for quality, "
+            "lower for speed."
+        ),
+    )
+    perf.add_argument(
+        "--stage-verification", action="store_true", dest="stage_verification",
+        help="enable FastVideo per-stage checks (slower; default off for throughput)",
+    )
+    perf.add_argument(
+        "--torch-compile", action="store_true", dest="torch_compile",
+        help="enable torch.compile in FastVideo (PyTorch 2.4+; experimental on MPS)",
     )
 
     misc = p.add_argument_group("misc")
@@ -747,6 +873,11 @@ def main() -> None:
     elif "FASTVIDEO_ATTENTION_BACKEND" not in os.environ:
         os.environ["FASTVIDEO_ATTENTION_BACKEND"] = "TORCH_SDPA"
 
+    _apply_pytorch_mps_runtime_tuning()
+
+    if args.infer_steps < 1:
+        parser.error("--infer-steps must be >= 1")
+
     # ── Validate / adjust num_frames ─────────────────────────────────────────
     valid_frames = _nearest_valid_frames(args.num_frames)
     if valid_frames != args.num_frames:
@@ -756,6 +887,16 @@ def main() -> None:
             flush=True,
         )
         args.num_frames = valid_frames
+
+    ah = _align_ltx2_spatial(args.height)
+    aw = _align_ltx2_spatial(args.width)
+    if ah != args.height or aw != args.width:
+        print(
+            f"  [warn] --height/--width {args.height}×{args.width} adjusted to "
+            f"{ah}×{aw} (LTX2 requires multiples of {LTX2_SPATIAL_ALIGN})",
+            flush=True,
+        )
+        args.height, args.width = ah, aw
 
     # ── Banner ────────────────────────────────────────────────────────────────
     _model_is_local = Path(args.model).exists()
@@ -774,20 +915,26 @@ def main() -> None:
     print(f"  Video    : {args.num_frames} frames @ "
           f"{args.height}×{args.width}  {args.fps} fps")
     print(f"  CFG      : {args.guidance_scale}")
+    print(f"  Denoise  : {args.infer_steps} steps  (use --infer-steps to tune)")
     print(f"{'═' * 60}\n")
 
-    # ── Load model ────────────────────────────────────────────────────────────
+    # ── Load model (before WebSocket bind — first client is never a cold-start) ─
     generator = LocalVideoGenerator(
-        model          = args.model,
-        num_gpus       = args.num_gpus,
-        num_frames     = args.num_frames,
-        height         = args.height,
-        width          = args.width,
-        fps            = args.fps,
-        guidance_scale = args.guidance_scale,
-        model_dir      = args.model_dir,
+        model                       = args.model,
+        num_gpus                    = args.num_gpus,
+        num_frames                  = args.num_frames,
+        height                      = args.height,
+        width                       = args.width,
+        fps                         = args.fps,
+        guidance_scale              = args.guidance_scale,
+        model_dir                   = args.model_dir,
+        inference_steps             = args.infer_steps,
+        enable_stage_verification   = args.stage_verification,
+        enable_torch_compile        = args.torch_compile,
     )
+    log.info("Loading weights before accepting connections …")
     generator.load()
+    log.info("Server ready — model is in memory.")
 
     # ── Start server ──────────────────────────────────────────────────────────
     server = VideoServer(

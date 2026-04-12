@@ -43,6 +43,7 @@ PROTOCOL — FastVideo (1080p)
           → simple_generate  (trigger generation)
           ← gpu_assigned
           ← ltx2_segment_start / ltx2_segment_complete
+          ← generation_keepalive  (optional; local server sends during long runs)
           ← [binary chunks]
           ← ltx2_stream_complete
 
@@ -123,7 +124,6 @@ MODES: dict[str, dict] = {
             'people clap as a romantic song ends and a girl speaks italian '
             '"orca madonna raghi"'
         ),
-        "default_timeout":  240,
         "default_delay":    1.0,
         "default_prefix":   "video",
         "default_preset_id": "simple_custom_prompt",
@@ -135,7 +135,6 @@ MODES: dict[str, dict] = {
         "host":             "dreamverse.fastvideo.org",
         "display_name":     "Dreamverse",
         "default_prompt":   "a kid burps into a tunnel, with a huge echo",
-        "default_timeout":  480,
         "default_delay":    2.0,
         "default_prefix":   "dreamverse",
         "default_preset_id": "custom_editable",
@@ -342,23 +341,59 @@ class VideoSession:
 
     # ── main ─────────────────────────────────────────────────────────────────
 
-    async def run(self, timeout: float) -> bool:
+    async def run(self, timeout: float | None, idle_timeout: float) -> bool:
+        """
+        ``timeout`` — optional maximum wall-clock time for the whole session; if
+        ``None``, the client waits until the stream completes, the server closes the
+        socket, or the idle limit trips.
+
+        ``idle_timeout`` — if no WebSocket frame arrives for this many seconds,
+        treat the connection as stuck.  ``generation_keepalive`` JSON from
+        videofentanylserver resets this clock during long local runs.
+        """
         self._t0 = time.time()
+        deadline = (self._t0 + timeout) if timeout is not None else None
         try:
-            async with asyncio.timeout(timeout):
-                async with websockets.connect(
-                    _ws_url(self.mode),
-                    additional_headers=_ws_headers(self.mode),
-                    max_size=200 * 1024 * 1024,
-                    ping_interval=30,
-                    ping_timeout=20,
-                    close_timeout=5,
-                ) as ws:
-                    await self._on_open(ws)
-                    await self._recv_loop(ws)
-        except asyncio.TimeoutError:
-            self.job.error = f"timed out after {timeout:.0f}s"
-            return False
+            async with websockets.connect(
+                _ws_url(self.mode),
+                additional_headers=_ws_headers(self.mode),
+                max_size=200 * 1024 * 1024,
+                ping_interval=30,
+                ping_timeout=20,
+                close_timeout=5,
+            ) as ws:
+                await self._on_open(ws)
+                while not self._done.is_set():
+                    if deadline is not None:
+                        remaining_wall = deadline - time.time()
+                        if remaining_wall <= 0:
+                            self.job.error = (
+                                f"wall-clock limit {timeout:.0f}s reached "
+                                "(drop --timeout for no wall limit)"
+                            )
+                            return False
+                        wait = min(idle_timeout, remaining_wall)
+                    else:
+                        wait = idle_timeout
+                    try:
+                        frame = await asyncio.wait_for(ws.recv(), timeout=wait)
+                    except asyncio.TimeoutError:
+                        self.job.error = (
+                            f"no server data for {idle_timeout:.0f}s "
+                            "(idle timeout — check server or increase --idle-timeout)"
+                        )
+                        return False
+                    if isinstance(frame, bytes):
+                        self._handle_binary(frame)
+                    else:
+                        await self._handle_json(frame)
+        except websockets.exceptions.ConnectionClosed as exc:
+            if not self._done.is_set():
+                self.job.error = (
+                    f"server closed WebSocket ({exc.code}): "
+                    f"{exc.reason or 'no reason'}"
+                )
+                return False
         except Exception as exc:
             self.job.error = str(exc)
             return False
@@ -388,15 +423,6 @@ class VideoSession:
                 f"→ simple_generate  prompt={self.job.params.prompt[:60]!r}",
                 always=True,
             )
-
-    async def _recv_loop(self, ws):
-        async for frame in ws:
-            if isinstance(frame, bytes):
-                self._handle_binary(frame)
-            else:
-                await self._handle_json(frame)
-            if self._done.is_set():
-                break
 
     # ── frame handlers ────────────────────────────────────────────────────────
 
@@ -441,6 +467,11 @@ class VideoSession:
                           f"session_timeout={timeout}s", always=True)
             else:
                 self._log("← gpu_assigned ✓", always=True)
+
+        elif t == "generation_keepalive":
+            elapsed = msg.get("elapsed_s", "?")
+            phase   = msg.get("phase", "?")
+            self._log(f"← keepalive  {phase}  {elapsed}s", always=True)
 
         elif t == "session_started":
             self._log("← session_started")
@@ -627,18 +658,20 @@ class GenerationQueue:
 
     def __init__(
         self,
-        jobs:         list[Job],
-        mode:         str,
-        timeout:      float,
-        delay:        float,
-        verbose:      bool = False,
-        autocontinue: bool = False,
+        jobs:           list[Job],
+        mode:           str,
+        timeout:        float | None,
+        idle_timeout:   float,
+        delay:          float,
+        verbose:        bool = False,
+        autocontinue:   bool = False,
     ):
-        self.jobs         = jobs
-        self.mode         = mode
-        self.timeout      = timeout
-        self.delay        = delay
-        self.verbose      = verbose
+        self.jobs          = jobs
+        self.mode          = mode
+        self.timeout = timeout
+        self.idle_timeout = idle_timeout
+        self.delay = delay
+        self.verbose = verbose
         self.autocontinue = autocontinue
 
     async def run_all(self):
@@ -650,7 +683,15 @@ class GenerationQueue:
         print(f"\n{'═'*60}")
         print(f"  {name} Queue — {total} job(s)")
         print(f"  Endpoint : {_ws_url(self.mode)}")
-        print(f"  Timeout  : {self.timeout}s per video")
+        _wall = (
+            f"{self.timeout:.0f}s (optional cap)"
+            if self.timeout is not None
+            else "none (until idle fails or server closes)"
+        )
+        print(
+            f"  Wall limit : {_wall}  |  "
+            f"idle {self.idle_timeout:.0f}s max silence between messages"
+        )
         print(f"  Delay    : {self.delay}s between jobs")
         print(f"{'═'*60}\n")
 
@@ -682,7 +723,10 @@ class GenerationQueue:
                     job.error = None
 
                 session = VideoSession(job, mode=self.mode, verbose=self.verbose)
-                success = await session.run(timeout=self.timeout)
+                success = await session.run(
+                    timeout=self.timeout,
+                    idle_timeout=self.idle_timeout,
+                )
 
             job.finished_at = time.time()
             job.status      = JobStatus.DONE if success else JobStatus.FAILED
@@ -1180,8 +1224,22 @@ examples:
     q.add_argument(
         "--timeout", "-t",
         type=float, default=None, metavar="SECS",
-        help="per-video timeout in seconds "
-             "(default: 240 for fastvideo, 480 for dreamverse)",
+        help=(
+            "optional hard cap on wall-clock time per video in seconds; "
+            "omit (default) to wait only for stream completion, server close, or "
+            "--idle-timeout (no automatic session deadline)"
+        ),
+    )
+    q.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=None,
+        metavar="SECS",
+        help=(
+            "fail if the server sends nothing for this many seconds "
+            "(default: 120 hosted, 300 with --server; keepalives from "
+            "videofentanylserver reset this clock)"
+        ),
     )
     q.add_argument(
         "--delay", "-d",
@@ -1272,7 +1330,19 @@ async def async_main(args: argparse.Namespace):
         sys.exit(2)
 
     # ── Resolve mode-specific defaults ───────────────────────────────────────
-    timeout = args.timeout if args.timeout is not None else cfg["default_timeout"]
+    timeout = args.timeout
+
+    if args.idle_timeout is not None:
+        idle_timeout = args.idle_timeout
+    elif args.server:
+        idle_timeout = 300.0
+    else:
+        idle_timeout = 120.0
+
+    if idle_timeout < 10:
+        print("Error: --idle-timeout must be >= 10 seconds")
+        sys.exit(1)
+
     delay   = args.delay   if args.delay   is not None else cfg["default_delay"]
     prefix  = args.prefix  if args.prefix  is not None else cfg["default_prefix"]
     preset_id    = args.preset_id    if args.preset_id    is not None else cfg["default_preset_id"]
@@ -1321,7 +1391,11 @@ async def async_main(args: argparse.Namespace):
             print()
         print(f"  Endpoint   : {_ws_url(mode)}")
         print(f"  Output dir : {output_dir.resolve()}")
-        print(f"  Timeout    : {timeout}s  Delay: {delay}s  Retries: {args.retries}")
+        _tw = f"{timeout:.0f}s wall" if timeout is not None else "no wall cap"
+        print(
+            f"  Limits     : {_tw}  idle {idle_timeout:.0f}s  "
+            f"Delay: {delay}s  Retries: {args.retries}"
+        )
         if args.autoconcat:
             print("  autoconcat : after run, merge successful clips with ffmpeg; "
                   "remove fragments if merge succeeds")
@@ -1332,6 +1406,7 @@ async def async_main(args: argparse.Namespace):
         jobs=jobs,
         mode=mode,
         timeout=timeout,
+        idle_timeout=idle_timeout,
         delay=delay,
         verbose=args.verbose,
         autocontinue=args.autocontinue,

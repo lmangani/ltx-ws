@@ -126,7 +126,8 @@ python videofentanyl.py \
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
-| `--timeout SECS` | `-t` | `240` / `480` | Per-video timeout (fastvideo / dreamverse). |
+| `--timeout SECS` | `-t` | _(none)_ | Optional hard wall-clock cap per video; omit to wait until completion, idle failure, or server close. |
+| `--idle-timeout SECS` | | `120` (hosted); **`300`** with `--server` | Fail if no WebSocket traffic for this long (keepalives count). |
 | `--delay SECS` | `-d` | `1.0` / `2.0` | Pause between consecutive jobs. |
 | `--retries N` | `-r` | `1` | Max attempts per job (exponential backoff). |
 
@@ -179,7 +180,7 @@ Examples:
 ════════════════════════════════════════════════════════════
   Dreamverse Queue — 1 job(s)
   Endpoint : wss://dreamverse.fastvideo.org/ws
-  Timeout  : 480s per video
+  Wall limit : none (until idle fails or server closes)  |  idle 120s max silence between messages
   Delay    : 2.0s between jobs
 ════════════════════════════════════════════════════════════
 
@@ -202,7 +203,7 @@ Examples:
 ════════════════════════════════════════════════════════════
   FastVideo Queue — 1 job(s)
   Endpoint : wss://1080p.fastvideo.org/ws
-  Timeout  : 240s per video
+  Wall limit : none (until idle fails or server closes)  |  idle 120s max silence between messages
   Delay    : 1.0s between jobs
 ════════════════════════════════════════════════════════════
 
@@ -319,7 +320,14 @@ python videofentanylserver.py --model ./models/LTX2-Distilled-Diffusers
 
 #### Generate videos locally
 
-Use the `--server` flag to point the client at your local server:
+Use the `--server` flag to point the client at your local server.
+
+While the model runs, `videofentanylserver.py` emits **`generation_keepalive`** JSON
+about every 15 seconds so the client can tell the session is still alive. By default
+the client sets **no wall-clock deadline** (`--timeout` omitted): the job finishes when
+the stream completes, the **server closes the WebSocket**, or **nothing arrives** for
+`--idle-timeout` (default **300 s** with `--server`, **120 s** on the hosted API — use
+`-t` only if you want an optional maximum session length).
 
 ```bash
 # Text-to-video
@@ -346,13 +354,18 @@ python videofentanyl.py --server ws://localhost:8765/ws \
 | `--model-dir` | _(HF cache)_ | Directory to download/cache the model into when `--model` is a HuggingFace ID. Ignored when `--model` is already a local path. |
 | `--num-gpus` | `1` | Device count. |
 | `--num-frames` | `97` | Frames to generate (`(8k+1)` required by LTX2: 9, 17, 25 … 97). |
-| `--height` | `480` | Output height in pixels. |
-| `--width` | `848` | Output width in pixels. |
+| `--height` | `480` | Output height in pixels (snapped to a multiple of 32 for LTX2). |
+| `--width` | `832` | Output width in pixels (snapped to a multiple of 32 for LTX2). |
 | `--fps` | `24` | Frames per second. |
 | `--guidance-scale` | `1.0` | CFG scale (LTX2-Distilled uses 1.0). |
+| `--infer-steps` | `12` | Denoising steps (distilled LTX2 is tuned for few steps; raise e.g. to `50` for quality on fast GPUs). |
+| `--stage-verification` | off | Enable FastVideo per-stage checks (slower). |
+| `--torch-compile` | off | Enable `torch.compile` in FastVideo (experimental on MPS; needs a recent PyTorch). |
 | `--attention-backend` | `TORCH_SDPA` | Attention backend: `TORCH_SDPA` (MPS/CPU) or `FLASH_ATTN` (CUDA). |
 | `--chunk-size` | `65536` | Binary chunk size in bytes. |
 | `--verbose` / `-v` | off | Per-connection protocol logging. |
+
+On **Apple MPS**, use a current **PyTorch** build (2.5+ recommended) with Metal support; the server logs the active version at startup and applies light runtime tuning (`float32_matmul_precision`, bf16 accumulation where supported). FastVideo still runs inference in a **multiprocess** worker, so wall time will not match a minimal single-process diffusers script — lowering `--infer-steps` is the main quality/speed trade-off for distilled weights.
 
 ---
 
