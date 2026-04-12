@@ -247,21 +247,47 @@ on **Apple Silicon (MPS)**.  No internet connection is needed for generation.
 
 #### Install FastVideo (Apple MPS)
 
+Upstream `FastVideo` declares a hard dependency on **`fastvideo-kernel`**, which
+pulls **Triton**. Triton and the published `fastvideo-kernel` wheels target
+**Linux x86_64 + CUDA**, not **macOS / Apple Silicon**. Resolver errors mentioning
+`triton` and `macosx_*_arm64` are expected from a plain `uv pip install -e .` on a Mac.
+
+The **MPS** code path in FastVideo uses **Torch SDPA** only and does not need
+`fastvideo-kernel` for LTX2 inference in `videofentanylserver.py`. Use the small
+patch script in this repo to gate that dependency to Linux x86_64 before installing.
+
+**Option A — submodule (stays on latest upstream)**
+
 ```bash
-# Create a Python 3.12 environment (uv recommended)
+# From the videofentanyl repo root
+git submodule update --init --recursive
+
+# One-time per submodule update: relax fastvideo-kernel for macOS
+python scripts/patch_fastvideo_pyproject_for_apple_silicon.py
+
+cd third_party/FastVideo
 uv venv --python 3.12 --seed
 source .venv/bin/activate
-
-# Install FastVideo from source (required for LTX2 support)
-git clone https://github.com/hao-ai-lab/FastVideo.git
-cd FastVideo
 uv pip install -e .
+cd ../..
 
 # Optional: install flash-attn (CUDA only; skip on Apple MPS)
 # uv pip install flash-attn --no-build-isolation -v
 
-# Install videofentanyl dependencies
-uv pip install websockets av Pillow
+# Install videofentanyl server/client deps (if not already global)
+uv pip install websockets av Pillow huggingface_hub
+```
+
+**Option B — standalone clone** (same patch idea, any directory)
+
+```bash
+git clone https://github.com/hao-ai-lab/FastVideo.git
+python /path/to/videofentanyl/scripts/patch_fastvideo_pyproject_for_apple_silicon.py \
+    FastVideo/pyproject.toml
+cd FastVideo
+uv venv --python 3.12 --seed
+source .venv/bin/activate
+uv pip install -e .
 ```
 
 #### Download the server script
