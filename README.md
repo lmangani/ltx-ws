@@ -42,6 +42,9 @@ python videofentanyl.py --prompt "forest rain" --prompt "city lights" --prompt "
 python videofentanyl.py --prompt "the scene comes alive" --image photo.jpg
 python videofentanyl.py --prompt "the scene comes alive" --image https://example.com/still.png
 
+# With --server, run scripts/fastvideo_install so local LTX2 image-to-video matches the start image
+# (see "Local Server (Apple MPS)").
+
 # AI prompt enhancement, custom output folder
 python videofentanyl.py --prompt "girl walking in rain" --enhance --output-dir ./videos
 
@@ -109,7 +112,7 @@ python videofentanyl.py \
 | `--count N` | `-n` | `1` | Videos to generate per prompt. |
 | `--enhance` | `-e` | off (fastvideo) / on (dreamverse) | Enable AI prompt enhancement (GPT rewrite). |
 | `--no-enhance` | | — | Disable GPT prompt expansion (dreamverse only). |
-| `--image PATH_OR_URL` | `-i` | — | Input image for image-to-video: local path or `http(s)` URL (downloaded via a temp file). |
+| `--image PATH_OR_URL` | `-i` | — | Input image for image-to-video: local path or `http(s)` URL (downloaded via a temp file). Hosted API: works out of the box. **Local server:** use FastVideo installed with `scripts/fastvideo_install` (LTX2 i2v patches). |
 | `--preset-id ID` | | mode default | Override the session preset ID. |
 | `--preset-label STR` | | mode default | Override the preset label (dreamverse). |
 | `--auto-extension` | | off | Enable server-side segment auto-extension. |
@@ -139,7 +142,7 @@ python videofentanyl.py \
 | `--dry-run` | Show the job queue and exit without connecting. |
 | `--autocontinue` | Extract the last frame of each clip and feed it as the first frame of the next one. Ideal for seamless multi-clip runs in 1080p mode. |
 | `--autoconcat` | After the queue finishes, merge **successful** autocontinue clips with **ffmpeg** (`-c copy`), then **delete** the fragment files. **Requires `--autocontinue`.** If `ffmpeg` is not on your PATH, the tool logs details and leaves all fragments unchanged. |
-| `--server URL` | Override the WebSocket endpoint. Use `ws://localhost:8765/ws` to route all generation through a local `videofentanylserver.py` instance. |
+| `--server URL` | Override the WebSocket endpoint. Use `ws://localhost:8765/ws` to route all generation through a local `server.py` instance. |
 
 ---
 
@@ -233,7 +236,7 @@ ffmpeg -i input.mp4 -c copy fixed.mp4
 
 ### Local Server (Apple MPS)
 
-`videofentanylserver.py` runs a fully local WebSocket server that implements the
+`server.py` runs a fully local WebSocket server that implements the
 same protocol as `wss://1080p.fastvideo.org/ws`, using
 [FastVideo](https://github.com/hao-ai-lab/FastVideo)'s **LTX2-Distilled** model
 on **Apple Silicon (MPS)**.  No internet connection is needed for generation.
@@ -246,14 +249,21 @@ pulls **Triton**. Triton and the published `fastvideo-kernel` wheels target
 `triton` and `macosx_*_arm64` are expected from a plain `uv pip install -e .` on a Mac.
 
 The **MPS** code path in FastVideo uses **Torch SDPA** only and does not need
-`fastvideo-kernel` for LTX2 inference in `videofentanylserver.py`. Use
+`fastvideo-kernel` for LTX2 inference in `server.py`. Use
 `scripts/fastvideo_install` so the submodule, **pyproject** workaround (gate
 `fastvideo-kernel` to Linux x86_64), **patches FastVideo sources** for Apple Silicon:
 LTX2 denoising uses **`torch.autocast` on the active device** (MPS/CUDA, not
 hard-coded `cuda`), optional **`FV_PROGRESS_JSON`** lines for local-server
 keepalives, **decoded frames on CPU** for multiprocessing IPC, and **worker
 `pipe.send` sanitization** so MPS tensors never hit `_share_filename_: only
-available on CPU`, then runs **editable install**.
+available on CPU`. **Image-to-video (`--image`):** the pipeline passes the VAE into
+latent preparation, encodes the start image into the first latent temporal slice, and
+during denoising **re-applies that slice each step** while setting **per-token timestep
+0** on first-frame tokens—matching the FastVideo **`LTX2TrainingPipeline`** first-frame
+conditioning (same idea as official LTX-2 keyframe conditioning: the first frame is
+held as conditioning, not treated as fully noised). Workers prepend
+**`VIDEOFENTANYL_FASTVIDEO_SRC`** so spawn processes load the patched FastVideo tree from this repo.
+The script then runs **editable install**.
 
 After `git pull` inside your FastVideo clone, re-run
 `python scripts/fastvideo_install --no-install` (from this repo) to re-apply patches.
@@ -283,23 +293,25 @@ python scripts/fastvideo_install --no-submodule --path ~/src/FastVideo
 #### Download the server script
 
 ```bash
-curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/videofentanylserver.py
+curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/server.py
 ```
+
+The local WebSocket entrypoint was formerly `videofentanylserver.py`; old bookmarks or scripts can be updated to `server.py`.
 
 #### Start the server
 
 ```bash
 # Default: downloads/caches the model in ~/.cache/huggingface/hub on first run
-python videofentanylserver.py
+python server.py
 
 # Download to a specific local folder (downloaded once, reused on subsequent starts)
-python videofentanylserver.py --model-dir ./models/LTX2-Distilled-Diffusers
+python server.py --model-dir ./models/LTX2-Distilled-Diffusers
 
 # Use a model folder that is already fully downloaded (no network access needed)
-python videofentanylserver.py --model ./models/LTX2-Distilled-Diffusers
+python server.py --model ./models/LTX2-Distilled-Diffusers
 
 # Custom resolution / port
-python videofentanylserver.py --port 9000 --height 720 --width 1280 --num-frames 65
+python server.py --port 9000 --height 720 --width 1280 --num-frames 65
 ```
 
 **Model weights** (~9 GB) are resolved in this priority order:
@@ -313,16 +325,16 @@ In all cases the model is always loaded from a local path before being passed to
 ```bash
 # One-time download to a custom folder, then use it offline
 pip install huggingface_hub
-python videofentanylserver.py --model-dir ./models/LTX2-Distilled-Diffusers
+python server.py --model-dir ./models/LTX2-Distilled-Diffusers
 # On subsequent runs point directly at the folder:
-python videofentanylserver.py --model ./models/LTX2-Distilled-Diffusers
+python server.py --model ./models/LTX2-Distilled-Diffusers
 ```
 
 #### Generate videos locally
 
 Use the `--server` flag to point **`videofentanyl.py`** at your local server.
 
-While the model runs, `videofentanylserver.py` emits **`generation_keepalive`** JSON
+While the model runs, `server.py` emits **`generation_keepalive`** JSON
 about every 15 seconds (with optional **`model_progress`**: denoise step, total steps,
 rolling average seconds per step, and ETA parsed from FastVideo worker logs), accepts
 **`generation_status`** from the client, and replies with **`generation_status_ack`**
@@ -337,7 +349,8 @@ copies the file into **`fvserver_completed/`** (override with `--spill-dir`).
 python videofentanyl.py --server ws://localhost:8765/ws \
     --prompt "a fox running through a snowy forest"
 
-# Image-to-video
+# Image-to-video (first frame matches the start image when FastVideo was installed with
+# scripts/fastvideo_install — see "Install FastVideo (Apple MPS)" above)
 python videofentanyl.py --server ws://localhost:8765/ws \
     --prompt "the scene comes alive" --image photo.jpg
 

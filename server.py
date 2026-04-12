@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-videofentanylserver.py — Local FastVideo/LTX2 WebSocket Server
-==============================================================
+server.py — Local FastVideo/LTX2 WebSocket Server
+==================================================
 Runs a local WebSocket server that implements the same protocol as
 wss://1080p.fastvideo.org/ws, generating videos with FastVideo's
 LTX2-Distilled model on Apple MPS (or CPU as fallback).
@@ -9,14 +9,14 @@ LTX2-Distilled model on Apple MPS (or CPU as fallback).
 USAGE
 ─────
   # Start the server (default: ws://0.0.0.0:8765/ws)
-  python videofentanylserver.py
+  python server.py
 
   # Then run the client pointing at the local server
   python videofentanyl.py --server ws://localhost:8765/ws \\
       --prompt "a fox running through snow"
 
   # Custom device settings
-  python videofentanylserver.py --port 9000 --num-frames 65 --height 480 --width 832
+  python server.py --port 9000 --num-frames 65 --height 480 --width 832
 
 PROTOCOL — FastVideo (1080p) — server side
 ─────────────────────────────────────────────
@@ -114,7 +114,7 @@ def _prepend_repo_fastvideo_to_sys_path() -> None:
             os.environ["PYTHONPATH"] = s + os.pathsep + prev
     else:
         os.environ["PYTHONPATH"] = s
-    # Multiprocessing spawn workers import ``multiproc_executor`` before videofentanylserver;
+    # Multiprocessing spawn workers import ``multiproc_executor`` before ``server.py``;
     # they read this and prepend the same tree (see FastVideo worker patch).
     os.environ["VIDEOFENTANYL_FASTVIDEO_SRC"] = s
 
@@ -1217,7 +1217,7 @@ def _nearest_valid_frames(n: int) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="videofentanylserver",
+        prog="server",
         description=(
             "Local FastVideo/LTX2 WebSocket server.\n"
             "Implements the same protocol as wss://1080p.fastvideo.org/ws."
@@ -1226,10 +1226,10 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""
 examples:
   # Start with defaults (ws://0.0.0.0:8765/ws)
-  python videofentanylserver.py
+  python server.py
 
   # Custom port, larger resolution
-  python videofentanylserver.py --port 9000 --height 720 --width 1280
+  python server.py --port 9000 --height 720 --width 1280
 
   # Then use the client
   python videofentanyl.py --server ws://localhost:8765/ws \\
@@ -1401,7 +1401,7 @@ def main() -> None:
     else:
         _model_source = f"HuggingFace cache  ({args.model})"
     print(f"\n{'═' * 60}")
-    print(f"  FastVideo Local Server  (videofentanylserver)")
+    print(f"  FastVideo Local Server  (server.py)")
     print(f"  Model    : {_model_source}")
     print(f"  Device   : Apple MPS  (FASTVIDEO_ATTENTION_BACKEND="
           f"{os.environ.get('FASTVIDEO_ATTENTION_BACKEND')})")

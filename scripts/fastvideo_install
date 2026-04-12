@@ -10,11 +10,11 @@ Does the full sequence that upstream docs omit:
      is not required on macOS — MPS uses Torch SDPA and does not need it.
   3. Patch ``ltx2_denoising.py``: ``torch.autocast`` uses the active device (MPS/CUDA),
      not hard-coded ``cuda``; optional structured ``FV_PROGRESS_JSON`` log lines for
-     ``videofentanylserver`` keepalives.
+     ``server.py`` keepalives.
   4. Patch ``decoding.py``: decoded ``batch.output`` on CPU (MPS tensors cannot be
      sent over multiprocessing pipes).
   5. Patch ``multiproc_executor.py``: prepend ``VIDEOFENTANYL_FASTVIDEO_SRC`` on ``sys.path`` in
-     worker processes (spawn never imports ``videofentanylserver``); sanitize tensors in
+     worker processes (spawn never imports ``server.py``); sanitize tensors in
      ``execute_forward`` replies before ``pipe.send`` (belt-and-suspenders for MPS IPC).
   6. Patch LTX-2 image-to-video: ``ltx2_pipeline.py`` passes ``vae=`` into latent preparation (never
      ``pipeline=``, so workers that import an older ``LTX2LatentPreparationStage`` from site-packages
@@ -241,7 +241,7 @@ MULTIPROC_OSQUEUE_VFNEW = (
     "import os\n"
     "import sys\n"
     "\n"
-    "# videofentanyl: spawn workers never import videofentanylserver; align ``sys.path`` with the repo\n"
+    "# videofentanyl: spawn workers never import server.py; align ``sys.path`` with the repo\n"
     "# submodule before any ``fastvideo`` import so patched LTX2 latent prep (VAE i2v) matches the parent.\n"
     "_FV_SRC = os.environ.get(\"VIDEOFENTANYL_FASTVIDEO_SRC\")\n"
     "if _FV_SRC and os.path.isdir(os.path.join(_FV_SRC, \"fastvideo\")) and _FV_SRC not in sys.path:\n"
@@ -507,7 +507,7 @@ def patch_multiproc_executor_mps_ipc(multiproc_py: Path) -> int:
 # --- ltx2_denoising.py: FV_PROGRESS_JSON lines (after MPS autocast patch) ------------------
 
 LTX2_PROGRESS_MARKER = (
-    "videofentanyl: denoise step progress (FV_PROGRESS_JSON for videofentanylserver)"
+    "videofentanyl: denoise step progress (FV_PROGRESS_JSON for server.py)"
 )
 
 LTX2_PROGRESS_IMPORTS_OLD = """import math
@@ -530,7 +530,7 @@ LTX2_PROGRESS_LOOP_OLD = """        use_vsa = (vsa_available and envs.FASTVIDEO_
 LTX2_PROGRESS_LOOP_NEW = """        use_vsa = (vsa_available and envs.FASTVIDEO_ATTENTION_BACKEND == "VIDEO_SPARSE_ATTN")
         vsa_metadata_builder = (VideoSparseAttentionMetadataBuilder() if use_vsa else None)
 
-        # videofentanyl: denoise step progress (FV_PROGRESS_JSON for videofentanylserver)
+        # videofentanyl: denoise step progress (FV_PROGRESS_JSON for server.py)
         _n_steps = len(sigmas) - 1
         _loop_t0 = time.perf_counter()
         _prev = _loop_t0
@@ -545,7 +545,7 @@ LTX2_PROGRESS_TAIL_OLD = """                audio_latents = (audio_latents.float
 
 LTX2_PROGRESS_TAIL_NEW = """                audio_latents = (audio_latents.float() + audio_velocity.float() * dt).to(audio_latents.dtype)
 
-            # videofentanyl: structured denoise progress (parsed by videofentanylserver)
+            # videofentanyl: structured denoise progress (parsed by server.py)
             _now = time.perf_counter()
             _dt = _now - _prev
             _prev = _now

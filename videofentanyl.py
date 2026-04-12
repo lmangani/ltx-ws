@@ -280,7 +280,7 @@ def msg_session_init_v2(p: GenerationParams, mode: str) -> str:
         })
     else:  # fastvideo
         # Mirror Dreamverse: carry ``initial_image`` on session_init so the server
-        # fallback (videofentanylserver) works for autocontinue / i2v and for
+        # fallback (server.py) works for autocontinue / i2v and for
         # clients that only attach the start frame to session_init_v2.
         return json.dumps({
             "type":                    "session_init_v2",
@@ -1431,7 +1431,7 @@ examples:
         "--server",
         default=None, metavar="URL",
         help="override WebSocket endpoint (e.g. ws://localhost:8765/ws); "
-             "use with videofentanylserver.py for fully local generation",
+             "use with server.py for fully local generation",
     )
 
     return p
