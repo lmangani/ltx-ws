@@ -22,7 +22,9 @@ PROTOCOL — FastVideo (1080p) — server side
 ─────────────────────────────────────────────
   ← session_init_v2    (client handshake; store session state; may include
                         ``initial_image`` / ``initialImage`` for i2v or autocontinue)
-  ← simple_generate    (client triggers generation; same image keys optional here)
+  ← simple_generate    (client triggers generation; optional ``seed``, ``num_frames``,
+                        ``height``, ``width`` override server defaults; same image keys
+                        as session_init for start / continuation frames)
   → queue_status       (position in queue while waiting; active_generation_id)
   → gpu_assigned       (device ready; includes generation_id for this job)
   → ltx2_stream_start
@@ -622,7 +624,7 @@ class LocalVideoGenerator:
         self._reset_model_progress()
 
         try:
-            if image_data:
+            if isinstance(image_data, dict) and image_data:
                 tmp_image = _decode_initial_image(image_data)
 
             # LTX2 text_encoding asserts isinstance(negative_prompt, str); schema default is None.
@@ -869,16 +871,34 @@ class RequestHandler:
         # Resolve initial image: prefer simple_generate, then session_init_v2.
         initial_image: dict | None = _resolve_initial_image_payload(msg, self._session)
 
+        def _msg_int(name: str, default: int) -> int:
+            raw = msg.get(name)
+            if raw is None:
+                return default
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return default
+
+        gen_seed = _msg_int("seed", 1024)
+        gen_num_frames = _msg_int("num_frames", self.generator.num_frames)
+        gen_height = _msg_int("height", self.generator.height)
+        gen_width = _msg_int("width", self.generator.width)
+
         async def _notify_queue(**kwargs: Any) -> None:
             await self._send_json(**kwargs)
 
         async with self.scheduler.generation_slot(_notify_queue) as generation_id:
             t_start = time.time()
             log.info(
-                "  ▶ generation %s  prompt=%r  start_image=%s",
+                "  ▶ generation %s  prompt=%r  start_image=%s  seed=%s  %s×%s  frames=%s",
                 generation_id,
                 prompt[:72],
                 "yes" if initial_image else "no",
+                gen_seed,
+                gen_height,
+                gen_width,
+                gen_num_frames,
             )
 
             # ── gpu_assigned ──────────────────────────────────────────────────
@@ -930,6 +950,10 @@ class RequestHandler:
                         prompt=prompt,
                         image_data=initial_image,
                         negative_prompt=negative_prompt,
+                        seed=gen_seed,
+                        num_frames=gen_num_frames,
+                        height=gen_height,
+                        width=gen_width,
                         job_id=generation_id,
                     )
                 )

@@ -802,6 +802,23 @@ LTX2_LATENT_I2V_BODY_NEW = "".join((
     '        else:\n',
     '            latents = latents.to(device)\n',
     '\n',
+    '        # videofentanyl: reload PIL from image_path when missing (mp/spawn workers may\n',
+    '        # not preserve a pickled PIL; path still points at the temp start image).\n',
+    '        if batch.pil_image is None and batch.image_path is not None:\n',
+    '            from fastvideo.models.vision_utils import load_image, load_video\n',
+    '\n',
+    '            _ip = str(batch.image_path)\n',
+    '            if _ip.endswith(".mp4"):\n',
+    '                batch.pil_image = load_video(_ip)[0]\n',
+    '            else:\n',
+    '                batch.pil_image = load_image(batch.image_path)\n',
+    '\n',
+    '        if self.vae is None and batch.image_path is not None:\n',
+    '            logger.warning(\n',
+    '                "[LTX2] image_path set but latent prep has no VAE — image-to-video disabled "\n',
+    '                "(run scripts/fastvideo_install: ltx2_pipeline wires VAE into this stage).",\n',
+    '            )\n',
+    '\n',
     '        batch.extra.pop("ltx2_i2v_anchor_latents", None)\n',
     '        if (\n',
     '            latent_path is None\n',
@@ -924,6 +941,29 @@ LTX2_I2V_VELOCITY_OLD_COMPACT = '            sigma_value = sigma.to(torch.float3
 
 LTX2_I2V_VELOCITY_NEW = '            sigma_value = sigma.to(torch.float32) if isinstance(sigma, torch.Tensor) else torch.tensor(\n                float(sigma),\n                device=latents.device,\n                dtype=torch.float32,\n            )\n            dt = sigma_next - sigma\n            anchor = batch.extra.get("ltx2_i2v_anchor_latents")\n            if anchor is not None and latents.shape[2] > 1:\n                lat_t = latents[:, :, 1:]\n                pred_t = pos_denoised[:, :, 1:]\n                velocity = ((lat_t.float() - pred_t.float()) / sigma_value).to(latents.dtype)\n                latents = latents.clone()\n                latents[:, :, 1:] = (lat_t.float() + velocity.float() * dt).to(latents.dtype)\n                latents[:, :, :1] = anchor.to(device=latents.device, dtype=latents.dtype)\n            else:\n                velocity = ((latents.float() - pos_denoised.float()) / sigma_value).to(latents.dtype)\n                latents = (latents.float() + velocity.float() * dt).to(latents.dtype)\n            if pos_audio is not None and audio_latents is not None:'
 
+# Inserted between ``latents.to(device)`` and ``batch.extra.pop`` for older i2v-only trees.
+LTX2_LATENT_I2V_RELOAD_GAP_OLD = (
+    "            latents = latents.to(device)\n\n        batch.extra.pop(\"ltx2_i2v_anchor_latents\", None)\n"
+)
+LTX2_LATENT_I2V_RELOAD_GAP_NEW = (
+    "            latents = latents.to(device)\n\n"
+    "        # videofentanyl: reload PIL from image_path when missing (mp/spawn workers may\n"
+    "        # not preserve a pickled PIL; path still points at the temp start image).\n"
+    "        if batch.pil_image is None and batch.image_path is not None:\n"
+    "            from fastvideo.models.vision_utils import load_image, load_video\n\n"
+    "            _ip = str(batch.image_path)\n"
+    "            if _ip.endswith(\".mp4\"):\n"
+    "                batch.pil_image = load_video(_ip)[0]\n"
+    "            else:\n"
+    "                batch.pil_image = load_image(batch.image_path)\n\n"
+    "        if self.vae is None and batch.image_path is not None:\n"
+    "            logger.warning(\n"
+    "                \"[LTX2] image_path set but latent prep has no VAE — image-to-video disabled \"\n"
+    "                \"(run scripts/fastvideo_install: ltx2_pipeline wires VAE into this stage).\",\n"
+    "            )\n\n"
+    "        batch.extra.pop(\"ltx2_i2v_anchor_latents\", None)\n"
+)
+
 
 def patch_ltx2_pipeline_latent_i2v(ltx2_pipeline_py: Path) -> int:
     """Wire VAE into ``LTX2LatentPreparationStage`` for image-to-video (idempotent)."""
@@ -959,8 +999,13 @@ def patch_ltx2_latent_preparation_i2v(latent_py: Path) -> int:
         print(f"Warning: {latent_py} not found — skip LTX2 latent i2v patch", file=sys.stderr)
         return 0
     text = latent_py.read_text(encoding="utf-8")
-    if "def _blend_start_image_into_latents" in text:
-        print(f"Already patched: {latent_py} (LTX2 i2v latent prep)")
+    if "reload PIL from image_path" in text:
+        print(f"Already patched: {latent_py} (LTX2 i2v latent prep + image_path reload)")
+        return 0
+    if LTX2_LATENT_I2V_RELOAD_GAP_OLD in text:
+        text = text.replace(LTX2_LATENT_I2V_RELOAD_GAP_OLD, LTX2_LATENT_I2V_RELOAD_GAP_NEW, 1)
+        latent_py.write_text(text, encoding="utf-8")
+        print(f"Patched {latent_py} (LTX2 i2v: reload PIL from image_path for mp workers)")
         return 0
     if LTX2_LATENT_I2V_IMPORTS_OLD not in text:
         print(

@@ -209,6 +209,11 @@ class GenerationParams:
     auto_extension_enabled:   bool           = False
     loop_generation_enabled:  bool           = False
     initial_image:            Optional[dict] = None
+    # Passed to local server simple_generate (None → server default seed / resolution).
+    seed:                       Optional[int] = None
+    num_frames:                Optional[int] = None
+    height:                     Optional[int] = None
+    width:                      Optional[int] = None
 
 
 @dataclasses.dataclass
@@ -291,7 +296,7 @@ def msg_session_init_v2(p: GenerationParams, mode: str) -> str:
 
 def msg_simple_generate(p: GenerationParams) -> str:
     """FastVideo only — trigger generation after session_init_v2."""
-    return json.dumps({
+    d: dict[str, Any] = {
         "type":                "simple_generate",
         "preset_id":           p.preset_id,
         "prompt_id":           p.preset_id,
@@ -299,7 +304,16 @@ def msg_simple_generate(p: GenerationParams) -> str:
         "initial_image":       p.initial_image,
         "single_clip_mode":    True,
         "enhancement_enabled": p.enhancement_enabled,
-    })
+    }
+    if p.seed is not None:
+        d["seed"] = int(p.seed)
+    if p.num_frames is not None:
+        d["num_frames"] = int(p.num_frames)
+    if p.height is not None:
+        d["height"] = int(p.height)
+    if p.width is not None:
+        d["width"] = int(p.width)
+    return json.dumps(d)
 
 
 def msg_append_prompt(prompt: str, prompt_id: str | None = None) -> str:
@@ -864,8 +878,11 @@ class GenerationQueue:
                 if self.autocontinue and i + 1 < len(self.jobs):
                     frame = extract_last_frame(job.output_path)
                     if frame:
-                        self.jobs[i + 1].params.initial_image = frame
-                        print(f"  → autocontinue: last frame → job {i + 2:02d}")
+                        nxt = self.jobs[i + 1].params
+                        nxt.initial_image = frame
+                        # Vary seed so a missed i2v path does not reproduce the same noise as clip 1.
+                        nxt.seed = int(time.time_ns() % (2**31 - 1)) or 1
+                        print(f"  → autocontinue: last frame → job {i + 2:02d}  seed={nxt.seed}")
             else:
                 failed += 1
                 print(f"  ✗ FAILED  {job.error}")
