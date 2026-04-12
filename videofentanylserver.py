@@ -179,10 +179,22 @@ class LocalVideoGenerator:
                     "missing registry entry in installed FastVideo version."
                 )
             except ImportError:
-                log.warning(
-                    "fastvideo.configs.pipelines.ltx2.LTX2T2VConfig not "
-                    "importable; falling back to registry auto-detection."
-                )
+                # LTX2T2VConfig is absent → the installed FastVideo predates
+                # LTX2 support entirely.  The registry auto-detection path
+                # will also fail, so raise immediately with clear instructions.
+                try:
+                    import fastvideo
+                    installed_ver = getattr(fastvideo, "__version__", "unknown")
+                except ImportError:
+                    installed_ver = "not installed"
+                raise RuntimeError(
+                    f"The installed FastVideo ({installed_ver}) does not "
+                    "support the LTX2 model family.  Please upgrade to the "
+                    "latest version:\n\n"
+                    "  pip install --upgrade fastvideo\n\n"
+                    "or install from source:\n\n"
+                    "  pip install git+https://github.com/hao-ai-lab/FastVideo.git\n"
+                ) from None
 
         self._generator = VideoGenerator.from_pretrained(
             local_path,
