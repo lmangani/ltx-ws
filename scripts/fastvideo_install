@@ -3,7 +3,9 @@
 Install FastVideo for videofentanyl (especially Apple Silicon / MPS).
 
 Does the full sequence that upstream docs omit:
-  1. Initialize the FastVideo git submodule (this repo layout).
+  1. Initialize the FastVideo git submodule (this repo layout). If the recorded commit is
+     not available from the public FastVideo remote, submodule update may fail; an existing
+     ``third_party/FastVideo`` checkout is still patched and the script prints the gitlink SHA.
   2. Patch pyproject.toml so ``fastvideo-kernel`` (Triton / Linux CUDA wheels only)
      is not required on macOS — MPS uses Torch SDPA and does not need it.
   3. Patch ``ltx2_denoising.py``: ``torch.autocast`` uses the active device (MPS/CUDA),
@@ -27,7 +29,7 @@ Standalone clone (skip submodule step):
 
   python scripts/fastvideo_install --path ~/src/FastVideo
 
-Re-run is safe: submodule update and patches are idempotent.
+Re-run is safe: submodule update (best effort) and patches are idempotent.
 """
 from __future__ import annotations
 
@@ -48,6 +50,24 @@ KERNEL_DEP_RE = re.compile(
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def recorded_submodule_commit(repo: Path, submodule_relpath: str) -> str | None:
+    """Gitlink SHA the parent repo records for ``submodule_relpath`` (index or HEAD), or None."""
+    for rev in (f"HEAD:{submodule_relpath}", f":{submodule_relpath}"):
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", rev],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            sha = out.stdout.strip()
+            if len(sha) >= 7 and all(c in "0123456789abcdef" for c in sha.lower()):
+                return sha
+        except (subprocess.CalledProcessError, OSError):
+            continue
+    return None
 
 
 def patch_pyproject(pyproject: Path) -> int:
@@ -1005,7 +1025,7 @@ def main() -> int:
     p.add_argument(
         "--no-submodule",
         action="store_true",
-        help="Do not run git submodule update (use with --path or after manual init)",
+        help="Do not run git submodule update (use with --path, missing-remote SHAs, or manual init)",
     )
     p.add_argument(
         "--no-install",
@@ -1032,22 +1052,53 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        try:
-            run(
-                [
-                    "git",
-                    "-C",
-                    str(root),
-                    "submodule",
-                    "update",
-                    "--init",
-                    "--recursive",
-                    "third_party/FastVideo",
-                ]
+        gitlink = recorded_submodule_commit(root, "third_party/FastVideo")
+        sm_cmd = [
+            "git",
+            "-C",
+            str(root),
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+            "third_party/FastVideo",
+        ]
+        print("+", " ".join(sm_cmd), flush=True)
+        sm = subprocess.run(sm_cmd, cwd=str(root))
+        if sm.returncode != 0:
+            print(
+                "Warning: git submodule update failed (remote may not publish the recorded commit).",
+                file=sys.stderr,
             )
-        except subprocess.CalledProcessError:
-            print("Error: git submodule update failed.", file=sys.stderr)
-            return 1
+            if gitlink:
+                print(
+                    f"  Recorded submodule gitlink for third_party/FastVideo: {gitlink}",
+                    file=sys.stderr,
+                )
+                print(
+                    "  Maintainership: point the submodule at a commit that exists on the "
+                    "default FastVideo remote, or document a fork URL in .gitmodules.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "  (Could not read recorded submodule SHA from the parent repo index/HEAD.)",
+                    file=sys.stderr,
+                )
+            usable = fv.is_dir() and (fv / "pyproject.toml").is_file()
+            if not usable:
+                print(
+                    "Error: no usable FastVideo tree after submodule failure. Options:\n"
+                    "  • Clone FastVideo elsewhere and run: python scripts/fastvideo_install --path DIR\n"
+                    "  • Or: git submodule update --init third_party/FastVideo "
+                    "after fixing the submodule remote / recorded commit.",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                "  Continuing with the existing FastVideo checkout; applying videofentanyl patches.",
+                file=sys.stderr,
+            )
 
     if not fv.is_dir():
         print(f"Error: FastVideo directory not found: {fv}", file=sys.stderr)
