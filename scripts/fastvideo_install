@@ -715,11 +715,12 @@ LTX2_LATENT_I2V_BODY_OLD = "".join((
 
 
 LTX2_LATENT_I2V_BODY_NEW = "".join((
-    '    def __init__(self, transformer, vae: Any | None = None, pipeline: Any | None = None) -> None:\n',
+    '    def __init__(self, transformer, vae: Any | None = None, **kwargs: Any) -> None:\n',
     '        super().__init__()\n',
     '        self.transformer = transformer\n',
     '        self.vae = vae\n',
-    '        self._pipeline = pipeline\n',
+    '        self._pipeline = kwargs.pop("pipeline", None)\n',
+    '        kwargs.clear()\n',
     '\n',
     '    def _resolve_vae(self) -> Any | None:\n',
     '        if self.vae is not None:\n',
@@ -992,12 +993,33 @@ LTX2_LATENT_I2V_INIT_CLEAN = (
     "        return self.vae\n"
 )
 
-LTX2_LATENT_I2V_INIT_TARGET = (
+# Previous install used a named ``pipeline`` parameter; migrate to ``**kwargs`` for ctor robustness.
+LTX2_LATENT_I2V_INIT_TARGET_LEGACY = (
     "    def __init__(self, transformer, vae: Any | None = None, pipeline: Any | None = None) -> None:\n"
     "        super().__init__()\n"
     "        self.transformer = transformer\n"
     "        self.vae = vae\n"
     "        self._pipeline = pipeline\n"
+    "\n"
+    "    def _resolve_vae(self) -> Any | None:\n"
+    "        if self.vae is not None:\n"
+    "            return self.vae\n"
+    "        p = self._pipeline\n"
+    "        if p is None:\n"
+    "            return None\n"
+    "        modules = getattr(p, \"modules\", None)\n"
+    "        if isinstance(modules, dict):\n"
+    "            return modules.get(\"vae\")\n"
+    "        return None\n"
+)
+
+LTX2_LATENT_I2V_INIT_TARGET = (
+    "    def __init__(self, transformer, vae: Any | None = None, **kwargs: Any) -> None:\n"
+    "        super().__init__()\n"
+    "        self.transformer = transformer\n"
+    "        self.vae = vae\n"
+    "        self._pipeline = kwargs.pop(\"pipeline\", None)\n"
+    "        kwargs.clear()\n"
     "\n"
     "    def _resolve_vae(self) -> Any | None:\n"
     "        if self.vae is not None:\n"
@@ -1089,6 +1111,13 @@ def patch_ltx2_latent_preparation_i2v(latent_py: Path) -> int:
             encoding="utf-8",
         )
         print(f"Migrated {latent_py} (LTX2 latent prep __init__: normalize optional pipeline= + VAE resolver)")
+        return 0
+    if LTX2_LATENT_I2V_INIT_TARGET_LEGACY in text:
+        latent_py.write_text(
+            text.replace(LTX2_LATENT_I2V_INIT_TARGET_LEGACY, LTX2_LATENT_I2V_INIT_TARGET, 1),
+            encoding="utf-8",
+        )
+        print(f"Migrated {latent_py} (LTX2 latent prep __init__: use **kwargs for pipeline= compat)")
         return 0
     if LTX2_LATENT_I2V_INIT_CLEAN in text:
         latent_py.write_text(

@@ -89,6 +89,32 @@ def _ensure(pkg: str, import_as: str | None = None):
 
 websockets = _ensure("websockets")
 
+
+def _prepend_repo_fastvideo_to_sys_path() -> None:
+    """
+    Prefer this repo's ``third_party/FastVideo`` on ``sys.path`` (and ``PYTHONPATH``) so the
+    parent process and multiprocessing **spawn** children import a single patched tree.
+    Without this, ``ltx2_pipeline`` can load from the submodule while ``LTX2LatentPreparationStage``
+    still comes from another editable / site-packages ``fastvideo`` checkout.
+    """
+    root = Path(__file__).resolve().parent
+    fv = root / "third_party" / "FastVideo"
+    if not fv.is_dir() or not (fv / "fastvideo").is_dir():
+        return
+    s = str(fv.resolve())
+    if s not in sys.path:
+        sys.path.insert(0, s)
+    prev = os.environ.get("PYTHONPATH", "")
+    if prev:
+        parts = prev.split(os.pathsep)
+        if s not in parts:
+            os.environ["PYTHONPATH"] = s + os.pathsep + prev
+    else:
+        os.environ["PYTHONPATH"] = s
+
+
+_prepend_repo_fastvideo_to_sys_path()
+
 # ── Constants / defaults ───────────────────────────────────────────────────────
 
 DEFAULT_HOST           = "0.0.0.0"
