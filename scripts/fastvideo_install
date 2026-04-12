@@ -615,9 +615,10 @@ LTX2_LATENT_I2V_IMPORTS_NEW = 'from __future__ import annotations\n\nfrom pathli
 
 LTX2_PIPELINE_LATENT_STAGE_OLD = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(transformer=self.get_module("transformer"), ),\n        )'
 
-LTX2_PIPELINE_LATENT_STAGE_PREVIOUS = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(\n                transformer=self.get_module("transformer"),\n                vae=self.get_module("vae"),\n            ),\n        )'
+LTX2_PIPELINE_LATENT_STAGE_NEW = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(\n                transformer=self.get_module("transformer"),\n                vae=self.get_module("vae"),\n            ),\n        )'
 
-LTX2_PIPELINE_LATENT_STAGE_NEW = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(\n                transformer=self.get_module("transformer"),\n                vae=self.get_module("vae"),\n                pipeline=self,\n            ),\n        )'
+# Older videofentanyl patch passed ``pipeline=self``; ``LTX2LatentPreparationStage`` must not require it.
+LTX2_PIPELINE_LATENT_STAGE_WITH_PIPELINE = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(\n                transformer=self.get_module("transformer"),\n                vae=self.get_module("vae"),\n                pipeline=self,\n            ),\n        )'
 
 
 LTX2_LATENT_I2V_BODY_OLD = "".join((
@@ -715,24 +716,13 @@ LTX2_LATENT_I2V_BODY_OLD = "".join((
 
 
 LTX2_LATENT_I2V_BODY_NEW = "".join((
-    '    def __init__(self, transformer, vae: Any | None = None, pipeline: Any | None = None) -> None:\n',
+    '    def __init__(self, transformer, vae: Any | None = None) -> None:\n',
     '        super().__init__()\n',
     '        self.transformer = transformer\n',
     '        self.vae = vae\n',
-    '        # videofentanyl: upstream ``ltx2_pipeline`` only passes ``transformer``; resolve VAE\n',
-    "        # from the composed pipeline's module dict (same object DecodingStage uses).\n",
-    '        self._pipeline = pipeline\n',
     '\n',
     '    def _resolve_vae(self) -> Any | None:\n',
-    '        if self.vae is not None:\n',
-    '            return self.vae\n',
-    '        p = getattr(self, "_pipeline", None)\n',
-    '        if p is None:\n',
-    '            return None\n',
-    '        modules = getattr(p, "modules", None)\n',
-    '        if isinstance(modules, dict):\n',
-    '            return modules.get("vae")\n',
-    '        return None\n',
+    '        return self.vae\n',
     '\n',
     '    def forward(\n',
     '        self,\n',
@@ -833,8 +823,8 @@ LTX2_LATENT_I2V_BODY_NEW = "".join((
     '        vae_mod = self._resolve_vae()\n',
     '        if vae_mod is None and batch.image_path is not None:\n',
     '            logger.warning(\n',
-    '                "[LTX2] image_path set but no VAE on latent prep or pipeline.modules — "\n',
-    '                "image-to-video disabled (use patched ltx2_pipeline.py or pass pipeline=self).",\n',
+    '                "[LTX2] image_path set but latent prep has no VAE — image-to-video disabled "\n',
+    '                "(run scripts/fastvideo_install so ltx2_pipeline wires vae= into this stage).",\n',
     '            )\n',
     '\n',
     '        batch.extra.pop("ltx2_i2v_anchor_latents", None)\n',
@@ -962,6 +952,39 @@ LTX2_I2V_VELOCITY_OLD_COMPACT = '            sigma_value = sigma.to(torch.float3
 
 LTX2_I2V_VELOCITY_NEW = '            sigma_value = sigma.to(torch.float32) if isinstance(sigma, torch.Tensor) else torch.tensor(\n                float(sigma),\n                device=latents.device,\n                dtype=torch.float32,\n            )\n            dt = sigma_next - sigma\n            anchor = batch.extra.get("ltx2_i2v_anchor_latents")\n            if anchor is not None and latents.shape[2] > 1:\n                lat_t = latents[:, :, 1:]\n                pred_t = pos_denoised[:, :, 1:]\n                velocity = ((lat_t.float() - pred_t.float()) / sigma_value).to(latents.dtype)\n                latents = latents.clone()\n                latents[:, :, 1:] = (lat_t.float() + velocity.float() * dt).to(latents.dtype)\n                latents[:, :, :1] = anchor.to(device=latents.device, dtype=latents.dtype)\n            else:\n                velocity = ((latents.float() - pos_denoised.float()) / sigma_value).to(latents.dtype)\n                latents = (latents.float() + velocity.float() * dt).to(latents.dtype)\n            if pos_audio is not None and audio_latents is not None:'
 
+# Older i2v latent prep used ``pipeline=`` on ``__init__``; strip for ``LTX2LatentPreparationStage`` compat.
+LTX2_LATENT_I2V_INIT_WITH_PIPELINE_OLD = (
+    "    def __init__(self, transformer, vae: Any | None = None, pipeline: Any | None = None) -> None:\n"
+    "        super().__init__()\n"
+    "        self.transformer = transformer\n"
+    "        self.vae = vae\n"
+    "        # videofentanyl: upstream ``ltx2_pipeline`` only passes ``transformer``; resolve VAE\n"
+    "        # from the composed pipeline's module dict (same object DecodingStage uses).\n"
+    "        self._pipeline = pipeline\n"
+    "\n"
+    "    def _resolve_vae(self) -> Any | None:\n"
+    "        if self.vae is not None:\n"
+    "            return self.vae\n"
+    "        p = getattr(self, \"_pipeline\", None)\n"
+    "        if p is None:\n"
+    "            return None\n"
+    "        modules = getattr(p, \"modules\", None)\n"
+    "        if isinstance(modules, dict):\n"
+    "            return modules.get(\"vae\")\n"
+    "        return None\n"
+)
+
+LTX2_LATENT_I2V_INIT_CLEAN = (
+    "    def __init__(self, transformer, vae: Any | None = None) -> None:\n"
+    "        super().__init__()\n"
+    "        self.transformer = transformer\n"
+    "        self.vae = vae\n"
+    "\n"
+    "    def _resolve_vae(self) -> Any | None:\n"
+    "        return self.vae\n"
+)
+
+
 # Inserted between ``latents.to(device)`` and ``batch.extra.pop`` for older i2v-only trees.
 LTX2_LATENT_I2V_RELOAD_GAP_OLD = (
     "            latents = latents.to(device)\n\n        batch.extra.pop(\"ltx2_i2v_anchor_latents\", None)\n"
@@ -977,41 +1000,34 @@ LTX2_LATENT_I2V_RELOAD_GAP_NEW = (
     "                batch.pil_image = load_video(_ip)[0]\n"
     "            else:\n"
     "                batch.pil_image = load_image(batch.image_path)\n\n"
-    "        vae_mod = self.vae\n"
-    "        if vae_mod is None:\n"
-    "            _p = getattr(self, \"_pipeline\", None)\n"
-    "            _mods = getattr(_p, \"modules\", None) if _p is not None else None\n"
-    "            if isinstance(_mods, dict):\n"
-    "                vae_mod = _mods.get(\"vae\")\n"
-    "        if vae_mod is None and batch.image_path is not None:\n"
+    "        if self.vae is None and batch.image_path is not None:\n"
     "            logger.warning(\n"
-    "                \"[LTX2] image_path set but no VAE on latent prep or pipeline.modules — \"\n"
-    "                \"image-to-video disabled (use patched ltx2_pipeline.py or pass pipeline=self).\",\n"
+    "                \"[LTX2] image_path set but latent prep has no VAE — image-to-video disabled \"\n"
+    "                \"(run scripts/fastvideo_install so ltx2_pipeline wires vae= into this stage).\",\n"
     "            )\n\n"
     "        batch.extra.pop(\"ltx2_i2v_anchor_latents\", None)\n"
 )
 
 
 def patch_ltx2_pipeline_latent_i2v(ltx2_pipeline_py: Path) -> int:
-    """Wire VAE + pipeline into ``LTX2LatentPreparationStage`` for image-to-video (idempotent)."""
+    """Wire VAE into ``LTX2LatentPreparationStage`` for image-to-video (idempotent)."""
     if not ltx2_pipeline_py.is_file():
         print(f"Warning: {ltx2_pipeline_py} not found — skip LTX2 pipeline i2v patch", file=sys.stderr)
         return 0
     text = ltx2_pipeline_py.read_text(encoding="utf-8")
+    if LTX2_PIPELINE_LATENT_STAGE_WITH_PIPELINE in text:
+        ltx2_pipeline_py.write_text(
+            text.replace(LTX2_PIPELINE_LATENT_STAGE_WITH_PIPELINE, LTX2_PIPELINE_LATENT_STAGE_NEW, 1),
+            encoding="utf-8",
+        )
+        print(f"Migrated {ltx2_pipeline_py} (removed pipeline= from LTX2LatentPreparationStage ctor)")
+        return 0
     if (
         'stage_name="latent_preparation_stage"' in text
         and 'vae=self.get_module("vae")' in text
-        and "pipeline=self" in text
         and "LTX2LatentPreparationStage" in text
     ):
-        print(f"Already patched: {ltx2_pipeline_py} (LTX2 latent stage VAE + pipeline)")
-        return 0
-    if LTX2_PIPELINE_LATENT_STAGE_PREVIOUS in text:
-        ltx2_pipeline_py.write_text(
-            text.replace(LTX2_PIPELINE_LATENT_STAGE_PREVIOUS, LTX2_PIPELINE_LATENT_STAGE_NEW, 1),
-            encoding="utf-8",
-        )
-        print(f"Patched {ltx2_pipeline_py} (LTX2 latent prep: add pipeline=self for VAE resolution)")
+        print(f"Already patched: {ltx2_pipeline_py} (LTX2 latent stage VAE)")
         return 0
     if LTX2_PIPELINE_LATENT_STAGE_OLD not in text:
         print(
@@ -1024,7 +1040,7 @@ def patch_ltx2_pipeline_latent_i2v(ltx2_pipeline_py: Path) -> int:
         text.replace(LTX2_PIPELINE_LATENT_STAGE_OLD, LTX2_PIPELINE_LATENT_STAGE_NEW, 1),
         encoding="utf-8",
     )
-    print(f"Patched {ltx2_pipeline_py} (LTX2 latent prep receives VAE + pipeline for i2v)")
+    print(f"Patched {ltx2_pipeline_py} (LTX2 latent prep receives VAE for i2v)")
     return 0
 
 
@@ -1034,6 +1050,13 @@ def patch_ltx2_latent_preparation_i2v(latent_py: Path) -> int:
         print(f"Warning: {latent_py} not found — skip LTX2 latent i2v patch", file=sys.stderr)
         return 0
     text = latent_py.read_text(encoding="utf-8")
+    if LTX2_LATENT_I2V_INIT_WITH_PIPELINE_OLD in text:
+        latent_py.write_text(
+            text.replace(LTX2_LATENT_I2V_INIT_WITH_PIPELINE_OLD, LTX2_LATENT_I2V_INIT_CLEAN, 1),
+            encoding="utf-8",
+        )
+        print(f"Migrated {latent_py} (LTX2 latent prep __init__: drop pipeline= / _pipeline fallback)")
+        return 0
     if "reload PIL from image_path" in text:
         print(f"Already patched: {latent_py} (LTX2 i2v latent prep + image_path reload)")
         return 0
