@@ -427,9 +427,13 @@ class LocalVideoGenerator:
                 "_share_filename_ / MPS over multiprocessing pipes)."
             )
 
+        # log_queue here (not on ``generate()``): workers inherit it at spawn.
+        # Passing a Queue through ``set_log_queue`` RPC pickles it and raises
+        # "Queue objects should only be shared between processes through inheritance".
         self._generator = VideoGenerator.from_pretrained(
             local_path,
             num_gpus=self.num_gpus,
+            log_queue=self._fv_log_queue,
             # Default: no heavy CPU offload (MPS throughput). Opt-in via
             # --mac-ipc-safe-offload if worker IPC requires CPU-resident tensors.
             dit_cpu_offload=_heavy,
@@ -619,10 +623,7 @@ class LocalVideoGenerator:
             )
 
             try:
-                result = self._generator.generate(
-                    request=request,
-                    log_queue=self._fv_log_queue,
-                )
+                result = self._generator.generate(request=request)
             except BaseException:
                 self._salvage_mp4_to_spill(
                     tmpdir, out_path, job_id, prompt, "ENCODE_FAIL",
