@@ -139,31 +139,119 @@ DECODING_FRAMES_NEW = f"""        # {DECODING_CPU_MARKER} (MPS cannot _share_fil
         # Crop padding if this is a LongCat refinement"""
 
 
+DECODING_VAE_CPU_MARKER = "videofentanyl: VAE output on CPU"
+
+DECODING_DECODE_RETURN_OLD = """        # Normalize image to [0, 1] range
+        image = (image / 2 + 0.5).clamp(0, 1)
+        return image
+
+    @torch.no_grad()
+    def streaming_decode("""
+
+DECODING_DECODE_RETURN_NEW = """        # Normalize image to [0, 1] range
+        image = (image / 2 + 0.5).clamp(0, 1)
+        # videofentanyl: VAE output on CPU before any IPC (MPS cannot _share_filename_).
+        return image.to(torch.float32).detach().cpu().contiguous()
+
+    @torch.no_grad()
+    def streaming_decode("""
+
+DECODING_STREAMING_RETURN_OLD = """        # Normalize image to [0, 1] range
+        image = (image / 2 + 0.5).clamp(0, 1)
+        assert cache is not None, "cache should not be None after streaming_decode"
+        return image, cache
+
+    @torch.no_grad()
+    def forward("""
+
+DECODING_STREAMING_RETURN_NEW = """        # Normalize image to [0, 1] range
+        image = (image / 2 + 0.5).clamp(0, 1)
+        assert cache is not None, "cache should not be None after streaming_decode"
+        image = image.to(torch.float32).detach().cpu().contiguous()
+        return image, cache
+
+    @torch.no_grad()
+    def forward("""
+
+
 def patch_decoding_mps_ipc(decoding_py: Path) -> int:
-    """Ensure decoded frames are CPU before IPC (idempotent)."""
+    """CPU tensors for multiprocessing IPC: forward() batch.output + VAE returns."""
     if not decoding_py.is_file():
         print(f"Warning: {decoding_py} not found — skip decoding patch", file=sys.stderr)
         return 0
     text = decoding_py.read_text(encoding="utf-8")
-    if DECODING_CPU_MARKER in text:
-        print(f"Already patched: {decoding_py} (CPU decode for IPC)")
-        return 0
-    if DECODING_FRAMES_OLD not in text:
+    orig = text
+    if DECODING_FRAMES_OLD in text:
+        text = text.replace(DECODING_FRAMES_OLD, DECODING_FRAMES_NEW, 1)
+        print(f"Patched {decoding_py} (forward CPU batch.output)")
+    elif DECODING_CPU_MARKER not in text:
         print(
             f"Warning: expected float32 block not found in {decoding_py} — "
-            "skip decoding IPC patch",
+            "skip forward IPC patch",
             file=sys.stderr,
         )
+
+    if DECODING_VAE_CPU_MARKER not in text:
+        if DECODING_DECODE_RETURN_OLD in text:
+            text = text.replace(DECODING_DECODE_RETURN_OLD, DECODING_DECODE_RETURN_NEW, 1)
+        if DECODING_STREAMING_RETURN_OLD in text:
+            text = text.replace(DECODING_STREAMING_RETURN_OLD, DECODING_STREAMING_RETURN_NEW, 1)
+        if text != orig:
+            print(f"Patched {decoding_py} (VAE decode/streaming_decode → CPU)")
+
+    if text != orig:
+        decoding_py.write_text(text, encoding="utf-8")
         return 0
-    decoding_py.write_text(text.replace(DECODING_FRAMES_OLD, DECODING_FRAMES_NEW, 1), encoding="utf-8")
-    print(f"Patched {decoding_py} (CPU tensors for multiprocessing IPC)")
+    if DECODING_CPU_MARKER in text and DECODING_VAE_CPU_MARKER in text:
+        print(f"Already patched: {decoding_py} (CPU decode for IPC)")
     return 0
 
 
 # --- multiproc_executor.py: sanitize tensors before pipe.send ----------------------------
 
 MULTIPROC_IPC_MARKER = "_tensor_for_worker_ipc_send"
+MULTIPROC_DEEP_MARKER = "_deep_ipc_safe"
 
+MULTIPROC_SHALLOW_SANITIZE = """def _sanitize_worker_ipc_tensors(
+    output_tensor: Any,
+    extra: dict[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    if isinstance(output_tensor, torch.Tensor):
+        output_tensor = _tensor_for_worker_ipc_send(output_tensor)
+    cleaned: dict[str, Any] = {}
+    for key, val in extra.items():
+        if isinstance(val, torch.Tensor):
+            cleaned[key] = _tensor_for_worker_ipc_send(val)
+        else:
+            cleaned[key] = val
+    return output_tensor, cleaned
+
+"""
+
+MULTIPROC_DEEP_SANITIZE = """def _deep_ipc_safe(obj: Any) -> Any:
+    \"\"\"Move every ``torch.Tensor`` (nested dict/list/tuple) to CPU for pickling.\"\"\"
+    if isinstance(obj, torch.Tensor):
+        return _tensor_for_worker_ipc_send(obj)
+    if isinstance(obj, dict):
+        return {k: _deep_ipc_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deep_ipc_safe(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_deep_ipc_safe(v) for v in obj)
+    return obj
+
+
+def _sanitize_worker_ipc_tensors(
+    output_tensor: Any,
+    extra: dict[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    out = _deep_ipc_safe(output_tensor)
+    ex = _deep_ipc_safe(extra)
+    if not isinstance(ex, dict):
+        ex = dict(extra or {})
+    return out, ex
+
+"""
 
 MULTIPROC_HELPERS = '''
 def _tensor_for_worker_ipc_send(t: torch.Tensor) -> torch.Tensor:
@@ -178,21 +266,7 @@ def _tensor_for_worker_ipc_send(t: torch.Tensor) -> torch.Tensor:
     return t.detach().cpu().contiguous()
 
 
-def _sanitize_worker_ipc_tensors(
-    output_tensor: Any,
-    extra: dict[str, Any],
-) -> tuple[Any, dict[str, Any]]:
-    if isinstance(output_tensor, torch.Tensor):
-        output_tensor = _tensor_for_worker_ipc_send(output_tensor)
-    cleaned: dict[str, Any] = {}
-    for key, val in extra.items():
-        if isinstance(val, torch.Tensor):
-            cleaned[key] = _tensor_for_worker_ipc_send(val)
-        else:
-            cleaned[key] = val
-    return output_tensor, cleaned
-
-'''
+''' + MULTIPROC_DEEP_SANITIZE
 
 MULTIPROC_SEND_OLD = """                        result = output_batch.output
                         extra = output_batch.extra or {}
@@ -220,8 +294,20 @@ def patch_multiproc_executor_mps_ipc(multiproc_py: Path) -> int:
         print(f"Warning: {multiproc_py} not found — skip multiproc IPC patch", file=sys.stderr)
         return 0
     text = multiproc_py.read_text(encoding="utf-8")
+    if MULTIPROC_DEEP_MARKER in text:
+        print(f"Already patched: {multiproc_py} (deep worker IPC tensor sanitize)")
+        return 0
+    if MULTIPROC_IPC_MARKER in text and MULTIPROC_SHALLOW_SANITIZE in text:
+        text = text.replace(MULTIPROC_SHALLOW_SANITIZE, MULTIPROC_DEEP_SANITIZE, 1)
+        multiproc_py.write_text(text, encoding="utf-8")
+        print(f"Upgraded {multiproc_py} (shallow → deep IPC tensor sanitize)")
+        return 0
     if MULTIPROC_IPC_MARKER in text:
-        print(f"Already patched: {multiproc_py} (worker IPC tensor sanitize)")
+        print(
+            f"Warning: {multiproc_py} has IPC helpers but not the expected shallow block — "
+            "skip multiproc IPC patch",
+            file=sys.stderr,
+        )
         return 0
     if MULTIPROC_SEND_OLD not in text:
         print(
