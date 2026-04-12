@@ -20,13 +20,6 @@ curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/requiremen
 pip install -r requirements.txt
 ```
 
-The original single-backend scripts are still available:
-
-```bash
-curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/legacy/fastvideo.py
-curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/legacy/dreamverse.py
-```
-
 ---
 
 ### Usage
@@ -126,8 +119,7 @@ python videofentanyl.py \
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
-| `--timeout SECS` | `-t` | _(none)_ | Optional hard wall-clock cap per video; omit to wait until completion, idle failure, or server close. |
-| `--idle-timeout SECS` | | `120` (hosted); **`300`** with `--server` | Fail if no WebSocket traffic for this long (keepalives count). |
+| `--idle-timeout SECS` | | `120` (hosted); **unlimited** with `--server` | If set, no application message for this long triggers a WebSocket ping; only a failed pong ends the session. With `--server`, omit this flag to wait indefinitely for the next server frame (keepalives + `generation_status` traffic still flow). |
 | `--delay SECS` | `-d` | `1.0` / `2.0` | Pause between consecutive jobs. |
 | `--retries N` | `-r` | `1` | Max attempts per job (exponential backoff). |
 
@@ -256,10 +248,12 @@ pulls **Triton**. Triton and the published `fastvideo-kernel` wheels target
 The **MPS** code path in FastVideo uses **Torch SDPA** only and does not need
 `fastvideo-kernel` for LTX2 inference in `videofentanylserver.py`. Use
 `scripts/fastvideo_install` so the submodule, **pyproject** workaround (gate
-`fastvideo-kernel` to Linux x86_64), **patches LTX2 denoising** so
-`torch.autocast` uses **`mps` + `float16`** on Apple Silicon (upstream uses
-`device_type="cuda"`, which triggers *“CUDA is not available … Disabling autocast”*
-and turns off mixed-precision in that block), then runs **editable install**.
+`fastvideo-kernel` to Linux x86_64), **patches FastVideo sources** for Apple Silicon:
+LTX2 denoising uses **`torch.autocast` on the active device** (MPS/CUDA, not
+hard-coded `cuda`), optional **`FV_PROGRESS_JSON`** lines for local-server
+keepalives, **decoded frames on CPU** for multiprocessing IPC, and **worker
+`pipe.send` sanitization** so MPS tensors never hit `_share_filename_: only
+available on CPU`, then runs **editable install**.
 
 After `git pull` inside your FastVideo clone, re-run
 `python scripts/fastvideo_install --no-install` (from this repo) to re-apply patches.
@@ -326,14 +320,17 @@ python videofentanylserver.py --model ./models/LTX2-Distilled-Diffusers
 
 #### Generate videos locally
 
-Use the `--server` flag to point the client at your local server.
+Use the `--server` flag to point **`videofentanyl.py`** at your local server.
 
 While the model runs, `videofentanylserver.py` emits **`generation_keepalive`** JSON
-about every 15 seconds so the client can tell the session is still alive. By default
-the client sets **no wall-clock deadline** (`--timeout` omitted): the job finishes when
-the stream completes, the **server closes the WebSocket**, or **nothing arrives** for
-`--idle-timeout` (default **300 s** with `--server`, **120 s** on the hosted API — use
-`-t` only if you want an optional maximum session length).
+about every 15 seconds (with optional **`model_progress`**: denoise step, total steps,
+rolling average seconds per step, and ETA parsed from FastVideo worker logs), accepts
+**`generation_status`** from the client, and replies with **`generation_status_ack`**
+including the same **`model_progress`** when available. The client has **no wall-clock session limit**; with
+`--server` the default **idle** limit is **unlimited** (use `--idle-timeout` only if you
+want a finite silence cap). On the hosted API the default idle is **120 s** (then a
+WebSocket ping probe). If the client disconnects after the MP4 is ready, the server
+copies the file into **`fvserver_completed/`** (override with `--spill-dir`).
 
 ```bash
 # Text-to-video
@@ -369,6 +366,8 @@ python videofentanyl.py --server ws://localhost:8765/ws \
 | `--torch-compile` | off | Enable `torch.compile` in FastVideo (experimental on MPS; needs a recent PyTorch). |
 | `--attention-backend` | `TORCH_SDPA` | Attention backend: `TORCH_SDPA` (MPS/CPU) or `FLASH_ATTN` (CUDA). |
 | `--chunk-size` | `65536` | Binary chunk size in bytes. |
+| `--spill-dir` | `fvserver_completed` | If the client disconnects after the MP4 is encoded (or during download), copy the finished file here. On encode failure, the server also tries to salvage `*_ENCODE_FAIL*.mp4` from the temp workdir. |
+| `--mac-ipc-safe-offload` | off | **Rare escape hatch:** enables DiT/VAE/text-encoder CPU offload so more tensors are CPU at FastVideo worker pipe boundaries. **Very slow** on MPS; only if you hit errors like `_share_filename_: only available on CPU`. Default keeps offload off for normal throughput. |
 | `--verbose` / `-v` | off | Per-connection protocol logging. |
 
 On **Apple MPS**, use a current **PyTorch** build (2.5+ recommended) with Metal support; the server logs the active version at startup and applies light runtime tuning (`float32_matmul_precision`, bf16 accumulation where supported). FastVideo still runs inference in a **multiprocess** worker, so wall time will not match a minimal single-process diffusers script — lowering `--infer-steps` is the main quality/speed trade-off for distilled weights.
@@ -381,8 +380,10 @@ On **Apple MPS**, use a current **PyTorch** build (2.5+ recommended) with Metal 
 ```
 connect → session_init_v2    (handshake)
         → simple_generate    (trigger generation)
+        → generation_status  (optional client poll while waiting)
         ← gpu_assigned
         ← ltx2_segment_start / ltx2_segment_complete
+        ← generation_keepalive / generation_status_ack  (local server)
         ← [binary chunks]    (raw video data)
         ← ltx2_stream_complete
 ```

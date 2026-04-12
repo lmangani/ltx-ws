@@ -130,8 +130,7 @@ python videofentanyl.py --mode dreamverse --prompt "test" --output-dir ./videos 
 | `--output-dir DIR` | `-o` | `.` | Save directory. |
 | `--prefix STR` | | `video` / `dreamverse` | Filename prefix (per-mode default). |
 | `--ext EXT` | | `mp4` | File extension. |
-| `--timeout SECS` | `-t` | _(none)_ | Optional wall-clock cap; omit to wait for completion, idle silence, or server close. |
-| `--idle-timeout SECS` | | `120` / `300` with `--server` | Fail if no WebSocket traffic this long (keepalives count). |
+| `--idle-timeout SECS` | | `120` (hosted); **unlimited** with `--server` | If set, no application message this long → WebSocket ping probe. With `--server`, omit for unlimited recv wait (keepalives + optional `generation_status` traffic). |
 | `--delay SECS` | `-d` | `1.0` (fastvideo) / `2.0` (dreamverse) | Pause between jobs. |
 | `--retries N` | `-r` | `1` | Max attempts (exponential backoff). |
 | `--verbose` | `-v` | off | Full WebSocket protocol trace. |
@@ -227,8 +226,9 @@ to resolve immediately.
 ffmpeg -i input.mp4 -c copy fixed.mp4
 ```
 
-**Stall / hung session** — default has no wall-clock limit; stalls are detected via
-`--idle-timeout` (no traffic). For a hard cap, pass `--timeout SECS`.
+**Stall / hung session** — there is no client wall-clock limit. Hosted default
+`--idle-timeout` is 120 s of silence (then ping). With `--server`, idle defaults to
+unlimited unless you set `--idle-timeout` yourself.
 
 **Queue gets stuck on retry** — check `--retries` is > 1. Default is 1 attempt
 (no retry). Use `--retries 3` for resilience.

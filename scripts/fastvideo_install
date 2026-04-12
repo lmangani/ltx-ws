@@ -6,9 +6,14 @@ Does the full sequence that upstream docs omit:
   1. Initialize the FastVideo git submodule (this repo layout).
   2. Patch pyproject.toml so ``fastvideo-kernel`` (Triton / Linux CUDA wheels only)
      is not required on macOS — MPS uses Torch SDPA and does not need it.
-  3. Patch ``ltx2_denoising.py`` so ``torch.autocast`` uses ``device_type="mps"`` and
-     ``float16`` on Apple Silicon (upstream hard-codes ``cuda``, which warns and no-ops).
-  4. Run ``uv pip install -e`` (or ``python -m pip`` if uv is missing).
+  3. Patch ``ltx2_denoising.py``: ``torch.autocast`` uses the active device (MPS/CUDA),
+     not hard-coded ``cuda``; optional structured ``FV_PROGRESS_JSON`` log lines for
+     ``videofentanylserver`` keepalives.
+  4. Patch ``decoding.py``: decoded ``batch.output`` on CPU (MPS tensors cannot be
+     sent over multiprocessing pipes).
+  5. Patch ``multiproc_executor.py``: sanitize tensors in ``execute_forward`` replies
+     before ``pipe.send`` (belt-and-suspenders for MPS IPC).
+  6. Run ``uv pip install -e`` (or ``python -m pip`` if uv is missing).
 
 Run from the videofentanyl repo root (recommended):
 
@@ -92,10 +97,7 @@ LTX2_DENOISING_NEW = """            # videofentanyl: MPS/CUDA-native autocast (u
             _fv_ac_dev = latents.device.type
             _fv_ac_dtype = target_dtype
             _fv_ac_on = bool(autocast_enabled)
-            if _fv_ac_dev == "mps":
-                # MPS autocast uses float16; weights stay bf16 where not under autocast.
-                _fv_ac_dtype = torch.float16
-            elif _fv_ac_dev != "cuda":
+            if _fv_ac_dev != "cuda" and _fv_ac_dev != "mps":
                 _fv_ac_on = False
             _fv_ac_device_type = _fv_ac_dev if _fv_ac_dev in ("cuda", "mps") else "cuda"
             _fv_ac_apply = _fv_ac_on and _fv_ac_dev in ("cuda", "mps")
@@ -110,6 +112,248 @@ LTX2_DENOISING_NEW = """            # videofentanyl: MPS/CUDA-native autocast (u
             ):
 """
 
+# Older videofentanyl installs forced float16 under MPS autocast, which mismatched
+# bf16 weights and triggered rms_norm Half vs BFloat16 warnings on Metal.
+_LTX2_LEGACY_MPS_FP16_BLOCK = """            if _fv_ac_dev == "mps":
+                # MPS autocast uses float16; weights stay bf16 where not under autocast.
+                _fv_ac_dtype = torch.float16
+            elif _fv_ac_dev != "cuda":
+                _fv_ac_on = False"""
+
+_LTX2_LEGACY_MPS_FP16_REPLACEMENT = """            if _fv_ac_dev != "cuda" and _fv_ac_dev != "mps":
+                _fv_ac_on = False"""
+
+
+# --- decoding.py: CPU batch.output for worker → parent mp.pipe ----------------------------
+
+DECODING_CPU_MARKER = "videofentanyl: decoded frames CPU for mp.pipe"
+
+DECODING_FRAMES_OLD = """        # Convert to float32 for compatibility
+        frames = frames.to(torch.float32)
+
+        # Crop padding if this is a LongCat refinement"""
+
+DECODING_FRAMES_NEW = f"""        # {DECODING_CPU_MARKER} (MPS cannot _share_filename_).
+        frames = frames.to(torch.float32).detach().cpu().contiguous()
+
+        # Crop padding if this is a LongCat refinement"""
+
+
+def patch_decoding_mps_ipc(decoding_py: Path) -> int:
+    """Ensure decoded frames are CPU before IPC (idempotent)."""
+    if not decoding_py.is_file():
+        print(f"Warning: {decoding_py} not found — skip decoding patch", file=sys.stderr)
+        return 0
+    text = decoding_py.read_text(encoding="utf-8")
+    if DECODING_CPU_MARKER in text:
+        print(f"Already patched: {decoding_py} (CPU decode for IPC)")
+        return 0
+    if DECODING_FRAMES_OLD not in text:
+        print(
+            f"Warning: expected float32 block not found in {decoding_py} — "
+            "skip decoding IPC patch",
+            file=sys.stderr,
+        )
+        return 0
+    decoding_py.write_text(text.replace(DECODING_FRAMES_OLD, DECODING_FRAMES_NEW, 1), encoding="utf-8")
+    print(f"Patched {decoding_py} (CPU tensors for multiprocessing IPC)")
+    return 0
+
+
+# --- multiproc_executor.py: sanitize tensors before pipe.send ----------------------------
+
+MULTIPROC_IPC_MARKER = "_tensor_for_worker_ipc_send"
+
+
+MULTIPROC_HELPERS = '''
+def _tensor_for_worker_ipc_send(t: torch.Tensor) -> torch.Tensor:
+    """Prepare tensors for ``multiprocessing.Connection.send`` from a worker.
+
+    CUDA uses dedicated pickling reductions; CPU is trivially shareable.  MPS
+    (and other non-CUDA accelerators) otherwise hit
+    ``RuntimeError: _share_filename_: only available on CPU``.
+    """
+    if t.device.type in ("cpu", "cuda"):
+        return t
+    return t.detach().cpu().contiguous()
+
+
+def _sanitize_worker_ipc_tensors(
+    output_tensor: Any,
+    extra: dict[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    if isinstance(output_tensor, torch.Tensor):
+        output_tensor = _tensor_for_worker_ipc_send(output_tensor)
+    cleaned: dict[str, Any] = {}
+    for key, val in extra.items():
+        if isinstance(val, torch.Tensor):
+            cleaned[key] = _tensor_for_worker_ipc_send(val)
+        else:
+            cleaned[key] = val
+    return output_tensor, cleaned
+
+'''
+
+MULTIPROC_SEND_OLD = """                        result = output_batch.output
+                        extra = output_batch.extra or {}
+                        extra["peak_memory_mb"] = (torch.cuda.max_memory_allocated() / (1024 * 1024))
+                        self.pipe.send({
+                            "output_batch": result,
+                            "logging_info": logging_info,
+                            "extra": extra,
+                        })"""
+
+MULTIPROC_SEND_NEW = """                        result = output_batch.output
+                        extra = dict(output_batch.extra or {})
+                        extra["peak_memory_mb"] = (torch.cuda.max_memory_allocated() / (1024 * 1024))
+                        result, extra = _sanitize_worker_ipc_tensors(result, extra)
+                        self.pipe.send({
+                            "output_batch": result,
+                            "logging_info": logging_info,
+                            "extra": extra,
+                        })"""
+
+
+def patch_multiproc_executor_mps_ipc(multiproc_py: Path) -> int:
+    """Sanitize worker RPC payloads so MPS tensors are not pickled on pipes."""
+    if not multiproc_py.is_file():
+        print(f"Warning: {multiproc_py} not found — skip multiproc IPC patch", file=sys.stderr)
+        return 0
+    text = multiproc_py.read_text(encoding="utf-8")
+    if MULTIPROC_IPC_MARKER in text:
+        print(f"Already patched: {multiproc_py} (worker IPC tensor sanitize)")
+        return 0
+    if MULTIPROC_SEND_OLD not in text:
+        print(
+            f"Warning: expected execute_forward pipe.send block not found in {multiproc_py} — "
+            "skip multiproc IPC patch",
+            file=sys.stderr,
+        )
+        return 0
+    anchor = "logger = init_logger(__name__)\n\n\ndef _make_queue_log_handler"
+    insert = "logger = init_logger(__name__)\n" + MULTIPROC_HELPERS + "def _make_queue_log_handler"
+    if anchor not in text:
+        print(
+            f"Warning: could not find logger anchor before _make_queue_log_handler in {multiproc_py} — "
+            "skip multiproc IPC patch",
+            file=sys.stderr,
+        )
+        return 0
+    text = text.replace(anchor, insert, 1)
+    text = text.replace(MULTIPROC_SEND_OLD, MULTIPROC_SEND_NEW, 1)
+    multiproc_py.write_text(text, encoding="utf-8")
+    print(f"Patched {multiproc_py} (MPS-safe worker IPC)")
+    return 0
+
+
+# --- ltx2_denoising.py: FV_PROGRESS_JSON lines (after MPS autocast patch) ------------------
+
+LTX2_PROGRESS_MARKER = (
+    "videofentanyl: denoise step progress (FV_PROGRESS_JSON for videofentanylserver)"
+)
+
+LTX2_PROGRESS_IMPORTS_OLD = """import math
+import os
+
+import torch"""
+
+LTX2_PROGRESS_IMPORTS_NEW = """import math
+import json
+import os
+import time
+
+import torch"""
+
+LTX2_PROGRESS_LOOP_OLD = """        use_vsa = (vsa_available and envs.FASTVIDEO_ATTENTION_BACKEND == "VIDEO_SPARSE_ATTN")
+        vsa_metadata_builder = (VideoSparseAttentionMetadataBuilder() if use_vsa else None)
+
+        for step_index in tqdm(range(len(sigmas) - 1)):"""
+
+LTX2_PROGRESS_LOOP_NEW = """        use_vsa = (vsa_available and envs.FASTVIDEO_ATTENTION_BACKEND == "VIDEO_SPARSE_ATTN")
+        vsa_metadata_builder = (VideoSparseAttentionMetadataBuilder() if use_vsa else None)
+
+        # videofentanyl: denoise step progress (FV_PROGRESS_JSON for videofentanylserver)
+        _n_steps = len(sigmas) - 1
+        _loop_t0 = time.perf_counter()
+        _prev = _loop_t0
+        _step_dts: list[float] = []
+
+        for step_index in tqdm(range(_n_steps), desc="Denoising"):"""
+
+LTX2_PROGRESS_TAIL_OLD = """                audio_latents = (audio_latents.float() + audio_velocity.float() * dt).to(audio_latents.dtype)
+
+        batch.latents = latents
+        batch.extra["ltx2_audio_latents"] = audio_latents"""
+
+LTX2_PROGRESS_TAIL_NEW = """                audio_latents = (audio_latents.float() + audio_velocity.float() * dt).to(audio_latents.dtype)
+
+            # videofentanyl: structured denoise progress (parsed by videofentanylserver)
+            _now = time.perf_counter()
+            _dt = _now - _prev
+            _prev = _now
+            _step_dts.append(_dt)
+            _win = _step_dts[-max(1, min(len(_step_dts), 8)) :]
+            _avg = sum(_win) / len(_win)
+            _remaining = _n_steps - step_index - 1
+            _eta = _avg * _remaining
+            logger.info(
+                "FV_PROGRESS_JSON %s",
+                json.dumps(
+                    {
+                        "stage": "denoise",
+                        "step": step_index + 1,
+                        "total": _n_steps,
+                        "elapsed_s": round(_now - _loop_t0, 2),
+                        "last_step_s": round(_dt, 3),
+                        "avg_step_s": round(_avg, 3),
+                        "eta_s": round(_eta, 1),
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+
+        batch.latents = latents
+        batch.extra["ltx2_audio_latents"] = audio_latents"""
+
+
+def patch_ltx2_denoising_progress(denoising_py: Path) -> int:
+    """Emit FV_PROGRESS_JSON log lines each denoise step (idempotent)."""
+    if not denoising_py.is_file():
+        print(f"Warning: {denoising_py} not found — skip denoise progress patch", file=sys.stderr)
+        return 0
+    text = denoising_py.read_text(encoding="utf-8")
+    if LTX2_PROGRESS_MARKER in text or "FV_PROGRESS_JSON" in text:
+        print(f"Already patched: {denoising_py} (FV_PROGRESS_JSON)")
+        return 0
+    if LTX2_PROGRESS_IMPORTS_OLD in text:
+        text = text.replace(LTX2_PROGRESS_IMPORTS_OLD, LTX2_PROGRESS_IMPORTS_NEW, 1)
+    elif "import json" not in text:
+        print(
+            f"Warning: could not insert json/time imports in {denoising_py} — "
+            "skip denoise progress patch",
+            file=sys.stderr,
+        )
+        return 0
+    if LTX2_PROGRESS_LOOP_OLD not in text:
+        print(
+            f"Warning: expected denoise ``for`` / vsa block not found in {denoising_py} — "
+            "skip denoise progress patch",
+            file=sys.stderr,
+        )
+        return 0
+    text = text.replace(LTX2_PROGRESS_LOOP_OLD, LTX2_PROGRESS_LOOP_NEW, 1)
+    if LTX2_PROGRESS_TAIL_OLD not in text:
+        print(
+            f"Warning: expected denoise loop tail not found in {denoising_py} — "
+            "skip denoise progress patch (partial edit?)",
+            file=sys.stderr,
+        )
+        return 0
+    text = text.replace(LTX2_PROGRESS_TAIL_OLD, LTX2_PROGRESS_TAIL_NEW, 1)
+    denoising_py.write_text(text, encoding="utf-8")
+    print(f"Patched {denoising_py} (FV_PROGRESS_JSON denoise progress)")
+    return 0
+
 
 def patch_ltx2_denoising_mps(denoising_py: Path) -> int:
     """Patch LTX2 denoising autocast for MPS (idempotent). Returns 0 on success."""
@@ -119,6 +363,19 @@ def patch_ltx2_denoising_mps(denoising_py: Path) -> int:
         return 0
     text = denoising_py.read_text(encoding="utf-8")
     if marker in text:
+        if _LTX2_LEGACY_MPS_FP16_BLOCK in text:
+            text = text.replace(
+                _LTX2_LEGACY_MPS_FP16_BLOCK,
+                _LTX2_LEGACY_MPS_FP16_REPLACEMENT,
+                1,
+            )
+            denoising_py.write_text(text, encoding="utf-8")
+            print(
+                f"Upgraded {denoising_py}: MPS autocast dtype now follows target_dtype "
+                "(fixes Half/BFloat16 rms_norm mismatch vs old float16 override).",
+                flush=True,
+            )
+            return 0
         print(f"Already patched: {denoising_py}")
         return 0
     if LTX2_DENOISING_OLD not in text:
@@ -161,7 +418,7 @@ def main() -> int:
     p.add_argument(
         "--no-patch",
         action="store_true",
-        help="Skip pyproject + ltx2_denoising patches (not recommended on macOS)",
+        help="Skip all videofentanyl FastVideo source patches (not recommended on macOS)",
     )
     args = p.parse_args()
 
@@ -205,12 +462,17 @@ def main() -> int:
         return 1
 
     denoising_py = fv / "fastvideo" / "pipelines" / "stages" / "ltx2_denoising.py"
+    decoding_py = fv / "fastvideo" / "pipelines" / "stages" / "decoding.py"
+    multiproc_py = fv / "fastvideo" / "worker" / "multiproc_executor.py"
 
     if not args.no_patch:
         if patch_pyproject(pyproject) != 0:
             return 1
         if patch_ltx2_denoising_mps(denoising_py) != 0:
             return 1
+        patch_ltx2_denoising_progress(denoising_py)
+        patch_decoding_mps_ipc(decoding_py)
+        patch_multiproc_executor_mps_ipc(multiproc_py)
     else:
         print("Skipping FastVideo source patches (--no-patch).")
 

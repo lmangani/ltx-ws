@@ -22,11 +22,14 @@ PROTOCOL — FastVideo (1080p) — server side
 ─────────────────────────────────────────────
   ← session_init_v2    (client handshake; store session state)
   ← simple_generate    (client triggers generation)
-  → queue_status       (position in queue while waiting)
-  → gpu_assigned       (device ready)
+  → queue_status       (position in queue while waiting; active_generation_id)
+  → gpu_assigned       (device ready; includes generation_id for this job)
   → ltx2_stream_start
   → ltx2_segment_start
-  → generation_keepalive (periodic JSON while the model runs; elapsed_s / phase)
+  → generation_keepalive (periodic JSON while the model runs; elapsed_s / phase /
+    generation_id / optional model_progress from worker denoise steps)
+  ← generation_status  (optional client ping while generating)
+  → generation_status_ack (phase / elapsed_s / generation_id / optional model_progress)
   → [binary chunks]    (raw MP4 video data)
   → ltx2_segment_complete
   → ltx2_stream_complete
@@ -39,16 +42,25 @@ import argparse
 import asyncio
 import contextlib
 import base64
+import functools
 import json
 import logging
 import mimetypes
 import os
+import queue
+import re
+import shutil
 import sys
 import subprocess
 import tempfile
+import threading
 import time
+import uuid
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
+
+NotifyJson = Callable[..., Awaitable[None]]
 
 # ── Dependency bootstrap ───────────────────────────────────────────────────────
 
@@ -93,6 +105,8 @@ DEFAULT_CHUNK_SIZE     = 64 * 1024  # 64 KB per WebSocket binary message
 # JSON keepalives during long MPS runs so clients can use an idle timeout instead
 # of a short wall-clock cap (see videofentanyl.py).
 GENERATION_KEEPALIVE_INTERVAL_S = 15.0
+# Must match ``FV_PROGRESS_JSON`` lines emitted by patched FastVideo (e.g. ltx2_denoising).
+FV_PROGRESS_LOG_TAG = "FV_PROGRESS_JSON"
 
 # LTX2 frame requirement: num_frames must satisfy (frames - 1) % 8 == 0
 # e.g. 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 121, 129
@@ -104,6 +118,59 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("fvserver")
+
+
+def _spill_slug(prompt: str, maxlen: int = 48) -> str:
+    s = re.sub(r"[^\w\s-]+", "", prompt.lower().strip())[:maxlen]
+    s = re.sub(r"[\s_]+", "_", s).strip("_")
+    return s or "clip"
+
+
+def _largest_mp4_under(root: Path) -> Path | None:
+    """Best-effort: newest non-empty ``*.mp4`` under ``root`` (recursive)."""
+    best: Path | None = None
+    best_mtime = -1.0
+    try:
+        for p in root.rglob("*.mp4"):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            if st.st_size <= 0:
+                continue
+            if st.st_mtime >= best_mtime:
+                best_mtime = st.st_mtime
+                best = p
+    except OSError:
+        return None
+    return best
+
+
+def _make_fv_mp_queue() -> Any:
+    """Multiprocessing queue compatible with FastVideo worker ``log_queue``."""
+    try:
+        from fastvideo.utils import get_mp_context
+
+        return get_mp_context().Queue()
+    except Exception:
+        import multiprocessing as mp
+
+        return mp.Queue()
+
+
+def _cleanup_temp_video(path: str | None) -> None:
+    """Remove a temp MP4 and its parent directory (best-effort)."""
+    if not path:
+        return
+    try:
+        p = Path(path)
+        p.unlink(missing_ok=True)
+        try:
+            p.parent.rmdir()
+        except OSError:
+            pass
+    except OSError:
+        pass
 
 
 def _apply_pytorch_mps_runtime_tuning() -> None:
@@ -174,6 +241,8 @@ class LocalVideoGenerator:
         inference_steps:        int = DEFAULT_INFER_STEPS,
         enable_stage_verification: bool = False,
         enable_torch_compile:   bool = False,
+        spill_dir:                Path | None = None,
+        mac_ipc_safe_offload:   bool = False,
     ) -> None:
         self.model          = model
         self.num_gpus       = num_gpus
@@ -186,7 +255,87 @@ class LocalVideoGenerator:
         self.inference_steps = inference_steps
         self.enable_stage_verification = enable_stage_verification
         self.enable_torch_compile = enable_torch_compile
-        self._generator     = None
+        self.spill_dir              = spill_dir
+        self.mac_ipc_safe_offload   = mac_ipc_safe_offload
+        self._generator             = None
+        self._fv_log_queue          = _make_fv_mp_queue()
+        self._progress_lock         = threading.Lock()
+        self._model_progress: dict[str, Any] = {}
+        self._log_drain_thread: threading.Thread | None = None
+        self._log_drain_stop        = threading.Event()
+
+    # ── worker log queue → model_progress for WebSocket keepalives ────────────
+
+    def _reset_model_progress(self) -> None:
+        with self._progress_lock:
+            self._model_progress = {}
+
+    def model_progress_for_ws(self) -> dict[str, Any] | None:
+        """Latest structured progress from FastVideo workers (denoise steps, ETA)."""
+        with self._progress_lock:
+            if not self._model_progress.get("stage"):
+                return None
+            return dict(self._model_progress)
+
+    def _merge_fv_progress_payload(self, payload: dict[str, Any]) -> None:
+        stage = payload.get("stage")
+        if not stage:
+            return
+        step = payload.get("step")
+        total = payload.get("total")
+        pct: float | None = None
+        try:
+            si, st = int(step), int(total)
+            if st > 0:
+                pct = round(100.0 * min(si, st) / st, 1)
+        except (TypeError, ValueError):
+            pass
+        merged = {
+            "stage": stage,
+            "step": step,
+            "total": total,
+            "pct": pct,
+            "elapsed_s": payload.get("elapsed_s"),
+            "last_step_s": payload.get("last_step_s"),
+            "avg_step_s": payload.get("avg_step_s"),
+            "eta_s": payload.get("eta_s"),
+        }
+        with self._progress_lock:
+            self._model_progress = merged
+
+    def _fv_log_drain_loop(self) -> None:
+        while not self._log_drain_stop.is_set():
+            try:
+                rec = self._fv_log_queue.get(timeout=0.35)
+            except queue.Empty:
+                continue
+            except Exception:
+                continue
+            try:
+                msg = rec.getMessage()
+            except Exception:
+                continue
+            tag = FV_PROGRESS_LOG_TAG
+            if tag not in msg:
+                continue
+            try:
+                blob = msg.split(tag, 1)[1].strip()
+                payload = json.loads(blob)
+            except (json.JSONDecodeError, IndexError, TypeError, ValueError):
+                continue
+            if isinstance(payload, dict):
+                self._merge_fv_progress_payload(payload)
+
+    def _ensure_fv_log_drain_thread(self) -> None:
+        if self._log_drain_thread is not None and self._log_drain_thread.is_alive():
+            return
+        self._log_drain_stop.clear()
+        self._log_drain_thread = threading.Thread(
+            target=self._fv_log_drain_loop,
+            name="fvserver-fv-log-drain",
+            daemon=True,
+        )
+        self._log_drain_thread.start()
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
@@ -270,13 +419,22 @@ class LocalVideoGenerator:
                     "LTX2T2VConfig; print('OK')\""
                 ) from _ltx2_import_err
 
+        _heavy = self.mac_ipc_safe_offload
+        if _heavy:
+            log.warning(
+                "mac-ipc-safe-offload: DiT/VAE/text-encoder CPU offload enabled "
+                "(much slower; only use if FastVideo workers fail with "
+                "_share_filename_ / MPS over multiprocessing pipes)."
+            )
+
         self._generator = VideoGenerator.from_pretrained(
             local_path,
             num_gpus=self.num_gpus,
-            # MPS-compatible offload settings: keep everything on-device
-            dit_cpu_offload=False,
-            vae_cpu_offload=False,
-            text_encoder_cpu_offload=False,
+            # Default: no heavy CPU offload (MPS throughput). Opt-in via
+            # --mac-ipc-safe-offload if worker IPC requires CPU-resident tensors.
+            dit_cpu_offload=_heavy,
+            vae_cpu_offload=_heavy,
+            text_encoder_cpu_offload=_heavy,
             image_encoder_cpu_offload=False,
             pin_cpu_memory=False,
             # Throughput: skip per-stage verification (FastVideo default is True).
@@ -284,6 +442,7 @@ class LocalVideoGenerator:
             enable_torch_compile=self.enable_torch_compile,
             **extra_kwargs,
         )
+        self._ensure_fv_log_drain_thread()
         log.info("Model loaded ✓")
 
     def _resolve_model_path(self) -> str:
@@ -334,25 +493,64 @@ class LocalVideoGenerator:
         height:           int | None = None,
         width:            int | None = None,
         negative_prompt:  str = "",
+        *,
+        job_id:           str | None = None,
     ) -> str:
         """
         Generate a video asynchronously (runs `_generate_sync` in a thread
         pool so the event loop stays responsive).
+
+        ``job_id`` — optional generation UUID prefix for temp dirs and spill files.
 
         Returns the path of the saved MP4 file.
         """
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             None,
-            self._generate_sync,
-            prompt,
-            image_data,
-            seed,
-            num_frames or self.num_frames,
-            height     or self.height,
-            width      or self.width,
-            negative_prompt,
+            functools.partial(
+                self._generate_sync,
+                prompt,
+                image_data,
+                seed,
+                num_frames or self.num_frames,
+                height     or self.height,
+                width      or self.width,
+                negative_prompt,
+                job_id,
+            ),
         )
+
+    def _salvage_mp4_to_spill(
+        self,
+        tmpdir: str,
+        preferred_out: str,
+        job_id: str | None,
+        prompt: str,
+        tag: str,
+    ) -> None:
+        """Copy any usable MP4 from the workdir into ``spill_dir`` after failures."""
+        if not self.spill_dir or not job_id:
+            return
+        root = Path(tmpdir)
+        src = Path(preferred_out)
+        if not (src.is_file() and src.stat().st_size > 0):
+            alt = _largest_mp4_under(root)
+            if alt is None:
+                log.warning(
+                    "  ◆ no MP4 found to salvage under %s (job %s)",
+                    tmpdir,
+                    job_id[:8],
+                )
+                return
+            src = alt
+        try:
+            self.spill_dir.mkdir(parents=True, exist_ok=True)
+            slug = _spill_slug(prompt)
+            dest = self.spill_dir / f"{job_id}_{slug}_{tag}.mp4"
+            shutil.copy2(src, dest)
+            log.info("  ◆ spill-salvaged (%s) → %s", tag, dest)
+        except OSError as exc:
+            log.error("  ✗ spill salvage failed: %s", exc)
 
     def _generate_sync(
         self,
@@ -363,6 +561,7 @@ class LocalVideoGenerator:
         height:           int,
         width:            int,
         negative_prompt:  str,
+        job_id:           str | None = None,
     ) -> str:
         """Synchronous generation — executed in a thread-pool worker."""
         self.load()
@@ -388,8 +587,11 @@ class LocalVideoGenerator:
         )
 
         tmp_image: str | None = None
-        tmpdir = tempfile.mkdtemp(prefix="fvserver_out_")
+        prefix = f"fv_{job_id[:8]}_" if job_id else "fvserver_out_"
+        tmpdir = tempfile.mkdtemp(prefix=prefix)
         out_path = os.path.join(tmpdir, "output.mp4")
+        retained_tmpdir = False
+        self._reset_model_progress()
 
         try:
             if image_data:
@@ -416,7 +618,16 @@ class LocalVideoGenerator:
                 ),
             )
 
-            result = self._generator.generate(request=request)
+            try:
+                result = self._generator.generate(
+                    request=request,
+                    log_queue=self._fv_log_queue,
+                )
+            except BaseException:
+                self._salvage_mp4_to_spill(
+                    tmpdir, out_path, job_id, prompt, "ENCODE_FAIL",
+                )
+                raise
 
             # generate() may return a list when multiple prompts are given
             if isinstance(result, list):
@@ -427,9 +638,13 @@ class LocalVideoGenerator:
                 # Fall back to the path we requested
                 video_path = out_path
             if not os.path.exists(video_path):
+                self._salvage_mp4_to_spill(
+                    tmpdir, out_path, job_id, prompt, "MISSING_OUTPUT",
+                )
                 raise RuntimeError(
                     f"Generation completed but output file not found: {video_path}"
                 )
+            retained_tmpdir = True
             return video_path
 
         finally:
@@ -438,6 +653,72 @@ class LocalVideoGenerator:
                     os.unlink(tmp_image)
                 except OSError:
                     pass
+            if not retained_tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ── Single-flight generation queue (in-memory, self-cleaning) ───────────────────
+
+class GenerationScheduler:
+    """
+    Ensures only one ``LocalVideoGenerator.generate`` runs at a time.
+
+    Uses an asyncio lock plus a wait counter so clients blocked on the lock get a
+    ``queue_status`` with their position and the UUID of the job currently on the
+    device.  State is cleared in ``finally`` blocks — no persistence.
+    """
+
+    __slots__ = ("_gen_lock", "_meta", "_n_waiters", "_running_id")
+
+    def __init__(self) -> None:
+        self._gen_lock = asyncio.Lock()
+        self._meta = asyncio.Lock()
+        self._n_waiters = 0
+        self._running_id: str | None = None
+
+    @property
+    def running_generation_id(self) -> str | None:
+        return self._running_id
+
+    @contextlib.asynccontextmanager
+    async def generation_slot(self, notify: NotifyJson):
+        """
+        ``notify`` is awaited as ``await notify(type=..., ...)`` for ``queue_status``.
+
+        Yields a fresh ``generation_id`` (UUID string) after the exclusive lock is
+        acquired.
+        """
+        async with self._meta:
+            self._n_waiters += 1
+            ahead = self._n_waiters - 1
+        held = False
+        try:
+            if ahead > 0:
+                async with self._meta:
+                    active = self._running_id
+                await notify(
+                    type="queue_status",
+                    position=ahead,
+                    available_gpus=0,
+                    total_gpus=1,
+                    active_generation_id=active,
+                )
+            await self._gen_lock.acquire()
+            held = True
+            gid = str(uuid.uuid4())
+            async with self._meta:
+                self._running_id = gid
+            try:
+                yield gid
+            finally:
+                async with self._meta:
+                    self._running_id = None
+                if held:
+                    self._gen_lock.release()
+                    held = False
+        finally:
+            async with self._meta:
+                self._n_waiters -= 1
 
 
 # ── Per-connection request handler ─────────────────────────────────────────────
@@ -454,11 +735,15 @@ class RequestHandler:
         generator:  LocalVideoGenerator,
         verbose:    bool,
         chunk_size: int,
+        scheduler:  GenerationScheduler,
+        spill_dir:  Path,
     ) -> None:
         self.ws         = ws
         self.generator  = generator
         self.verbose    = verbose
         self.chunk_size = chunk_size
+        self.scheduler  = scheduler
+        self.spill_dir   = spill_dir
         self._session:  dict = {}
         self._t0        = time.time()
 
@@ -473,6 +758,52 @@ class RequestHandler:
 
     async def _send_json(self, **kwargs) -> None:
         await self.ws.send(json.dumps(kwargs))
+
+    def _ws_model_progress_payload(self) -> dict[str, Any]:
+        mp = self.generator.model_progress_for_ws()
+        return {"model_progress": mp} if mp else {}
+
+    def _spill_copy(self, video_path: str, generation_id: str, prompt: str) -> None:
+        """If the client is gone, persist the finished MP4 under ``spill_dir``."""
+        try:
+            src = Path(video_path)
+            if not src.is_file():
+                return
+            self.spill_dir.mkdir(parents=True, exist_ok=True)
+            slug = _spill_slug(prompt)
+            dest = self.spill_dir / f"{generation_id}_{slug}.mp4"
+            shutil.copy2(src, dest)
+            log.info(
+                "  ◆ spill-saved (client disconnected) → %s",
+                dest,
+            )
+        except OSError as exc:
+            log.error("  ✗ spill copy failed: %s", exc)
+
+    async def _handle_client_msg_while_generating(
+        self,
+        frame: Any,
+        generation_id: str,
+        t_start: float,
+    ) -> None:
+        if isinstance(frame, bytes):
+            return
+        try:
+            msg = json.loads(frame)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return
+        t = msg.get("type", "")
+        if t == "generation_status":
+            try:
+                await self._send_json(
+                    type="generation_status_ack",
+                    generation_id=generation_id,
+                    phase="generating",
+                    elapsed_s=round(time.time() - t_start, 1),
+                    **self._ws_model_progress_payload(),
+                )
+            except Exception:
+                pass
 
     # ── main loop ─────────────────────────────────────────────────────────────
 
@@ -516,132 +847,175 @@ class RequestHandler:
             msg.get("initial_image") or self._session.get("initial_image")
         )
 
-        t_start = time.time()
+        async def _notify_queue(**kwargs: Any) -> None:
+            await self._send_json(**kwargs)
 
-        # ── gpu_assigned ──────────────────────────────────────────────────────
-        await self._send_json(
-            type="gpu_assigned",
-            gpu_id="mps:0",
-            session_timeout=7200,
-        )
-        self._dbg("→ gpu_assigned")
+        async with self.scheduler.generation_slot(_notify_queue) as generation_id:
+            t_start = time.time()
+            log.info("  ▶ generation %s  prompt=%r", generation_id, prompt[:72])
 
-        # ── stream_start ──────────────────────────────────────────────────────
-        await self._send_json(
-            type="ltx2_stream_start",
-            total_segments=1,
-            stream_mode="single",
-        )
-        self._dbg("→ ltx2_stream_start")
-
-        # ── segment_start ─────────────────────────────────────────────────────
-        await self._send_json(
-            type="ltx2_segment_start",
-            segment_idx=0,
-            total_segments=1,
-        )
-        self._dbg("→ ltx2_segment_start (segment 0/1)")
-
-        # ── generate (keepalive JSON so clients can use idle-based timeouts) ───
-        video_path: str | None = None
-
-        async def _keepalive() -> None:
-            while True:
-                await asyncio.sleep(GENERATION_KEEPALIVE_INTERVAL_S)
-                try:
-                    await self._send_json(
-                        type="generation_keepalive",
-                        elapsed_s=round(time.time() - t_start, 1),
-                        phase="generating",
-                    )
-                except Exception:
-                    break
-
-        try:
-            gen_task = asyncio.create_task(
-                self.generator.generate(
-                    prompt=prompt,
-                    image_data=initial_image,
-                    negative_prompt=negative_prompt,
-                )
+            # ── gpu_assigned ──────────────────────────────────────────────────
+            await self._send_json(
+                type="gpu_assigned",
+                gpu_id="mps:0",
+                session_timeout=7200,
+                generation_id=generation_id,
             )
+            self._dbg("→ gpu_assigned")
+
+            # ── stream_start ──────────────────────────────────────────────────
+            await self._send_json(
+                type="ltx2_stream_start",
+                total_segments=1,
+                stream_mode="single",
+            )
+            self._dbg("→ ltx2_stream_start")
+
+            # ── segment_start ─────────────────────────────────────────────────
+            await self._send_json(
+                type="ltx2_segment_start",
+                segment_idx=0,
+                total_segments=1,
+            )
+            self._dbg("→ ltx2_segment_start (segment 0/1)")
+
+            # ── generate (keepalive + concurrent client JSON e.g. generation_status)
+            video_path: str | None = None
+
+            async def _keepalive() -> None:
+                while True:
+                    await asyncio.sleep(GENERATION_KEEPALIVE_INTERVAL_S)
+                    try:
+                        await self._send_json(
+                            type="generation_keepalive",
+                            elapsed_s=round(time.time() - t_start, 1),
+                            phase="generating",
+                            generation_id=generation_id,
+                            **self._ws_model_progress_payload(),
+                        )
+                    except Exception:
+                        break
+
             ka_task = asyncio.create_task(_keepalive())
             try:
-                video_path = await gen_task
+                gen_task = asyncio.create_task(
+                    self.generator.generate(
+                        prompt=prompt,
+                        image_data=initial_image,
+                        negative_prompt=negative_prompt,
+                        job_id=generation_id,
+                    )
+                )
+                try:
+                    while not gen_task.done():
+                        recv_t = asyncio.create_task(self.ws.recv())
+                        done, _ = await asyncio.wait(
+                            {gen_task, recv_t},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if gen_task in done:
+                            recv_t.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await recv_t
+                            break
+                        try:
+                            frame = recv_t.result()
+                        except websockets.exceptions.ConnectionClosed:
+                            log.warning(
+                                "  ⚠ client disconnected during generation %s — "
+                                "waiting for encode then spill-saving MP4",
+                                generation_id[:8],
+                            )
+                            try:
+                                video_path = await gen_task
+                                self._spill_copy(video_path, generation_id, prompt)
+                            except Exception as gen_exc:
+                                log.error(
+                                    "  ✗ generation after client disconnect failed "
+                                    "(check %s for spill-salvaged *_ENCODE_FAIL*.mp4): %s",
+                                    self.spill_dir,
+                                    gen_exc,
+                                )
+                            else:
+                                _cleanup_temp_video(video_path)
+                            return
+                        await self._handle_client_msg_while_generating(
+                            frame, generation_id, t_start,
+                        )
+                    video_path = await gen_task
+                except Exception as exc:
+                    log.error("Generation %s failed: %s", generation_id, exc)
+                    try:
+                        await self._send_json(
+                            type="error",
+                            error_code="generation_failed",
+                            message=str(exc),
+                        )
+                    except Exception:
+                        pass
+                    return
             finally:
                 ka_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await ka_task
-        except Exception as exc:
-            log.error("Generation failed: %s", exc)
-            await self._send_json(
-                type="error",
-                error_code="generation_failed",
-                message=str(exc),
-            )
-            return
 
-        t_gen = time.time() - t_start
+            t_gen = time.time() - t_start
 
-        # ── stream binary chunks ───────────────────────────────────────────────
-        video_bytes = Path(video_path).read_bytes()
-        total_bytes = len(video_bytes)
-        sent        = 0
-        while sent < total_bytes:
-            end   = min(sent + self.chunk_size, total_bytes)
-            await self.ws.send(video_bytes[sent:end])
-            sent = end
-        self._dbg(f"→ {total_bytes} bytes sent in chunks")
-
-        # ── segment_complete ──────────────────────────────────────────────────
-        await self._send_json(
-            type="ltx2_segment_complete",
-            segment_idx=0,
-            total_segments=1,
-        )
-
-        # ── stream_complete ───────────────────────────────────────────────────
-        await self._send_json(type="ltx2_stream_complete")
-        self._dbg("→ ltx2_stream_complete")
-
-        # ── latency ───────────────────────────────────────────────────────────
-        e2e_ms = (time.time() - self._t0) * 1000
-        gen_ms = t_gen * 1000
-        await self._send_json(
-            type="latency",
-            generation_ms=int(gen_ms),
-            e2e_ms=int(e2e_ms),
-        )
-
-        log.info(
-            "  ✓ sent %d KB in %.1fs  (gen=%.1fs)  prompt=%r",
-            total_bytes // 1024,
-            e2e_ms / 1000,
-            t_gen,
-            prompt[:72],
-        )
-
-        # Clean up temp file / directory
-        try:
-            p = Path(video_path)
-            p.unlink(missing_ok=True)
+            # ── stream binary chunks (spill-save if client vanishes mid-transfer)
             try:
-                p.parent.rmdir()
-            except OSError:
-                pass
-        except OSError:
-            pass
+                video_bytes = Path(video_path).read_bytes()
+                total_bytes = len(video_bytes)
+                sent        = 0
+                while sent < total_bytes:
+                    end   = min(sent + self.chunk_size, total_bytes)
+                    await self.ws.send(video_bytes[sent:end])
+                    sent = end
+                self._dbg(f"→ {total_bytes} bytes sent in chunks")
+
+                await self._send_json(
+                    type="ltx2_segment_complete",
+                    segment_idx=0,
+                    total_segments=1,
+                )
+
+                await self._send_json(type="ltx2_stream_complete")
+                self._dbg("→ ltx2_stream_complete")
+
+                e2e_ms = (time.time() - self._t0) * 1000
+                gen_ms = t_gen * 1000
+                await self._send_json(
+                    type="latency",
+                    generation_ms=int(gen_ms),
+                    e2e_ms=int(e2e_ms),
+                )
+
+                log.info(
+                    "  ✓ generation %s  sent %d KB in %.1fs  (gen=%.1fs)  prompt=%r",
+                    generation_id,
+                    total_bytes // 1024,
+                    e2e_ms / 1000,
+                    t_gen,
+                    prompt[:72],
+                )
+            except websockets.exceptions.ConnectionClosed:
+                log.warning(
+                    "  ⚠ client disconnected while streaming %s — spill-saving MP4",
+                    generation_id[:8],
+                )
+                self._spill_copy(video_path, generation_id, prompt)
+                return
+            finally:
+                _cleanup_temp_video(video_path)
 
 
 # ── Server ─────────────────────────────────────────────────────────────────────
 
 class VideoServer:
     """
-    Manages the WebSocket server and request queue.
+    Manages the WebSocket server.
 
-    Requests are processed one at a time (sequential) because MPS has a single
-    compute device.  Clients that connect while a generation is running receive
-    a queue_status message and wait for the lock to be released.
+    Multiple clients may connect at once; ``GenerationScheduler`` ensures only one
+    ``generate`` runs at a time.  Session traffic is not serialized.
     """
 
     def __init__(
@@ -651,14 +1025,15 @@ class VideoServer:
         generator:  LocalVideoGenerator,
         verbose:    bool,
         chunk_size: int,
+        spill_dir:  Path,
     ) -> None:
         self.host        = host
         self.port        = port
         self.generator   = generator
         self.verbose     = verbose
         self.chunk_size  = chunk_size
-        self._lock       = asyncio.Lock()
-        self._queue_len  = 0
+        self.spill_dir    = spill_dir
+        self.scheduler   = GenerationScheduler()
 
     # ── per-connection callback ───────────────────────────────────────────────
 
@@ -666,30 +1041,15 @@ class VideoServer:
         addr = getattr(ws, "remote_address", "?")
         log.info("  ┌ connect  %s", addr)
         try:
-            # Tell client its queue position while it waits for the lock
-            if self._lock.locked():
-                self._queue_len += 1
-                pos = self._queue_len
-                try:
-                    await ws.send(json.dumps({
-                        "type":           "queue_status",
-                        "position":       pos,
-                        "available_gpus": 0,
-                        "total_gpus":     1,
-                    }))
-                except Exception:
-                    pass
-
-            async with self._lock:
-                if self._queue_len > 0:
-                    self._queue_len -= 1
-                handler = RequestHandler(
-                    ws        = ws,
-                    generator = self.generator,
-                    verbose   = self.verbose,
-                    chunk_size= self.chunk_size,
-                )
-                await handler.handle()
+            handler = RequestHandler(
+                ws        = ws,
+                generator = self.generator,
+                verbose   = self.verbose,
+                chunk_size= self.chunk_size,
+                scheduler = self.scheduler,
+                spill_dir = self.spill_dir,
+            )
+            await handler.handle()
 
         except Exception as exc:
             log.error("  ✗ error  %s  %s", addr, exc)
@@ -706,7 +1066,7 @@ class VideoServer:
             self.port,
             max_size=200 * 1024 * 1024,
             ping_interval=30,
-            ping_timeout=20,
+            ping_timeout=None,
             close_timeout=5,
         ):
             log.info("WebSocket server listening on %s", url)
@@ -855,6 +1215,25 @@ examples:
         help=f"binary chunk size in bytes (default: {DEFAULT_CHUNK_SIZE})",
     )
     misc.add_argument(
+        "--spill-dir",
+        type=str,
+        default="fvserver_completed",
+        metavar="DIR",
+        help=(
+            "directory where finished MP4s are copied if the client disconnects "
+            "during generation or download (default: ./fvserver_completed)"
+        ),
+    )
+    misc.add_argument(
+        "--mac-ipc-safe-offload",
+        action="store_true",
+        help=(
+            "opt-in: enable DiT/VAE/text-encoder CPU offload (very slow on MPS).  "
+            "Only if FastVideo multiprocessing workers error with CPU-only tensor "
+            "sharing; default keeps models on device for normal speed."
+        ),
+    )
+    misc.add_argument(
         "--verbose", "-v", action="store_true",
         help="verbose per-connection logging",
     )
@@ -918,6 +1297,10 @@ def main() -> None:
     print(f"  Denoise  : {args.infer_steps} steps  (use --infer-steps to tune)")
     print(f"{'═' * 60}\n")
 
+    spill_dir = Path(args.spill_dir).expanduser().resolve()
+    spill_dir.mkdir(parents=True, exist_ok=True)
+    log.info("Disconnect spill directory: %s", spill_dir)
+
     # ── Load model (before WebSocket bind — first client is never a cold-start) ─
     generator = LocalVideoGenerator(
         model                       = args.model,
@@ -931,6 +1314,8 @@ def main() -> None:
         inference_steps             = args.infer_steps,
         enable_stage_verification   = args.stage_verification,
         enable_torch_compile        = args.torch_compile,
+        spill_dir                   = spill_dir,
+        mac_ipc_safe_offload        = args.mac_ipc_safe_offload,
     )
     log.info("Loading weights before accepting connections …")
     generator.load()
@@ -943,6 +1328,7 @@ def main() -> None:
         generator   = generator,
         verbose     = args.verbose,
         chunk_size  = args.chunk_size,
+        spill_dir   = spill_dir,
     )
     try:
         asyncio.run(server.serve())
