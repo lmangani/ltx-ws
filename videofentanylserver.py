@@ -158,6 +158,32 @@ class LocalVideoGenerator:
 
         local_path = self._resolve_model_path()
         log.info("Loading model from %s …", local_path)
+
+        # Older FastVideo releases may not include recent model IDs in the
+        # pipeline registry.  When the registry returns None it falls back to
+        # a generic PipelineConfig that lacks LTX2-specific components
+        # (LTX2GemmaConfig text encoder, LTX2VAEConfig VAE, etc.), causing a
+        # crash during model loading.  Explicitly supplying LTX2T2VConfig here
+        # ensures the correct pipeline config is used regardless of which
+        # FastVideo version is installed.  In newer releases where the model IS
+        # registered, the passed instance simply overrides the registry result
+        # with an identical config — a safe no-op.
+        extra_kwargs: dict = {}
+        _model_lower = (self.model or local_path).lower()
+        if "ltx2" in _model_lower or "ltx-2" in _model_lower:
+            try:
+                from fastvideo.configs.pipelines.ltx2 import LTX2T2VConfig
+                extra_kwargs["pipeline_config"] = LTX2T2VConfig()
+                log.info(
+                    "Providing explicit LTX2T2VConfig to guard against "
+                    "missing registry entry in installed FastVideo version."
+                )
+            except ImportError:
+                log.warning(
+                    "fastvideo.configs.pipelines.ltx2.LTX2T2VConfig not "
+                    "importable; falling back to registry auto-detection."
+                )
+
         self._generator = VideoGenerator.from_pretrained(
             local_path,
             num_gpus=self.num_gpus,
@@ -167,6 +193,7 @@ class LocalVideoGenerator:
             text_encoder_cpu_offload=False,
             image_encoder_cpu_offload=False,
             pin_cpu_memory=False,
+            **extra_kwargs,
         )
         log.info("Model loaded ✓")
 
