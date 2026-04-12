@@ -274,11 +274,14 @@ def msg_session_init_v2(p: GenerationParams, mode: str) -> str:
             "loop_generation_enabled": p.loop_generation_enabled,
         })
     else:  # fastvideo
+        # Mirror Dreamverse: carry ``initial_image`` on session_init so the server
+        # fallback (videofentanylserver) works for autocontinue / i2v and for
+        # clients that only attach the start frame to session_init_v2.
         return json.dumps({
             "type":                    "session_init_v2",
             "preset_id":               p.preset_id,
             "curated_prompts":         [],
-            "initial_image":           None,
+            "initial_image":           p.initial_image,
             "single_clip_mode":        p.single_clip_mode,
             "enhancement_enabled":     p.enhancement_enabled,
             "auto_extension_enabled":  p.auto_extension_enabled,

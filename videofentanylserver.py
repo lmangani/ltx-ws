@@ -20,8 +20,9 @@ USAGE
 
 PROTOCOL — FastVideo (1080p) — server side
 ─────────────────────────────────────────────
-  ← session_init_v2    (client handshake; store session state)
-  ← simple_generate    (client triggers generation)
+  ← session_init_v2    (client handshake; store session state; may include
+                        ``initial_image`` / ``initialImage`` for i2v or autocontinue)
+  ← simple_generate    (client triggers generation; same image keys optional here)
   → queue_status       (position in queue while waiting; active_generation_id)
   → gpu_assigned       (device ready; includes generation_id for this job)
   → ltx2_stream_start
@@ -196,6 +197,29 @@ def _apply_pytorch_mps_runtime_tuning() -> None:
 
 
 # ── Image helpers ──────────────────────────────────────────────────────────────
+
+def _resolve_initial_image_payload(msg: dict, session: dict) -> dict | None:
+    """
+    Pick the first non-empty image payload dict from the generate message, then session.
+
+    Accepts several keys so autocontinue / custom clients match FastVideo-style
+    ``inputs.image_path`` flows once decoded to a temp file for ``GenerationRequest``.
+    """
+    keys = (
+        "initial_image",
+        "initialImage",
+        "continuation_frame",
+        "continuationFrame",
+        "start_image",
+        "startImage",
+    )
+    for source in (msg, session):
+        for key in keys:
+            raw = source.get(key)
+            if isinstance(raw, dict) and raw:
+                return raw
+    return None
+
 
 def _decode_initial_image(image_data: dict) -> str:
     """
@@ -842,18 +866,20 @@ class RequestHandler:
             )
             return
 
-        # Resolve initial image: prefer from simple_generate, fall back to
-        # session_init_v2 (which is how the 1080p client sends i2v images)
-        initial_image: dict | None = (
-            msg.get("initial_image") or self._session.get("initial_image")
-        )
+        # Resolve initial image: prefer simple_generate, then session_init_v2.
+        initial_image: dict | None = _resolve_initial_image_payload(msg, self._session)
 
         async def _notify_queue(**kwargs: Any) -> None:
             await self._send_json(**kwargs)
 
         async with self.scheduler.generation_slot(_notify_queue) as generation_id:
             t_start = time.time()
-            log.info("  ▶ generation %s  prompt=%r", generation_id, prompt[:72])
+            log.info(
+                "  ▶ generation %s  prompt=%r  start_image=%s",
+                generation_id,
+                prompt[:72],
+                "yes" if initial_image else "no",
+            )
 
             # ── gpu_assigned ──────────────────────────────────────────────────
             await self._send_json(
