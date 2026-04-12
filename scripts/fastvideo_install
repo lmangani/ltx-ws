@@ -615,7 +615,10 @@ LTX2_LATENT_I2V_IMPORTS_NEW = 'from __future__ import annotations\n\nfrom pathli
 
 LTX2_PIPELINE_LATENT_STAGE_OLD = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(transformer=self.get_module("transformer"), ),\n        )'
 
-LTX2_PIPELINE_LATENT_STAGE_NEW = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(\n                transformer=self.get_module("transformer"),\n                vae=self.get_module("vae"),\n            ),\n        )'
+LTX2_PIPELINE_LATENT_STAGE_PREVIOUS = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(\n                transformer=self.get_module("transformer"),\n                vae=self.get_module("vae"),\n            ),\n        )'
+
+LTX2_PIPELINE_LATENT_STAGE_NEW = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(\n                transformer=self.get_module("transformer"),\n                vae=self.get_module("vae"),\n                pipeline=self,\n            ),\n        )'
+
 
 LTX2_LATENT_I2V_BODY_OLD = "".join((
     '    def __init__(self, transformer) -> None:\n',
@@ -712,10 +715,24 @@ LTX2_LATENT_I2V_BODY_OLD = "".join((
 
 
 LTX2_LATENT_I2V_BODY_NEW = "".join((
-    '    def __init__(self, transformer, vae: Any | None = None) -> None:\n',
+    '    def __init__(self, transformer, vae: Any | None = None, pipeline: Any | None = None) -> None:\n',
     '        super().__init__()\n',
     '        self.transformer = transformer\n',
     '        self.vae = vae\n',
+    '        # videofentanyl: upstream ``ltx2_pipeline`` only passes ``transformer``; resolve VAE\n',
+    "        # from the composed pipeline's module dict (same object DecodingStage uses).\n",
+    '        self._pipeline = pipeline\n',
+    '\n',
+    '    def _resolve_vae(self) -> Any | None:\n',
+    '        if self.vae is not None:\n',
+    '            return self.vae\n',
+    '        p = getattr(self, "_pipeline", None)\n',
+    '        if p is None:\n',
+    '            return None\n',
+    '        modules = getattr(p, "modules", None)\n',
+    '        if isinstance(modules, dict):\n',
+    '            return modules.get("vae")\n',
+    '        return None\n',
     '\n',
     '    def forward(\n',
     '        self,\n',
@@ -813,10 +830,11 @@ LTX2_LATENT_I2V_BODY_NEW = "".join((
     '            else:\n',
     '                batch.pil_image = load_image(batch.image_path)\n',
     '\n',
-    '        if self.vae is None and batch.image_path is not None:\n',
+    '        vae_mod = self._resolve_vae()\n',
+    '        if vae_mod is None and batch.image_path is not None:\n',
     '            logger.warning(\n',
-    '                "[LTX2] image_path set but latent prep has no VAE — image-to-video disabled "\n',
-    '                "(run scripts/fastvideo_install: ltx2_pipeline wires VAE into this stage).",\n',
+    '                "[LTX2] image_path set but no VAE on latent prep or pipeline.modules — "\n',
+    '                "image-to-video disabled (use patched ltx2_pipeline.py or pass pipeline=self).",\n',
     '            )\n',
     '\n',
     '        batch.extra.pop("ltx2_i2v_anchor_latents", None)\n',
@@ -824,12 +842,13 @@ LTX2_LATENT_I2V_BODY_NEW = "".join((
     '            latent_path is None\n',
     '            and sampled_random\n',
     '            and batch.pil_image is not None\n',
-    '            and self.vae is not None\n',
+    '            and vae_mod is not None\n',
     '            and shape[2] > 1\n',
     '        ):\n',
     '            latents = self._blend_start_image_into_latents(\n',
     '                latents,\n',
     '                batch.pil_image,\n',
+    '                vae_mod,\n',
     '                batch_size=batch_size,\n',
     '                height=int(height),\n',
     '                width=int(width),\n',
@@ -873,6 +892,7 @@ LTX2_LATENT_I2V_BODY_NEW = "".join((
     '    def _encode_start_image_latent(\n',
     '        self,\n',
     '        pil_image: Image.Image,\n',
+    '        vae: Any,\n',
     '        *,\n',
     '        batch_size: int,\n',
     '        height: int,\n',
@@ -890,21 +910,22 @@ LTX2_LATENT_I2V_BODY_NEW = "".join((
     '        video = pixel.unsqueeze(2)\n',
     '        if batch_size != 1:\n',
     '            video = video.expand(batch_size, -1, -1, -1, -1).contiguous()\n',
-    '        self.vae.to(device)\n',
+    '        vae.to(device)\n',
     '        with torch.no_grad():\n',
-    '            enc = self.vae.encode(video)\n',
+    '            enc = vae.encode(video)\n',
     '        if isinstance(enc, DiagonalGaussianDistribution):\n',
     '            z0 = enc.mode()\n',
     '        elif hasattr(enc, "latent_dist"):\n',
     '            z0 = enc.latent_dist.mode()\n',
     '        else:\n',
     '            z0 = enc\n',
-    '        return self._normalize_video_latent(z0, self.vae)\n',
+    '        return self._normalize_video_latent(z0, vae)\n',
     '\n',
     '    def _blend_start_image_into_latents(\n',
     '        self,\n',
     '        noise_latents: torch.Tensor,\n',
     '        pil_image: Image.Image,\n',
+    '        vae: Any,\n',
     '        *,\n',
     '        batch_size: int,\n',
     '        height: int,\n',
@@ -916,6 +937,7 @@ LTX2_LATENT_I2V_BODY_NEW = "".join((
     '        """Aligns with diffusers ``LTX2ImageToVideoPipeline.prepare_latents`` (first slice + noise)."""\n',
     '        z_first = self._encode_start_image_latent(\n',
     '            pil_image,\n',
+    '            vae,\n',
     '            batch_size=batch_size,\n',
     '            height=height,\n',
     '            width=width,\n',
@@ -933,7 +955,6 @@ LTX2_LATENT_I2V_BODY_NEW = "".join((
     '        init[:, :, :1] = z_first\n',
     '        return init * mask + noise_latents * (1.0 - mask)\n',
 ))
-
 
 LTX2_I2V_VELOCITY_OLD = '            sigma_value = sigma.to(torch.float32) if isinstance(sigma, torch.Tensor) else torch.tensor(\n                float(sigma),\n                device=latents.device,\n                dtype=torch.float32,\n            )\n            dt = sigma_next - sigma\n            velocity = ((latents.float() - pos_denoised.float()) / sigma_value).to(latents.dtype)\n\n            latents = (latents.float() + velocity.float() * dt).to(latents.dtype)\n            if pos_audio is not None and audio_latents is not None:'
 
@@ -956,17 +977,23 @@ LTX2_LATENT_I2V_RELOAD_GAP_NEW = (
     "                batch.pil_image = load_video(_ip)[0]\n"
     "            else:\n"
     "                batch.pil_image = load_image(batch.image_path)\n\n"
-    "        if self.vae is None and batch.image_path is not None:\n"
+    "        vae_mod = self.vae\n"
+    "        if vae_mod is None:\n"
+    "            _p = getattr(self, \"_pipeline\", None)\n"
+    "            _mods = getattr(_p, \"modules\", None) if _p is not None else None\n"
+    "            if isinstance(_mods, dict):\n"
+    "                vae_mod = _mods.get(\"vae\")\n"
+    "        if vae_mod is None and batch.image_path is not None:\n"
     "            logger.warning(\n"
-    "                \"[LTX2] image_path set but latent prep has no VAE — image-to-video disabled \"\n"
-    "                \"(run scripts/fastvideo_install: ltx2_pipeline wires VAE into this stage).\",\n"
+    "                \"[LTX2] image_path set but no VAE on latent prep or pipeline.modules — \"\n"
+    "                \"image-to-video disabled (use patched ltx2_pipeline.py or pass pipeline=self).\",\n"
     "            )\n\n"
     "        batch.extra.pop(\"ltx2_i2v_anchor_latents\", None)\n"
 )
 
 
 def patch_ltx2_pipeline_latent_i2v(ltx2_pipeline_py: Path) -> int:
-    """Wire VAE into ``LTX2LatentPreparationStage`` for image-to-video (idempotent)."""
+    """Wire VAE + pipeline into ``LTX2LatentPreparationStage`` for image-to-video (idempotent)."""
     if not ltx2_pipeline_py.is_file():
         print(f"Warning: {ltx2_pipeline_py} not found — skip LTX2 pipeline i2v patch", file=sys.stderr)
         return 0
@@ -974,9 +1001,17 @@ def patch_ltx2_pipeline_latent_i2v(ltx2_pipeline_py: Path) -> int:
     if (
         'stage_name="latent_preparation_stage"' in text
         and 'vae=self.get_module("vae")' in text
+        and "pipeline=self" in text
         and "LTX2LatentPreparationStage" in text
     ):
-        print(f"Already patched: {ltx2_pipeline_py} (LTX2 latent stage VAE)")
+        print(f"Already patched: {ltx2_pipeline_py} (LTX2 latent stage VAE + pipeline)")
+        return 0
+    if LTX2_PIPELINE_LATENT_STAGE_PREVIOUS in text:
+        ltx2_pipeline_py.write_text(
+            text.replace(LTX2_PIPELINE_LATENT_STAGE_PREVIOUS, LTX2_PIPELINE_LATENT_STAGE_NEW, 1),
+            encoding="utf-8",
+        )
+        print(f"Patched {ltx2_pipeline_py} (LTX2 latent prep: add pipeline=self for VAE resolution)")
         return 0
     if LTX2_PIPELINE_LATENT_STAGE_OLD not in text:
         print(
@@ -989,7 +1024,7 @@ def patch_ltx2_pipeline_latent_i2v(ltx2_pipeline_py: Path) -> int:
         text.replace(LTX2_PIPELINE_LATENT_STAGE_OLD, LTX2_PIPELINE_LATENT_STAGE_NEW, 1),
         encoding="utf-8",
     )
-    print(f"Patched {ltx2_pipeline_py} (LTX2 latent prep receives VAE for i2v)")
+    print(f"Patched {ltx2_pipeline_py} (LTX2 latent prep receives VAE + pipeline for i2v)")
     return 0
 
 
