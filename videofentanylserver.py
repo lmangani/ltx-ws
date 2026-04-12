@@ -178,23 +178,32 @@ class LocalVideoGenerator:
                     "Providing explicit LTX2T2VConfig to guard against "
                     "missing registry entry in installed FastVideo version."
                 )
-            except ImportError:
-                # LTX2T2VConfig is absent → the installed FastVideo predates
-                # LTX2 support entirely.  The registry auto-detection path
-                # will also fail, so raise immediately with clear instructions.
+            except ImportError as _ltx2_err:
+                # LTX2T2VConfig is absent or one of its transitive deps failed
+                # to import (common on macOS/MPS where CUDA-specific packages
+                # are absent).  Log the real cause first so the user can see
+                # exactly what's missing, then raise with context.
+                log.warning(
+                    "Could not import LTX2T2VConfig: %s", _ltx2_err,
+                    exc_info=True,
+                )
                 try:
                     import fastvideo
                     installed_ver = getattr(fastvideo, "__version__", "unknown")
                 except ImportError:
                     installed_ver = "not installed"
                 raise RuntimeError(
-                    f"The installed FastVideo ({installed_ver}) does not "
-                    "support the LTX2 model family.  Please install FastVideo "
-                    "from source:\n\n"
+                    f"Failed to load LTX2T2VConfig from the installed FastVideo "
+                    f"({installed_ver}).  See the ImportError above for the "
+                    "root cause.\n\n"
+                    "If FastVideo is not yet installed from source, run:\n\n"
                     "  git clone https://github.com/hao-ai-lab/FastVideo.git\n"
                     "  cd FastVideo\n"
-                    "  uv pip install -e .\n"
-                ) from None
+                    "  uv pip install -e .\n\n"
+                    "If it is already installed from source, verify that the "
+                    "correct virtual environment is active and that all "
+                    "dependencies installed without errors."
+                ) from _ltx2_err
 
         self._generator = VideoGenerator.from_pretrained(
             local_path,
