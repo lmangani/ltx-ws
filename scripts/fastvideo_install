@@ -11,8 +11,9 @@ Does the full sequence that upstream docs omit:
   3. Patch ``ltx2_denoising.py``: ``torch.autocast`` uses the active device (MPS/CUDA),
      not hard-coded ``cuda``; optional structured ``FV_PROGRESS_JSON`` log lines for
      ``server.py`` keepalives.
-  4. Patch ``decoding.py``: decoded ``batch.output`` on CPU (MPS tensors cannot be
-     sent over multiprocessing pipes).
+  4. Patch ``decoding.py``: MPS/CUDA-native ``torch.autocast`` for VAE decode (upstream
+     used ``device_type="cuda"`` only); decoded ``batch.output`` / VAE returns on CPU
+     (MPS tensors cannot be sent over multiprocessing pipes).
   5. Patch ``multiproc_executor.py``: prepend ``VIDEOFENTANYL_FASTVIDEO_SRC`` on ``sys.path`` in
      worker processes (spawn never imports ``server.py``); sanitize tensors in
      ``execute_forward`` replies before ``pipe.send`` (belt-and-suspenders for MPS IPC).
@@ -198,6 +199,56 @@ DECODING_STREAMING_RETURN_NEW = """        # Normalize image to [0, 1] range
 
     @torch.no_grad()
     def forward("""
+
+VAE_AUTOCAST_MARKER = "videofentanyl: MPS/CUDA-native VAE autocast"
+
+DECODING_VAE_AUTOCAST_OLD = (
+    "        with torch.autocast(device_type=\"cuda\", dtype=vae_dtype, "
+    "enabled=vae_autocast_enabled):"
+)
+
+DECODING_VAE_AUTOCAST_NEW = """        # videofentanyl: MPS/CUDA-native VAE autocast (upstream hard-coded cuda).
+        _fv_vae_dev = latents.device.type
+        _fv_vae_ac_on = bool(vae_autocast_enabled)
+        if _fv_vae_dev != "cuda" and _fv_vae_dev != "mps":
+            _fv_vae_ac_on = False
+        _fv_vae_ac_device_type = _fv_vae_dev if _fv_vae_dev in ("cuda", "mps") else "cuda"
+        _fv_vae_ac_apply = _fv_vae_ac_on and _fv_vae_dev in ("cuda", "mps")
+        with torch.autocast(
+                device_type=_fv_vae_ac_device_type,
+                dtype=vae_dtype,
+                enabled=_fv_vae_ac_apply,
+        ):"""
+
+
+def patch_decoding_mps_vae_autocast(decoding_py: Path) -> int:
+    """Use device-native autocast for VAE decode/streaming_decode on MPS (idempotent)."""
+    if not decoding_py.is_file():
+        print(f"Warning: {decoding_py} not found — skip VAE autocast patch", file=sys.stderr)
+        return 0
+    text = decoding_py.read_text(encoding="utf-8")
+    if VAE_AUTOCAST_MARKER in text:
+        print(f"Already patched: {decoding_py} (MPS/CUDA VAE autocast)")
+        return 0
+    if DECODING_VAE_AUTOCAST_OLD not in text:
+        print(
+            f"Warning: expected VAE autocast line not found in {decoding_py} — "
+            "skip VAE autocast patch",
+            file=sys.stderr,
+        )
+        return 0
+    n = text.count(DECODING_VAE_AUTOCAST_OLD)
+    if n != 2:
+        print(
+            f"Warning: expected 2 VAE autocast sites in {decoding_py}, found {n} — "
+            "skip VAE autocast patch",
+            file=sys.stderr,
+        )
+        return 0
+    text = text.replace(DECODING_VAE_AUTOCAST_OLD, DECODING_VAE_AUTOCAST_NEW)
+    decoding_py.write_text(text, encoding="utf-8")
+    print(f"Patched {decoding_py} (MPS/CUDA VAE autocast)")
+    return 0
 
 
 def patch_decoding_mps_ipc(decoding_py: Path) -> int:
@@ -1419,6 +1470,7 @@ def main() -> int:
         if patch_ltx2_denoising_mps(denoising_py) != 0:
             return 1
         patch_ltx2_denoising_progress(denoising_py)
+        patch_decoding_mps_vae_autocast(decoding_py)
         patch_decoding_mps_ipc(decoding_py)
         patch_multiproc_executor_videofentanyl_fv_src(multiproc_py)
         patch_multiproc_executor_mps_ipc(multiproc_py)

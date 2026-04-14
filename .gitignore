@@ -15,3 +15,6 @@ build/
 
 # OS
 .DS_Store
+
+# Local benchmark outputs (scripts/benchmark_local_generation.py)
+benchmark_runs/
