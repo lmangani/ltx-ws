@@ -22,6 +22,7 @@ Resolve `VIDEOFENTANYL_DIR` — the directory containing the script.
 
 ```
 $VIDEOFENTANYL_DIR/videofentanyl.py
+$VIDEOFENTANYL_DIR/server.py
 ```
 
 **How to resolve:**
@@ -65,6 +66,9 @@ python videofentanyl.py \
 
 # Image-to-video
 python videofentanyl.py --prompt "the scene comes alive" --image ./photo.jpg
+
+# Local LTX2 server — start server.py in another terminal, then:
+python videofentanyl.py --server ws://localhost:8765/ws --prompt "a fox in snow"
 
 # With AI prompt enhancement (GPT rewrite)
 python videofentanyl.py --prompt "girl walking in rain" --enhance
@@ -123,6 +127,7 @@ python videofentanyl.py --mode dreamverse --prompt "test" --output-dir ./videos 
 | `--enhance` | `-e` | off (fastvideo) / on (dreamverse) | GPT prompt rewrite before generation. |
 | `--no-enhance` | | — | Disable GPT expansion (dreamverse only). |
 | `--image PATH` | `-i` | — | Input image for image-to-video. |
+| `--server URL` | | _(hosted default)_ | WebSocket endpoint (e.g. `ws://localhost:8765/ws` with local `server.py`). |
 | `--preset-id ID` | | mode default | Override session preset ID. |
 | `--preset-label STR` | | mode default | Override preset label (dreamverse). |
 | `--auto-extension` | | off | Server-side segment auto-extension. |
@@ -130,11 +135,17 @@ python videofentanyl.py --mode dreamverse --prompt "test" --output-dir ./videos 
 | `--output-dir DIR` | `-o` | `.` | Save directory. |
 | `--prefix STR` | | `video` / `dreamverse` | Filename prefix (per-mode default). |
 | `--ext EXT` | | `mp4` | File extension. |
-| `--timeout SECS` | `-t` | `240` (fastvideo) / `480` (dreamverse) | Per-video timeout. |
+| `--idle-timeout SECS` | | `120` (hosted); **unlimited** with `--server` | If set, no application message this long → WebSocket ping probe. With `--server`, omit for unlimited recv wait (keepalives + optional `generation_status` traffic). |
 | `--delay SECS` | `-d` | `1.0` (fastvideo) / `2.0` (dreamverse) | Pause between jobs. |
 | `--retries N` | `-r` | `1` | Max attempts (exponential backoff). |
 | `--verbose` | `-v` | off | Full WebSocket protocol trace. |
 | `--dry-run` | | off | Show queue, don't connect. |
+
+---
+
+## Local server (`server.py`)
+
+Fully local generation uses **`server.py`** (FastVideo / LTX2 on Apple MPS). From the videofentanyl repo: run **`python scripts/fastvideo_install`** once, then start the server and use **`--server ws://localhost:8765/ws`** on the client. Image-to-video on the local server needs that patched FastVideo install.
 
 ---
 
@@ -226,8 +237,9 @@ to resolve immediately.
 ffmpeg -i input.mp4 -c copy fixed.mp4
 ```
 
-**Timeout on dreamverse** — long videos take 60–120s. Default timeout is 480s.
-If you're hitting it, increase: `--timeout 600`
+**Stall / hung session** — there is no client wall-clock limit. Hosted default
+`--idle-timeout` is 120 s of silence (then ping). With `--server`, idle defaults to
+unlimited unless you set `--idle-timeout` yourself.
 
 **Queue gets stuck on retry** — check `--retries` is > 1. Default is 1 attempt
 (no retry). Use `--retries 3` for resilience.

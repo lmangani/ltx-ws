@@ -1,0 +1,1447 @@
+#!/usr/bin/env python3
+"""
+Install FastVideo for videofentanyl (especially Apple Silicon / MPS).
+
+Does the full sequence that upstream docs omit:
+  1. Initialize the FastVideo git submodule (this repo layout). If the recorded commit is
+     not available from the public FastVideo remote, submodule update may fail; an existing
+     ``third_party/FastVideo`` checkout is still patched and the script prints the gitlink SHA.
+  2. Patch pyproject.toml so ``fastvideo-kernel`` (Triton / Linux CUDA wheels only)
+     is not required on macOS — MPS uses Torch SDPA and does not need it.
+  3. Patch ``ltx2_denoising.py``: ``torch.autocast`` uses the active device (MPS/CUDA),
+     not hard-coded ``cuda``; optional structured ``FV_PROGRESS_JSON`` log lines for
+     ``server.py`` keepalives.
+  4. Patch ``decoding.py``: decoded ``batch.output`` on CPU (MPS tensors cannot be
+     sent over multiprocessing pipes).
+  5. Patch ``multiproc_executor.py``: prepend ``VIDEOFENTANYL_FASTVIDEO_SRC`` on ``sys.path`` in
+     worker processes (spawn never imports ``server.py``); sanitize tensors in
+     ``execute_forward`` replies before ``pipe.send`` (belt-and-suspenders for MPS IPC).
+  6. Patch LTX-2 image-to-video: ``ltx2_pipeline.py`` passes ``vae=`` into latent preparation (never
+     ``pipeline=``, so workers that import an older ``LTX2LatentPreparationStage`` from site-packages
+     still start); ``ltx2_latent_preparation.py`` VAE-encodes ``image_path`` / ``pil_image`` into the
+     first latent slice when sampling random latents; ``ltx2_denoising.py`` pins that slice each step
+     and sets per-token timestep 0 on first-frame tokens (same idea as Lightricks / training conditioning).
+  7. Run ``uv pip install -e`` (or ``python -m pip`` if uv is missing).
+
+Run from the videofentanyl repo root (recommended):
+
+  ./scripts/fastvideo_install
+  python scripts/fastvideo_install
+
+Standalone clone (skip submodule step):
+
+  python scripts/fastvideo_install --path ~/src/FastVideo
+
+Re-run is safe: submodule update (best effort) and patches are idempotent.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+MARKER = "platform_system == 'Linux' and platform_machine == 'x86_64'"
+KERNEL_DEP_RE = re.compile(
+    r'^(\s*")fastvideo-kernel==([^"]+)(")\s*,?\s*$',
+    re.MULTILINE,
+)
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def recorded_submodule_commit(repo: Path, submodule_relpath: str) -> str | None:
+    """Gitlink SHA the parent repo records for ``submodule_relpath`` (index or HEAD), or None."""
+    for rev in (f"HEAD:{submodule_relpath}", f":{submodule_relpath}"):
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", rev],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            sha = out.stdout.strip()
+            if len(sha) >= 7 and all(c in "0123456789abcdef" for c in sha.lower()):
+                return sha
+        except (subprocess.CalledProcessError, OSError):
+            continue
+    return None
+
+
+def patch_pyproject(pyproject: Path) -> int:
+    """Return 0 on success (including already patched), 1 on error."""
+    text = pyproject.read_text(encoding="utf-8")
+
+    def repl(m: re.Match[str]) -> str:
+        return (
+            f'{m.group(1)}fastvideo-kernel=={m.group(2)}; {MARKER}{m.group(3)},'
+        )
+
+    if "fastvideo-kernel==" not in text:
+        print(
+            f"Error: no fastvideo-kernel dependency in {pyproject} "
+            "(unexpected FastVideo layout).",
+            file=sys.stderr,
+        )
+        return 1
+
+    for line in text.splitlines():
+        if "fastvideo-kernel==" in line and "platform_system" in line:
+            print(f"Already patched: {pyproject}")
+            return 0
+
+    new_text, n = KERNEL_DEP_RE.subn(repl, text, count=1)
+    if n != 1:
+        print(
+            f"Error: could not patch fastvideo-kernel line in {pyproject}",
+            file=sys.stderr,
+        )
+        return 1
+
+    pyproject.write_text(new_text, encoding="utf-8")
+    print(f"Patched {pyproject}")
+    return 0
+
+
+LTX2_DENOISING_OLD = """            with torch.autocast(
+                    device_type="cuda",
+                    dtype=target_dtype,
+                    enabled=autocast_enabled,
+            ), set_forward_context(
+                    current_timestep=sigma.item(),
+                    attn_metadata=attn_metadata,
+                    forward_batch=batch,
+            ):
+"""
+
+LTX2_DENOISING_NEW = """            # videofentanyl: MPS/CUDA-native autocast (upstream hard-coded cuda).
+            _fv_ac_dev = latents.device.type
+            _fv_ac_dtype = target_dtype
+            _fv_ac_on = bool(autocast_enabled)
+            if _fv_ac_dev != "cuda" and _fv_ac_dev != "mps":
+                _fv_ac_on = False
+            _fv_ac_device_type = _fv_ac_dev if _fv_ac_dev in ("cuda", "mps") else "cuda"
+            _fv_ac_apply = _fv_ac_on and _fv_ac_dev in ("cuda", "mps")
+            with torch.autocast(
+                    device_type=_fv_ac_device_type,
+                    dtype=_fv_ac_dtype,
+                    enabled=_fv_ac_apply,
+            ), set_forward_context(
+                    current_timestep=sigma.item(),
+                    attn_metadata=attn_metadata,
+                    forward_batch=batch,
+            ):
+"""
+
+# Older videofentanyl installs forced float16 under MPS autocast, which mismatched
+# bf16 weights and triggered rms_norm Half vs BFloat16 warnings on Metal.
+_LTX2_LEGACY_MPS_FP16_BLOCK = """            if _fv_ac_dev == "mps":
+                # MPS autocast uses float16; weights stay bf16 where not under autocast.
+                _fv_ac_dtype = torch.float16
+            elif _fv_ac_dev != "cuda":
+                _fv_ac_on = False"""
+
+_LTX2_LEGACY_MPS_FP16_REPLACEMENT = """            if _fv_ac_dev != "cuda" and _fv_ac_dev != "mps":
+                _fv_ac_on = False"""
+
+
+# --- decoding.py: CPU batch.output for worker → parent mp.pipe ----------------------------
+
+DECODING_CPU_MARKER = "videofentanyl: decoded frames CPU for mp.pipe"
+
+DECODING_FRAMES_OLD = """        # Convert to float32 for compatibility
+        frames = frames.to(torch.float32)
+
+        # Crop padding if this is a LongCat refinement"""
+
+DECODING_FRAMES_NEW = f"""        # {DECODING_CPU_MARKER} (MPS cannot _share_filename_).
+        frames = frames.to(torch.float32).detach().cpu().contiguous()
+
+        # Crop padding if this is a LongCat refinement"""
+
+
+DECODING_VAE_CPU_MARKER = "videofentanyl: VAE output on CPU"
+
+DECODING_DECODE_RETURN_OLD = """        # Normalize image to [0, 1] range
+        image = (image / 2 + 0.5).clamp(0, 1)
+        return image
+
+    @torch.no_grad()
+    def streaming_decode("""
+
+DECODING_DECODE_RETURN_NEW = """        # Normalize image to [0, 1] range
+        image = (image / 2 + 0.5).clamp(0, 1)
+        # videofentanyl: VAE output on CPU before any IPC (MPS cannot _share_filename_).
+        return image.to(torch.float32).detach().cpu().contiguous()
+
+    @torch.no_grad()
+    def streaming_decode("""
+
+DECODING_STREAMING_RETURN_OLD = """        # Normalize image to [0, 1] range
+        image = (image / 2 + 0.5).clamp(0, 1)
+        assert cache is not None, "cache should not be None after streaming_decode"
+        return image, cache
+
+    @torch.no_grad()
+    def forward("""
+
+DECODING_STREAMING_RETURN_NEW = """        # Normalize image to [0, 1] range
+        image = (image / 2 + 0.5).clamp(0, 1)
+        assert cache is not None, "cache should not be None after streaming_decode"
+        image = image.to(torch.float32).detach().cpu().contiguous()
+        return image, cache
+
+    @torch.no_grad()
+    def forward("""
+
+
+def patch_decoding_mps_ipc(decoding_py: Path) -> int:
+    """CPU tensors for multiprocessing IPC: forward() batch.output + VAE returns."""
+    if not decoding_py.is_file():
+        print(f"Warning: {decoding_py} not found — skip decoding patch", file=sys.stderr)
+        return 0
+    text = decoding_py.read_text(encoding="utf-8")
+    orig = text
+    if DECODING_FRAMES_OLD in text:
+        text = text.replace(DECODING_FRAMES_OLD, DECODING_FRAMES_NEW, 1)
+        print(f"Patched {decoding_py} (forward CPU batch.output)")
+    elif DECODING_CPU_MARKER not in text:
+        print(
+            f"Warning: expected float32 block not found in {decoding_py} — "
+            "skip forward IPC patch",
+            file=sys.stderr,
+        )
+
+    if DECODING_VAE_CPU_MARKER not in text:
+        if DECODING_DECODE_RETURN_OLD in text:
+            text = text.replace(DECODING_DECODE_RETURN_OLD, DECODING_DECODE_RETURN_NEW, 1)
+        if DECODING_STREAMING_RETURN_OLD in text:
+            text = text.replace(DECODING_STREAMING_RETURN_OLD, DECODING_STREAMING_RETURN_NEW, 1)
+        if text != orig:
+            print(f"Patched {decoding_py} (VAE decode/streaming_decode → CPU)")
+
+    if text != orig:
+        decoding_py.write_text(text, encoding="utf-8")
+        return 0
+    if DECODING_CPU_MARKER in text and DECODING_VAE_CPU_MARKER in text:
+        print(f"Already patched: {decoding_py} (CPU decode for IPC)")
+    return 0
+
+
+# --- multiproc_executor.py: worker sys.path (I2V / patched LTX2) + sanitize tensors --------
+
+MULTIPROC_OSQUEUE_VFOLD = "import os\nimport queue\n"
+
+MULTIPROC_OSQUEUE_VFNEW = (
+    "import os\n"
+    "import sys\n"
+    "\n"
+    "# videofentanyl: spawn workers never import server.py; align ``sys.path`` with the repo\n"
+    "# submodule before any ``fastvideo`` import so patched LTX2 latent prep (VAE i2v) matches the parent.\n"
+    "_FV_SRC = os.environ.get(\"VIDEOFENTANYL_FASTVIDEO_SRC\")\n"
+    "if _FV_SRC and os.path.isdir(os.path.join(_FV_SRC, \"fastvideo\")) and _FV_SRC not in sys.path:\n"
+    "    sys.path.insert(0, _FV_SRC)\n"
+    "\n"
+    "import queue\n"
+)
+
+MULTIPROC_FV_SRC_MARKER = '_FV_SRC = os.environ.get("VIDEOFENTANYL_FASTVIDEO_SRC")'
+
+
+def patch_multiproc_executor_videofentanyl_fv_src(multiproc_py: Path) -> int:
+    """Prepend repo FastVideo on worker ``sys.path`` before ``fastvideo`` imports (idempotent)."""
+    if not multiproc_py.is_file():
+        print(f"Warning: {multiproc_py} not found — skip multiproc worker src patch", file=sys.stderr)
+        return 0
+    text = multiproc_py.read_text(encoding="utf-8")
+    if MULTIPROC_FV_SRC_MARKER in text:
+        print(f"Already patched: {multiproc_py} (worker VIDEOFENTANYL_FASTVIDEO_SRC sys.path)")
+        return 0
+    if MULTIPROC_OSQUEUE_VFOLD not in text:
+        print(
+            f"Warning: expected `import os` / `import queue` block not found in {multiproc_py} — "
+            "skip multiproc worker src patch",
+            file=sys.stderr,
+        )
+        return 0
+    multiproc_py.write_text(text.replace(MULTIPROC_OSQUEUE_VFOLD, MULTIPROC_OSQUEUE_VFNEW, 1), encoding="utf-8")
+    print(f"Patched {multiproc_py} (worker prepends VIDEOFENTANYL_FASTVIDEO_SRC for patched FastVideo)")
+    return 0
+
+
+MULTIPROC_IPC_MARKER = "_tensor_for_worker_ipc_send"
+
+MULTIPROC_SHALLOW_SANITIZE = """def _sanitize_worker_ipc_tensors(
+    output_tensor: Any,
+    extra: dict[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    if isinstance(output_tensor, torch.Tensor):
+        output_tensor = _tensor_for_worker_ipc_send(output_tensor)
+    cleaned: dict[str, Any] = {}
+    for key, val in extra.items():
+        if isinstance(val, torch.Tensor):
+            cleaned[key] = _tensor_for_worker_ipc_send(val)
+        else:
+            cleaned[key] = val
+    return output_tensor, cleaned
+
+"""
+
+MULTIPROC_DEEP_SANITIZE = """def _deep_ipc_safe(obj: Any) -> Any:
+    \"\"\"Move every ``torch.Tensor`` to CPU for pickling (nested Mapping/list/tuple/dataclass).\"\"\"
+    if isinstance(obj, torch.Tensor):
+        return _tensor_for_worker_ipc_send(obj)
+    if isinstance(obj, Mapping):
+        return {k: _deep_ipc_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deep_ipc_safe(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_deep_ipc_safe(v) for v in obj)
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return _deep_ipc_safe(asdict(obj))
+    stages = getattr(obj, "stages", None)
+    if stages is not None and isinstance(stages, Mapping) and type(obj).__name__ == "PipelineLoggingInfo":
+        fresh = type(obj)()
+        fresh.stages = _deep_ipc_safe(stages)
+        return fresh
+    return obj
+
+
+def _sanitize_worker_ipc_tensors(
+    output_tensor: Any,
+    extra: dict[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    out = _deep_ipc_safe(output_tensor)
+    ex = _deep_ipc_safe(extra)
+    if not isinstance(ex, dict):
+        ex = dict(extra or {})
+    return out, ex
+
+"""
+
+MULTIPROC_SANITIZE_DEEP_ONLY = "def _sanitize_worker_ipc_tensors" + MULTIPROC_DEEP_SANITIZE.split(
+    "def _sanitize_worker_ipc_tensors",
+    1,
+)[1]
+
+# Older videofentanyl installs: dict-only ``_deep_ipc_safe`` (OrderedDict is a dict subclass,
+# but ``PipelineLoggingInfo`` / nested metrics need Mapping + explicit logging wrapper).
+MULTIPROC_DEEP_FN_LEGACY_A = """def _deep_ipc_safe(obj: Any) -> Any:
+    \"\"\"Move every ``torch.Tensor`` (nested dict/list/tuple) to CPU for pickling.\"\"\"
+    if isinstance(obj, torch.Tensor):
+        return _tensor_for_worker_ipc_send(obj)
+    if isinstance(obj, dict):
+        return {k: _deep_ipc_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deep_ipc_safe(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_deep_ipc_safe(v) for v in obj)
+    return obj
+
+
+"""
+
+MULTIPROC_DEEP_FN_LEGACY_B = """def _deep_ipc_safe(obj: Any) -> Any:
+    \"\"\"Move every ``torch.Tensor`` (including nested dict/list/tuple) to CPU for pickling.\"\"\"
+    if isinstance(obj, torch.Tensor):
+        return _tensor_for_worker_ipc_send(obj)
+    if isinstance(obj, dict):
+        return {k: _deep_ipc_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deep_ipc_safe(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_deep_ipc_safe(v) for v in obj)
+    return obj
+
+
+"""
+
+MULTIPROC_HELPERS = '''
+def _tensor_for_worker_ipc_send(t: torch.Tensor) -> torch.Tensor:
+    """Prepare tensors for ``multiprocessing.Connection.send`` from a worker.
+
+    CUDA uses dedicated pickling reductions; CPU is trivially shareable.  MPS
+    (and other non-CUDA accelerators) otherwise hit
+    ``RuntimeError: _share_filename_: only available on CPU``.
+    """
+    if t.device.type in ("cpu", "cuda"):
+        return t
+    return t.detach().cpu().contiguous()
+
+
+''' + MULTIPROC_DEEP_SANITIZE
+
+MULTIPROC_SEND_OLD = """                        result = output_batch.output
+                        extra = output_batch.extra or {}
+                        extra["peak_memory_mb"] = (torch.cuda.max_memory_allocated() / (1024 * 1024))
+                        self.pipe.send({
+                            "output_batch": result,
+                            "logging_info": logging_info,
+                            "extra": extra,
+                        })"""
+
+# Patched send without wrapping ``logging_info`` (fails if stage metrics hold tensors).
+MULTIPROC_SEND_BARE = """                        result = output_batch.output
+                        extra = dict(output_batch.extra or {})
+                        extra["peak_memory_mb"] = (torch.cuda.max_memory_allocated() / (1024 * 1024))
+                        result, extra = _sanitize_worker_ipc_tensors(result, extra)
+                        self.pipe.send({
+                            "output_batch": result,
+                            "logging_info": logging_info,
+                            "extra": extra,
+                        })"""
+
+MULTIPROC_SEND_WRAPPED = """                        result = output_batch.output
+                        extra = dict(output_batch.extra or {})
+                        extra["peak_memory_mb"] = (torch.cuda.max_memory_allocated() / (1024 * 1024))
+                        result, extra = _sanitize_worker_ipc_tensors(result, extra)
+                        self.pipe.send(
+                            _deep_ipc_safe({
+                                "output_batch": result,
+                                "logging_info": logging_info,
+                                "extra": extra,
+                            }),
+                        )"""
+
+
+def _multiproc_ensure_ipc_imports(text: str) -> str:
+    """Ensure ``Mapping`` / ``asdict`` / ``is_dataclass`` are importable for ``_deep_ipc_safe``."""
+    if "Callable, Mapping" not in text and "from collections.abc import Callable\n" in text:
+        text = text.replace(
+            "from collections.abc import Callable\n",
+            "from collections.abc import Callable, Mapping\n",
+            1,
+        )
+    if "asdict, dataclass, is_dataclass" not in text and "from dataclasses import dataclass\n" in text:
+        text = text.replace(
+            "from dataclasses import dataclass\n",
+            "from dataclasses import asdict, dataclass, is_dataclass\n",
+            1,
+        )
+    return text
+
+
+def patch_multiproc_executor_mps_ipc(multiproc_py: Path) -> int:
+    """Sanitize worker RPC payloads so MPS tensors are not pickled on pipes."""
+    if not multiproc_py.is_file():
+        print(f"Warning: {multiproc_py} not found — skip multiproc IPC patch", file=sys.stderr)
+        return 0
+    text = multiproc_py.read_text(encoding="utf-8")
+    orig = text
+
+    if MULTIPROC_SHALLOW_SANITIZE in text:
+        text = text.replace(MULTIPROC_SHALLOW_SANITIZE, MULTIPROC_SANITIZE_DEEP_ONLY, 1)
+        text = _multiproc_ensure_ipc_imports(text)
+
+    for legacy in (MULTIPROC_DEEP_FN_LEGACY_A, MULTIPROC_DEEP_FN_LEGACY_B):
+        if legacy in text:
+            text = text.replace(legacy, MULTIPROC_DEEP_SANITIZE.split("def _sanitize_worker_ipc_tensors", 1)[0], 1)
+            text = _multiproc_ensure_ipc_imports(text)
+            break
+
+    if MULTIPROC_SEND_BARE in text:
+        text = text.replace(MULTIPROC_SEND_BARE, MULTIPROC_SEND_WRAPPED, 1)
+
+    if text != orig:
+        multiproc_py.write_text(text, encoding="utf-8")
+        print(f"Upgraded {multiproc_py} (MPS worker IPC)")
+        return 0
+
+    if MULTIPROC_IPC_MARKER in text:
+        if (
+            "isinstance(obj, Mapping)" in text
+            and "_deep_ipc_safe({" in text
+            and MULTIPROC_SHALLOW_SANITIZE not in text
+        ):
+            print(f"Already patched: {multiproc_py} (MPS worker IPC)")
+            return 0
+        print(
+            f"Warning: {multiproc_py} has partial IPC helpers — expected Mapping-based "
+            "`_deep_ipc_safe` and wrapped `pipe.send`; skip further multiproc IPC patch",
+            file=sys.stderr,
+        )
+        return 0
+
+    if MULTIPROC_SEND_OLD not in text:
+        print(
+            f"Warning: expected execute_forward pipe.send block not found in {multiproc_py} — "
+            "skip multiproc IPC patch",
+            file=sys.stderr,
+        )
+        return 0
+
+    anchors_inserts = (
+        (
+            "logger = init_logger(__name__)\n\n\ndef _make_queue_log_handler",
+            "logger = init_logger(__name__)\n\n\n" + MULTIPROC_HELPERS + "def _make_queue_log_handler",
+        ),
+        (
+            "logger = init_logger(__name__)\n\ndef _make_queue_log_handler",
+            "logger = init_logger(__name__)\n\n" + MULTIPROC_HELPERS + "def _make_queue_log_handler",
+        ),
+    )
+    for anchor, insert in anchors_inserts:
+        if anchor in text:
+            text = text.replace(anchor, insert, 1)
+            break
+    else:
+        print(
+            f"Warning: could not find logger anchor before _make_queue_log_handler in {multiproc_py} — "
+            "skip multiproc IPC patch",
+            file=sys.stderr,
+        )
+        return 0
+
+    text = text.replace(MULTIPROC_SEND_OLD, MULTIPROC_SEND_WRAPPED, 1)
+    text = _multiproc_ensure_ipc_imports(text)
+    multiproc_py.write_text(text, encoding="utf-8")
+    print(f"Patched {multiproc_py} (MPS-safe worker IPC)")
+    return 0
+
+
+# --- ltx2_denoising.py: FV_PROGRESS_JSON lines (after MPS autocast patch) ------------------
+
+LTX2_PROGRESS_MARKER = (
+    "videofentanyl: denoise step progress (FV_PROGRESS_JSON for server.py)"
+)
+
+LTX2_PROGRESS_IMPORTS_OLD = """import math
+import os
+
+import torch"""
+
+LTX2_PROGRESS_IMPORTS_NEW = """import math
+import json
+import os
+import time
+
+import torch"""
+
+LTX2_PROGRESS_LOOP_OLD = """        use_vsa = (vsa_available and envs.FASTVIDEO_ATTENTION_BACKEND == "VIDEO_SPARSE_ATTN")
+        vsa_metadata_builder = (VideoSparseAttentionMetadataBuilder() if use_vsa else None)
+
+        for step_index in tqdm(range(len(sigmas) - 1)):"""
+
+LTX2_PROGRESS_LOOP_NEW = """        use_vsa = (vsa_available and envs.FASTVIDEO_ATTENTION_BACKEND == "VIDEO_SPARSE_ATTN")
+        vsa_metadata_builder = (VideoSparseAttentionMetadataBuilder() if use_vsa else None)
+
+        # videofentanyl: denoise step progress (FV_PROGRESS_JSON for server.py)
+        _n_steps = len(sigmas) - 1
+        _loop_t0 = time.perf_counter()
+        _prev = _loop_t0
+        _step_dts: list[float] = []
+
+        for step_index in tqdm(range(_n_steps), desc="Denoising"):"""
+
+LTX2_PROGRESS_TAIL_OLD = """                audio_latents = (audio_latents.float() + audio_velocity.float() * dt).to(audio_latents.dtype)
+
+        batch.latents = latents
+        batch.extra["ltx2_audio_latents"] = audio_latents"""
+
+LTX2_PROGRESS_TAIL_NEW = """                audio_latents = (audio_latents.float() + audio_velocity.float() * dt).to(audio_latents.dtype)
+
+            # videofentanyl: structured denoise progress (parsed by server.py)
+            _now = time.perf_counter()
+            _dt = _now - _prev
+            _prev = _now
+            _step_dts.append(_dt)
+            _win = _step_dts[-max(1, min(len(_step_dts), 8)) :]
+            _avg = sum(_win) / len(_win)
+            _remaining = _n_steps - step_index - 1
+            _eta = _avg * _remaining
+            logger.info(
+                "FV_PROGRESS_JSON %s",
+                json.dumps(
+                    {
+                        "stage": "denoise",
+                        "step": step_index + 1,
+                        "total": _n_steps,
+                        "elapsed_s": round(_now - _loop_t0, 2),
+                        "last_step_s": round(_dt, 3),
+                        "avg_step_s": round(_avg, 3),
+                        "eta_s": round(_eta, 1),
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+
+        batch.latents = latents
+        batch.extra["ltx2_audio_latents"] = audio_latents"""
+
+
+def patch_ltx2_denoising_progress(denoising_py: Path) -> int:
+    """Emit FV_PROGRESS_JSON log lines each denoise step (idempotent)."""
+    if not denoising_py.is_file():
+        print(f"Warning: {denoising_py} not found — skip denoise progress patch", file=sys.stderr)
+        return 0
+    text = denoising_py.read_text(encoding="utf-8")
+    if LTX2_PROGRESS_MARKER in text or "FV_PROGRESS_JSON" in text:
+        print(f"Already patched: {denoising_py} (FV_PROGRESS_JSON)")
+        return 0
+    if LTX2_PROGRESS_IMPORTS_OLD in text:
+        text = text.replace(LTX2_PROGRESS_IMPORTS_OLD, LTX2_PROGRESS_IMPORTS_NEW, 1)
+    elif "import json" not in text:
+        print(
+            f"Warning: could not insert json/time imports in {denoising_py} — "
+            "skip denoise progress patch",
+            file=sys.stderr,
+        )
+        return 0
+    if LTX2_PROGRESS_LOOP_OLD not in text:
+        print(
+            f"Warning: expected denoise ``for`` / vsa block not found in {denoising_py} — "
+            "skip denoise progress patch",
+            file=sys.stderr,
+        )
+        return 0
+    text = text.replace(LTX2_PROGRESS_LOOP_OLD, LTX2_PROGRESS_LOOP_NEW, 1)
+    if LTX2_PROGRESS_TAIL_OLD not in text:
+        print(
+            f"Warning: expected denoise loop tail not found in {denoising_py} — "
+            "skip denoise progress patch (partial edit?)",
+            file=sys.stderr,
+        )
+        return 0
+    text = text.replace(LTX2_PROGRESS_TAIL_OLD, LTX2_PROGRESS_TAIL_NEW, 1)
+    denoising_py.write_text(text, encoding="utf-8")
+    print(f"Patched {denoising_py} (FV_PROGRESS_JSON denoise progress)")
+    return 0
+
+
+def patch_ltx2_denoising_mps(denoising_py: Path) -> int:
+    """Patch LTX2 denoising autocast for MPS (idempotent). Returns 0 on success."""
+    marker = "videofentanyl: MPS/CUDA-native autocast"
+    if not denoising_py.is_file():
+        print(f"Warning: {denoising_py} not found — skip denoising patch", file=sys.stderr)
+        return 0
+    text = denoising_py.read_text(encoding="utf-8")
+    if marker in text:
+        if _LTX2_LEGACY_MPS_FP16_BLOCK in text:
+            text = text.replace(
+                _LTX2_LEGACY_MPS_FP16_BLOCK,
+                _LTX2_LEGACY_MPS_FP16_REPLACEMENT,
+                1,
+            )
+            denoising_py.write_text(text, encoding="utf-8")
+            print(
+                f"Upgraded {denoising_py}: MPS autocast dtype now follows target_dtype "
+                "(fixes Half/BFloat16 rms_norm mismatch vs old float16 override).",
+                flush=True,
+            )
+            return 0
+        print(f"Already patched: {denoising_py}")
+        return 0
+    if LTX2_DENOISING_OLD not in text:
+        print(
+            f"Warning: expected autocast block not found in {denoising_py} — "
+            "upstream layout may have changed; skip denoising patch",
+            file=sys.stderr,
+        )
+        return 0
+    denoising_py.write_text(text.replace(LTX2_DENOISING_OLD, LTX2_DENOISING_NEW, 1), encoding="utf-8")
+    print(f"Patched {denoising_py} (MPS/CUDA autocast)")
+    return 0
+
+
+
+# --- LTX2 image-to-video (image_path / pil_image first-frame anchor) -------------------------
+
+LTX2_LATENT_I2V_IMPORTS_OLD = 'from pathlib import Path\n\nimport torch\nfrom diffusers.utils.torch_utils import randn_tensor\n\nfrom fastvideo.distributed import get_local_torch_device\nfrom fastvideo.fastvideo_args import FastVideoArgs\nfrom fastvideo.logger import init_logger\nfrom fastvideo.pipelines.pipeline_batch_info import ForwardBatch'
+
+LTX2_LATENT_I2V_IMPORTS_NEW = 'from __future__ import annotations\n\nfrom pathlib import Path\nfrom typing import Any\n\nimport torch\nfrom diffusers.utils.torch_utils import randn_tensor\nfrom PIL import Image\n\nfrom fastvideo.distributed import get_local_torch_device\nfrom fastvideo.fastvideo_args import FastVideoArgs\nfrom fastvideo.image_processor import ImageProcessor\nfrom fastvideo.logger import init_logger\nfrom fastvideo.models.vaes.common import DiagonalGaussianDistribution\nfrom fastvideo.pipelines.pipeline_batch_info import ForwardBatch'
+
+LTX2_PIPELINE_LATENT_STAGE_OLD = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(transformer=self.get_module("transformer"), ),\n        )'
+
+LTX2_PIPELINE_LATENT_STAGE_NEW = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(\n                transformer=self.get_module("transformer"),\n                vae=self.get_module("vae"),\n            ),\n        )'
+
+# Older videofentanyl patches passed ``pipeline=self``; workers can import latent prep from another
+# ``fastvideo`` install that does not accept that kwarg — strip it back to ``vae=`` only.
+LTX2_PIPELINE_LATENT_STAGE_WITH_PIPELINE = '        self.add_stage(\n            stage_name="latent_preparation_stage",\n            stage=LTX2LatentPreparationStage(\n                transformer=self.get_module("transformer"),\n                vae=self.get_module("vae"),\n                pipeline=self,\n            ),\n        )'
+
+
+LTX2_LATENT_I2V_BODY_OLD = "".join((
+    '    def __init__(self, transformer) -> None:\n',
+    '        super().__init__()\n',
+    '        self.transformer = transformer\n',
+    '\n',
+    '    def forward(\n',
+    '        self,\n',
+    '        batch: ForwardBatch,\n',
+    '        fastvideo_args: FastVideoArgs,\n',
+    '    ) -> ForwardBatch:\n',
+    '        latent_num_frames = (batch.num_frames -\n',
+    '                             1) // fastvideo_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio + 1\n',
+    '        if not batch.prompt_embeds:\n',
+    '            batch_size = 1\n',
+    '        elif isinstance(batch.prompt, list):\n',
+    '            batch_size = len(batch.prompt)\n',
+    '        elif batch.prompt is not None:\n',
+    '            batch_size = 1\n',
+    '        else:\n',
+    '            batch_size = batch.prompt_embeds[0].shape[0]\n',
+    '\n',
+    '        batch_size *= batch.num_videos_per_prompt\n',
+    '\n',
+    '        if not batch.prompt_embeds:\n',
+    '            transformer_dtype = next(self.transformer.parameters()).dtype\n',
+    '            device = get_local_torch_device()\n',
+    '            dummy_prompt = torch.zeros(\n',
+    '                batch_size,\n',
+    '                0,\n',
+    '                self.transformer.hidden_size,\n',
+    '                device=device,\n',
+    '                dtype=transformer_dtype,\n',
+    '            )\n',
+    '            batch.prompt_embeds = [dummy_prompt]\n',
+    '            batch.negative_prompt_embeds = []\n',
+    '            batch.do_classifier_free_guidance = False\n',
+    '\n',
+    '        dtype = batch.prompt_embeds[0].dtype\n',
+    '        device = get_local_torch_device()\n',
+    '        generator = batch.generator\n',
+    '        latents = batch.latents\n',
+    '        num_frames = latent_num_frames if latent_num_frames is not None else batch.num_frames\n',
+    '        height = batch.height\n',
+    '        width = batch.width\n',
+    '        latent_path = fastvideo_args.ltx2_initial_latent_path\n',
+    '\n',
+    '        if height is None or width is None:\n',
+    '            raise ValueError("Height and width must be provided")\n',
+    '\n',
+    '        spatial_ratio = fastvideo_args.pipeline_config.vae_config.arch_config.spatial_compression_ratio\n',
+    '        if height % spatial_ratio != 0 or width % spatial_ratio != 0:\n',
+    '            raise ValueError(f"Height and width must be divisible by {spatial_ratio} "\n',
+    '                             f"but are {height} and {width}.")\n',
+    '        shape = (\n',
+    '            batch_size,\n',
+    '            self.transformer.num_channels_latents,\n',
+    '            num_frames,\n',
+    '            height // spatial_ratio,\n',
+    '            width // spatial_ratio,\n',
+    '        )\n',
+    '\n',
+    '        if isinstance(generator, list) and len(generator) != batch_size:\n',
+    '            raise ValueError(f"You have passed a list of generators of length {len(generator)}, "\n',
+    '                             f"but requested an effective batch size of {batch_size}.")\n',
+    '\n',
+    '        if latents is None:\n',
+    '            if latent_path:\n',
+    '                loaded_latents = self._load_initial_latent(latent_path, device, dtype)\n',
+    '                if loaded_latents is not None:\n',
+    '                    latents = loaded_latents\n',
+    '                else:\n',
+    '                    latents = randn_tensor(\n',
+    '                        shape,\n',
+    '                        generator=generator,\n',
+    '                        device=device,\n',
+    '                        dtype=dtype,\n',
+    '                    )\n',
+    '                    self._save_initial_latent(latent_path, latents)\n',
+    '            else:\n',
+    '                latents = randn_tensor(\n',
+    '                    shape,\n',
+    '                    generator=generator,\n',
+    '                    device=device,\n',
+    '                    dtype=dtype,\n',
+    '                )\n',
+    '        else:\n',
+    '            latents = latents.to(device)\n',
+    '\n',
+    '        batch.latents = latents\n',
+    '        batch.raw_latent_shape = shape\n',
+    '        return batch\n',
+))
+
+
+LTX2_LATENT_I2V_BODY_NEW = "".join((
+    '    def __init__(self, transformer, vae: Any | None = None, **kwargs: Any) -> None:\n',
+    '        super().__init__()\n',
+    '        self.transformer = transformer\n',
+    '        self.vae = vae\n',
+    '        self._pipeline = kwargs.pop("pipeline", None)\n',
+    '        kwargs.clear()\n',
+    '\n',
+    '    def _resolve_vae(self) -> Any | None:\n',
+    '        if self.vae is not None:\n',
+    '            return self.vae\n',
+    '        p = self._pipeline\n',
+    '        if p is None:\n',
+    '            return None\n',
+    '        modules = getattr(p, "modules", None)\n',
+    '        if isinstance(modules, dict):\n',
+    '            return modules.get("vae")\n',
+    '        return None\n',
+    '\n',
+    '    def forward(\n',
+    '        self,\n',
+    '        batch: ForwardBatch,\n',
+    '        fastvideo_args: FastVideoArgs,\n',
+    '    ) -> ForwardBatch:\n',
+    '        latent_num_frames = (batch.num_frames -\n',
+    '                             1) // fastvideo_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio + 1\n',
+    '        if not batch.prompt_embeds:\n',
+    '            batch_size = 1\n',
+    '        elif isinstance(batch.prompt, list):\n',
+    '            batch_size = len(batch.prompt)\n',
+    '        elif batch.prompt is not None:\n',
+    '            batch_size = 1\n',
+    '        else:\n',
+    '            batch_size = batch.prompt_embeds[0].shape[0]\n',
+    '\n',
+    '        batch_size *= batch.num_videos_per_prompt\n',
+    '\n',
+    '        if not batch.prompt_embeds:\n',
+    '            transformer_dtype = next(self.transformer.parameters()).dtype\n',
+    '            device = get_local_torch_device()\n',
+    '            dummy_prompt = torch.zeros(\n',
+    '                batch_size,\n',
+    '                0,\n',
+    '                self.transformer.hidden_size,\n',
+    '                device=device,\n',
+    '                dtype=transformer_dtype,\n',
+    '            )\n',
+    '            batch.prompt_embeds = [dummy_prompt]\n',
+    '            batch.negative_prompt_embeds = []\n',
+    '            batch.do_classifier_free_guidance = False\n',
+    '\n',
+    '        dtype = batch.prompt_embeds[0].dtype\n',
+    '        device = get_local_torch_device()\n',
+    '        generator = batch.generator\n',
+    '        latents = batch.latents\n',
+    '        num_frames = latent_num_frames if latent_num_frames is not None else batch.num_frames\n',
+    '        height = batch.height\n',
+    '        width = batch.width\n',
+    '        latent_path = fastvideo_args.ltx2_initial_latent_path\n',
+    '\n',
+    '        if height is None or width is None:\n',
+    '            raise ValueError("Height and width must be provided")\n',
+    '\n',
+    '        spatial_ratio = fastvideo_args.pipeline_config.vae_config.arch_config.spatial_compression_ratio\n',
+    '        if height % spatial_ratio != 0 or width % spatial_ratio != 0:\n',
+    '            raise ValueError(f"Height and width must be divisible by {spatial_ratio} "\n',
+    '                             f"but are {height} and {width}.")\n',
+    '        shape = (\n',
+    '            batch_size,\n',
+    '            self.transformer.num_channels_latents,\n',
+    '            num_frames,\n',
+    '            height // spatial_ratio,\n',
+    '            width // spatial_ratio,\n',
+    '        )\n',
+    '\n',
+    '        if isinstance(generator, list) and len(generator) != batch_size:\n',
+    '            raise ValueError(f"You have passed a list of generators of length {len(generator)}, "\n',
+    '                             f"but requested an effective batch size of {batch_size}.")\n',
+    '\n',
+    '        sampled_random = False\n',
+    '        if latents is None:\n',
+    '            if latent_path:\n',
+    '                loaded_latents = self._load_initial_latent(latent_path, device, dtype)\n',
+    '                if loaded_latents is not None:\n',
+    '                    latents = loaded_latents\n',
+    '                else:\n',
+    '                    latents = randn_tensor(\n',
+    '                        shape,\n',
+    '                        generator=generator,\n',
+    '                        device=device,\n',
+    '                        dtype=dtype,\n',
+    '                    )\n',
+    '                    self._save_initial_latent(latent_path, latents)\n',
+    '            else:\n',
+    '                latents = randn_tensor(\n',
+    '                    shape,\n',
+    '                    generator=generator,\n',
+    '                    device=device,\n',
+    '                    dtype=dtype,\n',
+    '                )\n',
+    '                sampled_random = True\n',
+    '        else:\n',
+    '            latents = latents.to(device)\n',
+    '\n',
+    '        # videofentanyl: reload PIL from image_path when missing (mp/spawn workers may\n',
+    '        # not preserve a pickled PIL; path still points at the temp start image).\n',
+    '        if batch.pil_image is None and batch.image_path is not None:\n',
+    '            from fastvideo.models.vision_utils import load_image, load_video\n',
+    '\n',
+    '            _ip = str(batch.image_path)\n',
+    '            if _ip.endswith(".mp4"):\n',
+    '                batch.pil_image = load_video(_ip)[0]\n',
+    '            else:\n',
+    '                batch.pil_image = load_image(batch.image_path)\n',
+    '\n',
+    '        vae_mod = self._resolve_vae()\n',
+    '        if vae_mod is None and batch.image_path is not None:\n',
+    '            logger.warning(\n',
+    '                "[LTX2] image_path set but no VAE in latent prep (vae= / pipeline.modules) — "\n',
+    '                "image-to-video disabled (run scripts/fastvideo_install).",\n',
+    '            )\n',
+    '\n',
+    '        batch.extra.pop("ltx2_i2v_anchor_latents", None)\n',
+    '        if (\n',
+    '            latent_path is None\n',
+    '            and sampled_random\n',
+    '            and batch.pil_image is not None\n',
+    '            and vae_mod is not None\n',
+    '            and shape[2] > 1\n',
+    '        ):\n',
+    '            latents = self._blend_start_image_into_latents(\n',
+    '                latents,\n',
+    '                batch.pil_image,\n',
+    '                vae_mod,\n',
+    '                batch_size=batch_size,\n',
+    '                height=int(height),\n',
+    '                width=int(width),\n',
+    '                spatial_ratio=int(spatial_ratio),\n',
+    '                device=device,\n',
+    '                dtype=dtype,\n',
+    '            )\n',
+    '            z0 = latents[:, :, :1].detach().clone()\n',
+    '            batch.extra["ltx2_i2v_anchor_latents"] = z0\n',
+    '            logger.info("[LTX2] image-to-video: first latent slice fixed from start image")\n',
+    '\n',
+    '        batch.latents = latents\n',
+    '        batch.raw_latent_shape = shape\n',
+    '        return batch\n',
+    '\n',
+    '    @staticmethod\n',
+    '    def _cfg_get(cfg: Any, name: str) -> Any:\n',
+    '        if cfg is None:\n',
+    '            return None\n',
+    '        if isinstance(cfg, dict):\n',
+    '            return cfg.get(name)\n',
+    '        return getattr(cfg, name, None)\n',
+    '\n',
+    '    def _normalize_video_latent(self, z: torch.Tensor, vae: Any) -> torch.Tensor:\n',
+    '        """Match diffusers LTX2 ``_normalize_latents`` (inverse of decode-time denorm)."""\n',
+    '        cfg = getattr(vae, "config", None)\n',
+    '        latents_mean = self._cfg_get(cfg, "latents_mean")\n',
+    '        latents_std = self._cfg_get(cfg, "latents_std")\n',
+    '        if latents_mean is not None and latents_std is not None:\n',
+    '            mean = torch.as_tensor(latents_mean, device=z.device, dtype=z.dtype).view(1, -1, 1, 1, 1)\n',
+    '            std = torch.as_tensor(latents_std, device=z.device, dtype=z.dtype).view(1, -1, 1, 1, 1)\n',
+    '            sf = float(self._cfg_get(cfg, "scaling_factor") or 1.0)\n',
+    '            return (z - mean) * sf / std\n',
+    '        if hasattr(vae, "scaling_factor"):\n',
+    '            sf = vae.scaling_factor\n',
+    '            if isinstance(sf, torch.Tensor):\n',
+    '                sf = sf.to(z.device, z.dtype)\n',
+    '            return z / sf\n',
+    '        return z\n',
+    '\n',
+    '    def _encode_start_image_latent(\n',
+    '        self,\n',
+    '        pil_image: Image.Image,\n',
+    '        vae: Any,\n',
+    '        *,\n',
+    '        batch_size: int,\n',
+    '        height: int,\n',
+    '        width: int,\n',
+    '        spatial_ratio: int,\n',
+    '        device: torch.device,\n',
+    '        dtype: torch.dtype,\n',
+    '    ) -> torch.Tensor:\n',
+    '        """Encode a single RGB frame to one latent temporal slice (normalized)."""\n',
+    '        if not isinstance(pil_image, Image.Image):\n',
+    '            raise TypeError(f"LTX2 i2v expects PIL.Image from image_path; got {type(pil_image)}")\n',
+    '        img = pil_image.convert("RGB") if pil_image.mode != "RGB" else pil_image\n',
+    '        processor = ImageProcessor(vae_scale_factor=spatial_ratio)\n',
+    '        pixel = processor.preprocess(img, height, width).to(device=device, dtype=dtype)\n',
+    '        video = pixel.unsqueeze(2)\n',
+    '        if batch_size != 1:\n',
+    '            video = video.expand(batch_size, -1, -1, -1, -1).contiguous()\n',
+    '        vae.to(device)\n',
+    '        with torch.no_grad():\n',
+    '            enc = vae.encode(video)\n',
+    '        if isinstance(enc, DiagonalGaussianDistribution):\n',
+    '            z0 = enc.mode()\n',
+    '        elif hasattr(enc, "latent_dist"):\n',
+    '            z0 = enc.latent_dist.mode()\n',
+    '        else:\n',
+    '            z0 = enc\n',
+    '        return self._normalize_video_latent(z0, vae)\n',
+    '\n',
+    '    def _blend_start_image_into_latents(\n',
+    '        self,\n',
+    '        noise_latents: torch.Tensor,\n',
+    '        pil_image: Image.Image,\n',
+    '        vae: Any,\n',
+    '        *,\n',
+    '        batch_size: int,\n',
+    '        height: int,\n',
+    '        width: int,\n',
+    '        spatial_ratio: int,\n',
+    '        device: torch.device,\n',
+    '        dtype: torch.dtype,\n',
+    '    ) -> torch.Tensor:\n',
+    '        """Aligns with diffusers ``LTX2ImageToVideoPipeline.prepare_latents`` (first slice + noise)."""\n',
+    '        z_first = self._encode_start_image_latent(\n',
+    '            pil_image,\n',
+    '            vae,\n',
+    '            batch_size=batch_size,\n',
+    '            height=height,\n',
+    '            width=width,\n',
+    '            spatial_ratio=spatial_ratio,\n',
+    '            device=device,\n',
+    '            dtype=dtype,\n',
+    '        )\n',
+    '        mask = torch.zeros(\n',
+    '            (batch_size, 1, noise_latents.shape[2], noise_latents.shape[3], noise_latents.shape[4]),\n',
+    '            device=device,\n',
+    '            dtype=noise_latents.dtype,\n',
+    '        )\n',
+    '        mask[:, :, 0] = 1.0\n',
+    '        init = torch.zeros_like(noise_latents)\n',
+    '        init[:, :, :1] = z_first\n',
+    '        return init * mask + noise_latents * (1.0 - mask)\n',
+))
+
+LTX2_I2V_VELOCITY_OLD = '            sigma_value = sigma.to(torch.float32) if isinstance(sigma, torch.Tensor) else torch.tensor(\n                float(sigma),\n                device=latents.device,\n                dtype=torch.float32,\n            )\n            dt = sigma_next - sigma\n            velocity = ((latents.float() - pos_denoised.float()) / sigma_value).to(latents.dtype)\n\n            latents = (latents.float() + velocity.float() * dt).to(latents.dtype)\n            if pos_audio is not None and audio_latents is not None:'
+
+LTX2_I2V_VELOCITY_OLD_COMPACT = '            sigma_value = sigma.to(torch.float32) if isinstance(sigma, torch.Tensor) else torch.tensor(\n                float(sigma),\n                device=latents.device,\n                dtype=torch.float32,\n            )\n            dt = sigma_next - sigma\n            velocity = ((latents.float() - pos_denoised.float()) / sigma_value).to(latents.dtype)\n            latents = (latents.float() + velocity.float() * dt).to(latents.dtype)\n            if pos_audio is not None and audio_latents is not None:'
+
+LTX2_I2V_VELOCITY_NEW = '            sigma_value = sigma.to(torch.float32) if isinstance(sigma, torch.Tensor) else torch.tensor(\n                float(sigma),\n                device=latents.device,\n                dtype=torch.float32,\n            )\n            dt = sigma_next - sigma\n            anchor = batch.extra.get("ltx2_i2v_anchor_latents")\n            if anchor is not None and latents.shape[2] > 1:\n                lat_t = latents[:, :, 1:]\n                pred_t = pos_denoised[:, :, 1:]\n                velocity = ((lat_t.float() - pred_t.float()) / sigma_value).to(latents.dtype)\n                latents = latents.clone()\n                latents[:, :, 1:] = (lat_t.float() + velocity.float() * dt).to(latents.dtype)\n                latents[:, :, :1] = anchor.to(device=latents.device, dtype=latents.dtype)\n            else:\n                velocity = ((latents.float() - pos_denoised.float()) / sigma_value).to(latents.dtype)\n                latents = (latents.float() + velocity.float() * dt).to(latents.dtype)\n            if pos_audio is not None and audio_latents is not None:'
+
+# LTX2 i2v: per-token timestep 0 on first latent frame (``LTX2TrainingPipeline._prepare_dit_inputs``).
+LTX2_I2V_TRAINING_TIMESTEP_MARKER = "[LTX2] image-to-video: timestep=0 on first-frame tokens"
+
+LTX2_I2V_TRAINING_TIMESTEP_PRE_OLD = """        timestep_template = torch.ones(
+            (latents.shape[0], token_count),
+            device=latents.device,
+            dtype=torch.float32,
+        )
+        audio_prompt_embeds = batch.extra.get("ltx2_audio_prompt_embeds")"""
+
+LTX2_I2V_TRAINING_TIMESTEP_PRE_NEW = """        timestep_template = torch.ones(
+            (latents.shape[0], token_count),
+            device=latents.device,
+            dtype=torch.float32,
+        )
+        # Image-to-video (first latent temporal slice): match ``LTX2TrainingPipeline``
+        # ``_prepare_dit_inputs`` — conditioned spatial tokens use timestep 0 while the
+        # rest follow ``sigma`` (see ``timesteps = torch.where(mask_patch, 0, sigmas…)``).
+        n_i2v_zero_timestep_tokens = 0
+        if batch.extra.get("ltx2_i2v_anchor_latents") is not None and hasattr(self.transformer, "patchifier"):
+            _, _, _f_lat, h_lat, w_lat = latents.shape
+            _pt = self.transformer.patchifier.patch_size
+            _p1, p_h, p_w = int(_pt[0]), int(_pt[1]), int(_pt[2])
+            if _p1 != 1:
+                logger.warning(
+                    "[LTX2] i2v first-frame timestep mask expects temporal patch size 1; got %s",
+                    _pt,
+                )
+            gh = int(h_lat) // p_h
+            gw = int(w_lat) // p_w
+            n_i2v_zero_timestep_tokens = min(gh * gw, int(token_count))
+            logger.info(
+                "[LTX2] image-to-video: timestep=0 on first-frame tokens (%d of %d) "
+                "(training first-frame conditioning)",
+                n_i2v_zero_timestep_tokens,
+                token_count,
+            )
+        audio_prompt_embeds = batch.extra.get("ltx2_audio_prompt_embeds")"""
+
+LTX2_I2V_TRAINING_TIMESTEP_LOOP_OLD = """            timestep = timestep_template * sigma
+            audio_timestep = (audio_timestep_template * sigma if audio_timestep_template is not None else None)"""
+
+LTX2_I2V_TRAINING_TIMESTEP_LOOP_NEW = """            _i2v_anchor = batch.extra.get("ltx2_i2v_anchor_latents")
+            if _i2v_anchor is not None and latents.shape[2] > 1:
+                latents[:, :, :1] = _i2v_anchor.to(device=latents.device, dtype=latents.dtype)
+            timestep = timestep_template * sigma
+            if n_i2v_zero_timestep_tokens > 0:
+                timestep = timestep.clone()
+                timestep[:, :n_i2v_zero_timestep_tokens] = 0.0
+            audio_timestep = (audio_timestep_template * sigma if audio_timestep_template is not None else None)"""
+
+# Older i2v latent prep ``__init__`` / ``_resolve_vae`` variants → normalize to current target.
+LTX2_LATENT_I2V_INIT_WITH_PIPELINE_OLD = (
+    "    def __init__(self, transformer, vae: Any | None = None, pipeline: Any | None = None) -> None:\n"
+    "        super().__init__()\n"
+    "        self.transformer = transformer\n"
+    "        self.vae = vae\n"
+    "        # videofentanyl: upstream ``ltx2_pipeline`` only passes ``transformer``; resolve VAE\n"
+    "        # from the composed pipeline's module dict (same object DecodingStage uses).\n"
+    "        self._pipeline = pipeline\n"
+    "\n"
+    "    def _resolve_vae(self) -> Any | None:\n"
+    "        if self.vae is not None:\n"
+    "            return self.vae\n"
+    "        p = getattr(self, \"_pipeline\", None)\n"
+    "        if p is None:\n"
+    "            return None\n"
+    "        modules = getattr(p, \"modules\", None)\n"
+    "        if isinstance(modules, dict):\n"
+    "            return modules.get(\"vae\")\n"
+    "        return None\n"
+)
+
+LTX2_LATENT_I2V_INIT_CLEAN = (
+    "    def __init__(self, transformer, vae: Any | None = None) -> None:\n"
+    "        super().__init__()\n"
+    "        self.transformer = transformer\n"
+    "        self.vae = vae\n"
+    "\n"
+    "    def _resolve_vae(self) -> Any | None:\n"
+    "        return self.vae\n"
+)
+
+# Previous install used a named ``pipeline`` parameter; migrate to ``**kwargs`` for ctor robustness.
+LTX2_LATENT_I2V_INIT_TARGET_LEGACY = (
+    "    def __init__(self, transformer, vae: Any | None = None, pipeline: Any | None = None) -> None:\n"
+    "        super().__init__()\n"
+    "        self.transformer = transformer\n"
+    "        self.vae = vae\n"
+    "        self._pipeline = pipeline\n"
+    "\n"
+    "    def _resolve_vae(self) -> Any | None:\n"
+    "        if self.vae is not None:\n"
+    "            return self.vae\n"
+    "        p = self._pipeline\n"
+    "        if p is None:\n"
+    "            return None\n"
+    "        modules = getattr(p, \"modules\", None)\n"
+    "        if isinstance(modules, dict):\n"
+    "            return modules.get(\"vae\")\n"
+    "        return None\n"
+)
+
+LTX2_LATENT_I2V_INIT_TARGET = (
+    "    def __init__(self, transformer, vae: Any | None = None, **kwargs: Any) -> None:\n"
+    "        super().__init__()\n"
+    "        self.transformer = transformer\n"
+    "        self.vae = vae\n"
+    "        self._pipeline = kwargs.pop(\"pipeline\", None)\n"
+    "        kwargs.clear()\n"
+    "\n"
+    "    def _resolve_vae(self) -> Any | None:\n"
+    "        if self.vae is not None:\n"
+    "            return self.vae\n"
+    "        p = self._pipeline\n"
+    "        if p is None:\n"
+    "            return None\n"
+    "        modules = getattr(p, \"modules\", None)\n"
+    "        if isinstance(modules, dict):\n"
+    "            return modules.get(\"vae\")\n"
+    "        return None\n"
+)
+
+
+# Inserted between ``latents.to(device)`` and ``batch.extra.pop`` for older i2v-only trees.
+LTX2_LATENT_I2V_RELOAD_GAP_OLD = (
+    "            latents = latents.to(device)\n\n        batch.extra.pop(\"ltx2_i2v_anchor_latents\", None)\n"
+)
+LTX2_LATENT_I2V_RELOAD_GAP_NEW = (
+    "            latents = latents.to(device)\n\n"
+    "        # videofentanyl: reload PIL from image_path when missing (mp/spawn workers may\n"
+    "        # not preserve a pickled PIL; path still points at the temp start image).\n"
+    "        if batch.pil_image is None and batch.image_path is not None:\n"
+    "            from fastvideo.models.vision_utils import load_image, load_video\n\n"
+    "            _ip = str(batch.image_path)\n"
+    "            if _ip.endswith(\".mp4\"):\n"
+    "                batch.pil_image = load_video(_ip)[0]\n"
+    "            else:\n"
+    "                batch.pil_image = load_image(batch.image_path)\n\n"
+    "        if self.vae is None and batch.image_path is not None:\n"
+    "            logger.warning(\n"
+    "                \"[LTX2] image_path set but no VAE in latent prep (vae= / pipeline.modules) — \"\n"
+    "                \"image-to-video disabled (run scripts/fastvideo_install).\",\n"
+    "            )\n\n"
+    "        batch.extra.pop(\"ltx2_i2v_anchor_latents\", None)\n"
+)
+
+
+def patch_ltx2_pipeline_latent_i2v(ltx2_pipeline_py: Path) -> int:
+    """Wire ``vae=`` into ``LTX2LatentPreparationStage`` only (no ``pipeline=``; idempotent)."""
+    if not ltx2_pipeline_py.is_file():
+        print(f"Warning: {ltx2_pipeline_py} not found — skip LTX2 pipeline i2v patch", file=sys.stderr)
+        return 0
+    text = ltx2_pipeline_py.read_text(encoding="utf-8")
+    if LTX2_PIPELINE_LATENT_STAGE_NEW in text:
+        print(f"Already patched: {ltx2_pipeline_py} (LTX2 latent stage VAE, no pipeline=)")
+        return 0
+    if LTX2_PIPELINE_LATENT_STAGE_WITH_PIPELINE in text:
+        ltx2_pipeline_py.write_text(
+            text.replace(LTX2_PIPELINE_LATENT_STAGE_WITH_PIPELINE, LTX2_PIPELINE_LATENT_STAGE_NEW, 1),
+            encoding="utf-8",
+        )
+        print(f"Migrated {ltx2_pipeline_py} (removed pipeline= from LTX2LatentPreparationStage ctor)")
+        return 0
+    stripped, n = re.subn(
+        r'(\n[ \t]*vae=self\.get_module\("vae"\),)\s*\n[ \t]*pipeline=self,\s*\n',
+        r"\1\n",
+        text,
+        count=1,
+    )
+    if n:
+        ltx2_pipeline_py.write_text(stripped, encoding="utf-8")
+        print(f"Migrated {ltx2_pipeline_py} (regex-removed pipeline= after vae= in latent prep stage)")
+        return 0
+    if LTX2_PIPELINE_LATENT_STAGE_OLD not in text:
+        print(
+            f"Warning: expected latent_preparation_stage block not found in {ltx2_pipeline_py} — "
+            "skip LTX2 pipeline i2v patch",
+            file=sys.stderr,
+        )
+        return 0
+    ltx2_pipeline_py.write_text(
+        text.replace(LTX2_PIPELINE_LATENT_STAGE_OLD, LTX2_PIPELINE_LATENT_STAGE_NEW, 1),
+        encoding="utf-8",
+    )
+    print(f"Patched {ltx2_pipeline_py} (LTX2 latent prep receives VAE for i2v)")
+    return 0
+
+
+def patch_ltx2_latent_preparation_i2v(latent_py: Path) -> int:
+    """VAE first-frame conditioning for ``image_path`` / ``batch.pil_image`` (idempotent)."""
+    if not latent_py.is_file():
+        print(f"Warning: {latent_py} not found — skip LTX2 latent i2v patch", file=sys.stderr)
+        return 0
+    text = latent_py.read_text(encoding="utf-8")
+    if LTX2_LATENT_I2V_INIT_WITH_PIPELINE_OLD in text:
+        latent_py.write_text(
+            text.replace(LTX2_LATENT_I2V_INIT_WITH_PIPELINE_OLD, LTX2_LATENT_I2V_INIT_TARGET, 1),
+            encoding="utf-8",
+        )
+        print(f"Migrated {latent_py} (LTX2 latent prep __init__: normalize optional pipeline= + VAE resolver)")
+        return 0
+    if LTX2_LATENT_I2V_INIT_TARGET_LEGACY in text:
+        latent_py.write_text(
+            text.replace(LTX2_LATENT_I2V_INIT_TARGET_LEGACY, LTX2_LATENT_I2V_INIT_TARGET, 1),
+            encoding="utf-8",
+        )
+        print(f"Migrated {latent_py} (LTX2 latent prep __init__: use **kwargs for pipeline= compat)")
+        return 0
+    if LTX2_LATENT_I2V_INIT_CLEAN in text:
+        latent_py.write_text(
+            text.replace(LTX2_LATENT_I2V_INIT_CLEAN, LTX2_LATENT_I2V_INIT_TARGET, 1),
+            encoding="utf-8",
+        )
+        print(f"Migrated {latent_py} (LTX2 latent prep: accept optional pipeline= + modules VAE fallback)")
+        return 0
+    if "reload PIL from image_path" in text:
+        print(f"Already patched: {latent_py} (LTX2 i2v latent prep + image_path reload)")
+        return 0
+    if LTX2_LATENT_I2V_RELOAD_GAP_OLD in text:
+        text = text.replace(LTX2_LATENT_I2V_RELOAD_GAP_OLD, LTX2_LATENT_I2V_RELOAD_GAP_NEW, 1)
+        latent_py.write_text(text, encoding="utf-8")
+        print(f"Patched {latent_py} (LTX2 i2v: reload PIL from image_path for mp workers)")
+        return 0
+    if LTX2_LATENT_I2V_IMPORTS_OLD not in text:
+        print(
+            f"Warning: expected latent prep import block not found in {latent_py} — "
+            "skip LTX2 latent i2v patch",
+            file=sys.stderr,
+        )
+        return 0
+    if LTX2_LATENT_I2V_BODY_OLD not in text:
+        print(
+            f"Warning: expected latent prep __init__/forward block not found in {latent_py} — "
+            "skip LTX2 latent i2v patch",
+            file=sys.stderr,
+        )
+        return 0
+    text = text.replace(LTX2_LATENT_I2V_IMPORTS_OLD, LTX2_LATENT_I2V_IMPORTS_NEW, 1)
+    text = text.replace(LTX2_LATENT_I2V_BODY_OLD, LTX2_LATENT_I2V_BODY_NEW, 1)
+    latent_py.write_text(text, encoding="utf-8")
+    print(f"Patched {latent_py} (LTX2 image-to-video latent prep)")
+    return 0
+
+
+def patch_ltx2_denoising_i2v_anchor(denoising_py: Path) -> int:
+    """Pin first latent slice during denoise when ``ltx2_i2v_anchor_latents`` is set (idempotent)."""
+    if not denoising_py.is_file():
+        print(f"Warning: {denoising_py} not found — skip LTX2 denoise i2v patch", file=sys.stderr)
+        return 0
+    text = denoising_py.read_text(encoding="utf-8")
+    if 'anchor = batch.extra.get("ltx2_i2v_anchor_latents")' in text:
+        print(f"Already patched: {denoising_py} (LTX2 i2v denoise anchor)")
+        return 0
+    if LTX2_I2V_VELOCITY_OLD in text:
+        text = text.replace(LTX2_I2V_VELOCITY_OLD, LTX2_I2V_VELOCITY_NEW, 1)
+    elif LTX2_I2V_VELOCITY_OLD_COMPACT in text:
+        text = text.replace(LTX2_I2V_VELOCITY_OLD_COMPACT, LTX2_I2V_VELOCITY_NEW, 1)
+    else:
+        print(
+            f"Warning: expected sigma/velocity update block not found in {denoising_py} — "
+            "skip LTX2 denoise i2v patch",
+            file=sys.stderr,
+        )
+        return 0
+    denoising_py.write_text(text, encoding="utf-8")
+    print(f"Patched {denoising_py} (LTX2 i2v denoise anchor)")
+    return 0
+
+
+def patch_ltx2_denoising_i2v_training_timesteps(denoising_py: Path) -> int:
+    """Match ``LTX2TrainingPipeline`` first-frame conditioning: timestep 0 on first-frame tokens."""
+    if not denoising_py.is_file():
+        print(f"Warning: {denoising_py} not found — skip LTX2 i2v timestep patch", file=sys.stderr)
+        return 0
+    text = denoising_py.read_text(encoding="utf-8")
+    if LTX2_I2V_TRAINING_TIMESTEP_MARKER in text:
+        print(f"Already patched: {denoising_py} (LTX2 i2v training timesteps)")
+        return 0
+    if LTX2_I2V_TRAINING_TIMESTEP_PRE_OLD not in text:
+        print(
+            f"Warning: expected timestep_template block not found in {denoising_py} — "
+            "skip LTX2 i2v timestep patch",
+            file=sys.stderr,
+        )
+        return 0
+    text = text.replace(LTX2_I2V_TRAINING_TIMESTEP_PRE_OLD, LTX2_I2V_TRAINING_TIMESTEP_PRE_NEW, 1)
+    if LTX2_I2V_TRAINING_TIMESTEP_LOOP_OLD not in text:
+        print(
+            f"Warning: expected denoise loop timestep line not found in {denoising_py} — "
+            "skip LTX2 i2v timestep patch (partial edit?)",
+            file=sys.stderr,
+        )
+        return 0
+    text = text.replace(LTX2_I2V_TRAINING_TIMESTEP_LOOP_OLD, LTX2_I2V_TRAINING_TIMESTEP_LOOP_NEW, 1)
+    denoising_py.write_text(text, encoding="utf-8")
+    print(f"Patched {denoising_py} (LTX2 i2v training timesteps)")
+    return 0
+
+
+def run(cmd: list[str], *, cwd: Path | None = None) -> None:
+    print("+", " ".join(cmd), flush=True)
+    subprocess.check_call(cmd, cwd=str(cwd) if cwd else None)
+
+
+def main() -> int:
+    root = repo_root()
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--path",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="FastVideo tree (default: third_party/FastVideo under this repo)",
+    )
+    p.add_argument(
+        "--no-submodule",
+        action="store_true",
+        help="Do not run git submodule update (use with --path, missing-remote SHAs, or manual init)",
+    )
+    p.add_argument(
+        "--no-install",
+        action="store_true",
+        help="Only submodule + patch; skip pip install",
+    )
+    p.add_argument(
+        "--no-patch",
+        action="store_true",
+        help="Skip all videofentanyl FastVideo source patches (not recommended on macOS)",
+    )
+    args = p.parse_args()
+
+    fv = (args.path or (root / "third_party" / "FastVideo")).resolve()
+    use_submodule = args.path is None and not args.no_submodule
+
+    if use_submodule:
+        gitmodules = root / ".gitmodules"
+        if not gitmodules.is_file():
+            print(
+                "Error: no third_party/FastVideo submodule (.gitmodules missing).\n"
+                "  git submodule add https://github.com/hao-ai-lab/FastVideo.git "
+                "third_party/FastVideo",
+                file=sys.stderr,
+            )
+            return 1
+        gitlink = recorded_submodule_commit(root, "third_party/FastVideo")
+        sm_cmd = [
+            "git",
+            "-C",
+            str(root),
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+            "third_party/FastVideo",
+        ]
+        print("+", " ".join(sm_cmd), flush=True)
+        sm = subprocess.run(sm_cmd, cwd=str(root))
+        if sm.returncode != 0:
+            print(
+                "Warning: git submodule update failed (remote may not publish the recorded commit).",
+                file=sys.stderr,
+            )
+            if gitlink:
+                print(
+                    f"  Recorded submodule gitlink for third_party/FastVideo: {gitlink}",
+                    file=sys.stderr,
+                )
+                print(
+                    "  Maintainership: point the submodule at a commit that exists on the "
+                    "default FastVideo remote, or document a fork URL in .gitmodules.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "  (Could not read recorded submodule SHA from the parent repo index/HEAD.)",
+                    file=sys.stderr,
+                )
+            usable = fv.is_dir() and (fv / "pyproject.toml").is_file()
+            if not usable:
+                print(
+                    "Error: no usable FastVideo tree after submodule failure. Options:\n"
+                    "  • Clone FastVideo elsewhere and run: python scripts/fastvideo_install --path DIR\n"
+                    "  • Or: git submodule update --init third_party/FastVideo "
+                    "after fixing the submodule remote / recorded commit.",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                "  Continuing with the existing FastVideo checkout; applying videofentanyl patches.",
+                file=sys.stderr,
+            )
+
+    if not fv.is_dir():
+        print(f"Error: FastVideo directory not found: {fv}", file=sys.stderr)
+        return 1
+
+    pyproject = fv / "pyproject.toml"
+    if not pyproject.is_file():
+        print(f"Error: missing {pyproject}", file=sys.stderr)
+        return 1
+
+    denoising_py = fv / "fastvideo" / "pipelines" / "stages" / "ltx2_denoising.py"
+    decoding_py = fv / "fastvideo" / "pipelines" / "stages" / "decoding.py"
+    multiproc_py = fv / "fastvideo" / "worker" / "multiproc_executor.py"
+    ltx2_pipeline_py = fv / "fastvideo" / "pipelines" / "basic" / "ltx2" / "ltx2_pipeline.py"
+    latent_prep_py = fv / "fastvideo" / "pipelines" / "stages" / "ltx2_latent_preparation.py"
+
+    if not args.no_patch:
+        if patch_pyproject(pyproject) != 0:
+            return 1
+        if patch_ltx2_denoising_mps(denoising_py) != 0:
+            return 1
+        patch_ltx2_denoising_progress(denoising_py)
+        patch_decoding_mps_ipc(decoding_py)
+        patch_multiproc_executor_videofentanyl_fv_src(multiproc_py)
+        patch_multiproc_executor_mps_ipc(multiproc_py)
+        patch_ltx2_pipeline_latent_i2v(ltx2_pipeline_py)
+        patch_ltx2_latent_preparation_i2v(latent_prep_py)
+        patch_ltx2_denoising_i2v_anchor(denoising_py)
+        patch_ltx2_denoising_i2v_training_timesteps(denoising_py)
+    else:
+        print("Skipping FastVideo source patches (--no-patch).")
+
+    if args.no_install:
+        print("Skipping install (--no-install). Done.")
+        return 0
+
+    if shutil.which("uv"):
+        run(["uv", "pip", "install", "-e", str(fv)], cwd=root)
+    else:
+        print("Note: uv not found; using python -m pip", file=sys.stderr)
+        run([sys.executable, "-m", "pip", "install", "-e", str(fv)], cwd=root)
+
+    print("FastVideo install finished.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

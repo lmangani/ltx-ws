@@ -41,8 +41,11 @@ PROTOCOL — FastVideo (1080p)
 ─────────────────────────────
   connect → session_init_v2  (handshake)
           → simple_generate  (trigger generation)
+          → generation_status  (optional; client may poll while waiting)
           ← gpu_assigned
           ← ltx2_segment_start / ltx2_segment_complete
+          ← generation_keepalive  (optional; local server; may include model_progress)
+          ← generation_status_ack  (local server reply; may include model_progress)
           ← [binary chunks]
           ← ltx2_stream_complete
 
@@ -62,6 +65,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import base64
 import dataclasses
 import json
@@ -80,9 +84,32 @@ from datetime import datetime
 from urllib.parse import unquote, urlparse
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # ── Dependency bootstrap ───────────────────────────────────────────────────────
+
+
+def _fmt_model_progress(mp: Any) -> str:
+    """Human-readable suffix for server ``model_progress`` (denoise step / ETA)."""
+    if not isinstance(mp, dict):
+        return ""
+    stage = mp.get("stage")
+    if not stage:
+        return ""
+    bits: list[str] = [f"model={stage}"]
+    step, tot = mp.get("step"), mp.get("total")
+    if step is not None and tot is not None:
+        bits.append(f"{step}/{tot}")
+    pct = mp.get("pct")
+    if pct is not None:
+        bits.append(f"{pct}%")
+    eta = mp.get("eta_s")
+    if eta is not None:
+        bits.append(f"eta~{eta}s")
+    avg = mp.get("avg_step_s")
+    if avg is not None:
+        bits.append(f"{avg}s/step")
+    return "  " + "  ".join(bits)
 
 def _ensure(pkg: str, import_as: str | None = None):
     """Import a package, auto-installing it if missing.  Exit with a clear
@@ -123,7 +150,6 @@ MODES: dict[str, dict] = {
             'people clap as a romantic song ends and a girl speaks italian '
             '"orca madonna raghi"'
         ),
-        "default_timeout":  240,
         "default_delay":    1.0,
         "default_prefix":   "video",
         "default_preset_id": "simple_custom_prompt",
@@ -135,7 +161,6 @@ MODES: dict[str, dict] = {
         "host":             "dreamverse.fastvideo.org",
         "display_name":     "Dreamverse",
         "default_prompt":   "a kid burps into a tunnel, with a huge echo",
-        "default_timeout":  480,
         "default_delay":    2.0,
         "default_prefix":   "dreamverse",
         "default_preset_id": "custom_editable",
@@ -146,10 +171,20 @@ MODES: dict[str, dict] = {
 }
 
 
+_SERVER_OVERRIDE: str | None = None   # set by --server flag
+
+
 def _ws_url(mode: str) -> str:
+    if _SERVER_OVERRIDE:
+        return _SERVER_OVERRIDE
     return f"wss://{MODES[mode]['host']}/ws"
 
 def _ws_headers(mode: str) -> dict:
+    if _SERVER_OVERRIDE:
+        from urllib.parse import urlparse
+        parsed = urlparse(_SERVER_OVERRIDE)
+        origin = f"{parsed.scheme.replace('ws', 'http')}://{parsed.netloc}"
+        return {"Origin": origin, "User-Agent": USER_AGENT}
     return {"Origin": f"https://{MODES[mode]['host']}", "User-Agent": USER_AGENT}
 
 
@@ -174,6 +209,11 @@ class GenerationParams:
     auto_extension_enabled:   bool           = False
     loop_generation_enabled:  bool           = False
     initial_image:            Optional[dict] = None
+    # Passed to local server simple_generate (None → server default seed / resolution).
+    seed:                       Optional[int] = None
+    num_frames:                Optional[int] = None
+    height:                     Optional[int] = None
+    width:                      Optional[int] = None
 
 
 @dataclasses.dataclass
@@ -239,11 +279,14 @@ def msg_session_init_v2(p: GenerationParams, mode: str) -> str:
             "loop_generation_enabled": p.loop_generation_enabled,
         })
     else:  # fastvideo
+        # Mirror Dreamverse: carry ``initial_image`` on session_init so the server
+        # fallback (server.py) works for autocontinue / i2v and for
+        # clients that only attach the start frame to session_init_v2.
         return json.dumps({
             "type":                    "session_init_v2",
             "preset_id":               p.preset_id,
             "curated_prompts":         [],
-            "initial_image":           None,
+            "initial_image":           p.initial_image,
             "single_clip_mode":        p.single_clip_mode,
             "enhancement_enabled":     p.enhancement_enabled,
             "auto_extension_enabled":  p.auto_extension_enabled,
@@ -253,7 +296,7 @@ def msg_session_init_v2(p: GenerationParams, mode: str) -> str:
 
 def msg_simple_generate(p: GenerationParams) -> str:
     """FastVideo only — trigger generation after session_init_v2."""
-    return json.dumps({
+    d: dict[str, Any] = {
         "type":                "simple_generate",
         "preset_id":           p.preset_id,
         "prompt_id":           p.preset_id,
@@ -261,7 +304,16 @@ def msg_simple_generate(p: GenerationParams) -> str:
         "initial_image":       p.initial_image,
         "single_clip_mode":    True,
         "enhancement_enabled": p.enhancement_enabled,
-    })
+    }
+    if p.seed is not None:
+        d["seed"] = int(p.seed)
+    if p.num_frames is not None:
+        d["num_frames"] = int(p.num_frames)
+    if p.height is not None:
+        d["height"] = int(p.height)
+    if p.width is not None:
+        d["width"] = int(p.width)
+    return json.dumps(d)
 
 
 def msg_append_prompt(prompt: str, prompt_id: str | None = None) -> str:
@@ -292,6 +344,13 @@ def msg_reset_to_seed_prompts() -> str:
     return json.dumps({"type": "reset_to_seed_prompts"})
 
 
+# When ``--server`` leaves ``idle_timeout`` unlimited, we still slice ``recv()`` with
+# this interval so we can log + run RFC6455 ping/pong even if the server sends no
+# JSON (half-open links, middleboxes).  Server ``generation_keepalive`` usually
+# arrives sooner, so this is a back-stop, not a user-facing “timeout”.
+SOFT_WS_RECV_TICK_S = 90.0
+
+
 # ── Single-video WebSocket session ─────────────────────────────────────────────
 
 class VideoSession:
@@ -305,7 +364,12 @@ class VideoSession:
       connect → session_init_v2 (prompt embedded) → GPT rewrite → recv binary → save
     """
 
-    def __init__(self, job: Job, mode: str, verbose: bool = False):
+    def __init__(
+        self,
+        job: Job,
+        mode: str,
+        verbose: bool = False,
+    ):
         self.job     = job
         self.mode    = mode
         self.verbose = verbose
@@ -332,23 +396,125 @@ class VideoSession:
 
     # ── main ─────────────────────────────────────────────────────────────────
 
-    async def run(self, timeout: float) -> bool:
+    async def run(self, idle_timeout: float | None) -> bool:
+        """
+        Waits until ``ltx2_stream_complete`` (or server error), the server closes the
+        socket, or an **idle** deadline trips (with WebSocket ping/pong probe).
+
+        There is **no wall-clock session cap** — long generations are not cut off
+        by elapsed time since connect.
+
+        ``idle_timeout`` — if not ``None``, no application message for this many
+        seconds triggers a WebSocket ping; only a failed pong ends the session.
+        If ``None`` (typical with ``--server``), recv is still sliced every
+        ``SOFT_WS_RECV_TICK_S`` seconds for **logging + ping/pong** so the process
+        never sits silently on a dead TCP socket.
+
+        **Keep-alive layers (all visible with default logging where noted):**
+
+        1. **Library** — ``ping_interval=30``, ``ping_timeout=None``: automatic
+           RFC6455 pings; no application-level log line per ping.
+        2. **Recv slice + ping** — each ``asyncio.wait_for(ws.recv(), …)`` expiry
+           logs ``… sending WebSocket ping`` then awaits the pong (always logged).
+        3. **App JSON** (``--server`` only) — background task sends
+           ``generation_status`` every 30s (logged as ``→``); server may answer with
+           ``generation_status_ack`` (logged as ``←``).
+        4. **Server JSON** — ``generation_keepalive`` frames log as ``← keepalive``.
+        """
         self._t0 = time.time()
         try:
-            async with asyncio.timeout(timeout):
-                async with websockets.connect(
-                    _ws_url(self.mode),
-                    additional_headers=_ws_headers(self.mode),
-                    max_size=200 * 1024 * 1024,
-                    ping_interval=30,
-                    ping_timeout=20,
-                    close_timeout=5,
-                ) as ws:
-                    await self._on_open(ws)
-                    await self._recv_loop(ws)
-        except asyncio.TimeoutError:
-            self.job.error = f"timed out after {timeout:.0f}s"
-            return False
+            async with websockets.connect(
+                _ws_url(self.mode),
+                additional_headers=_ws_headers(self.mode),
+                max_size=200 * 1024 * 1024,
+                open_timeout=None,
+                ping_interval=30,
+                ping_timeout=None,
+                close_timeout=5,
+            ) as ws:
+                await self._on_open(ws)
+
+                recv_cap = (
+                    idle_timeout
+                    if idle_timeout is not None
+                    else SOFT_WS_RECV_TICK_S
+                )
+
+                async def _recv_loop() -> None:
+                    while not self._done.is_set():
+                        try:
+                            frame = await asyncio.wait_for(
+                                ws.recv(),
+                                timeout=recv_cap,
+                            )
+                        except asyncio.TimeoutError:
+                            if idle_timeout is not None:
+                                tag = (
+                                    f"no application data for {idle_timeout:.0f}s "
+                                    "(idle limit)"
+                                )
+                            else:
+                                tag = (
+                                    f"no application data for {SOFT_WS_RECV_TICK_S:.0f}s "
+                                    "(soft recv slice; server JSON optional)"
+                                )
+                            self._log(f"{tag} — sending WebSocket ping…", always=True)
+                            try:
+                                pong_waiter = await ws.ping()
+                                await asyncio.wait_for(pong_waiter, timeout=30.0)
+                            except Exception as exc:
+                                self.job.error = (
+                                    f"{tag}: WebSocket ping/pong failed: {exc!r}"
+                                )
+                                return
+                            self._log(
+                                "← WebSocket pong OK — still waiting…",
+                                always=True,
+                            )
+                            continue
+                        if isinstance(frame, bytes):
+                            self._handle_binary(frame)
+                        else:
+                            await self._handle_json(frame)
+
+                async def _status_pinger() -> None:
+                    if not _SERVER_OVERRIDE:
+                        return
+                    ping_json = json.dumps({"type": "generation_status"})
+                    while not self._done.is_set():
+                        await asyncio.sleep(30.0)
+                        if self._done.is_set():
+                            break
+                        try:
+                            self._log(
+                                "→ generation_status  (app-level keepalive ping)",
+                                always=True,
+                            )
+                            await ws.send(ping_json)
+                        except Exception:
+                            break
+
+                recv_task = asyncio.create_task(_recv_loop())
+                ping_task = asyncio.create_task(_status_pinger())
+                try:
+                    await recv_task
+                finally:
+                    ping_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await ping_task
+                    if not recv_task.done():
+                        recv_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await recv_task
+                if self.job.error:
+                    return False
+        except websockets.exceptions.ConnectionClosed as exc:
+            if not self._done.is_set():
+                self.job.error = (
+                    f"server closed WebSocket ({exc.code}): "
+                    f"{exc.reason or 'no reason'}"
+                )
+                return False
         except Exception as exc:
             self.job.error = str(exc)
             return False
@@ -378,15 +544,6 @@ class VideoSession:
                 f"→ simple_generate  prompt={self.job.params.prompt[:60]!r}",
                 always=True,
             )
-
-    async def _recv_loop(self, ws):
-        async for frame in ws:
-            if isinstance(frame, bytes):
-                self._handle_binary(frame)
-            else:
-                await self._handle_json(frame)
-            if self._done.is_set():
-                break
 
     # ── frame handlers ────────────────────────────────────────────────────────
 
@@ -420,17 +577,44 @@ class VideoSession:
             pos   = msg.get("position", "?")
             avail = msg.get("available_gpus", "?")
             total = msg.get("total_gpus", "?")
-            self._log(f"← queue_status  position={pos}  gpus={avail}/{total}",
-                      always=True)
+            agid  = msg.get("active_generation_id")
+            extra = f"  active_gen={agid}" if agid else ""
+            self._log(
+                f"← queue_status  position={pos}  gpus={avail}/{total}{extra}",
+                always=True,
+            )
 
         elif t == "gpu_assigned":
             gpu_id  = msg.get("gpu_id", "?")
             timeout = msg.get("session_timeout", "?")
+            gid     = msg.get("generation_id")
+            gextra  = f"  generation_id={gid}" if gid else ""
             if self.mode == "dreamverse":
-                self._log(f"← gpu_assigned  gpu={gpu_id}  "
-                          f"session_timeout={timeout}s", always=True)
+                self._log(
+                    f"← gpu_assigned  gpu={gpu_id}  "
+                    f"session_timeout={timeout}s{gextra}",
+                    always=True,
+                )
             else:
-                self._log("← gpu_assigned ✓", always=True)
+                self._log(f"← gpu_assigned ✓{gextra}", always=True)
+
+        elif t == "generation_keepalive":
+            elapsed = msg.get("elapsed_s", "?")
+            phase   = msg.get("phase", "?")
+            extra = _fmt_model_progress(msg.get("model_progress"))
+            self._log(
+                f"← keepalive  {phase}  {elapsed}s{extra}",
+                always=True,
+            )
+
+        elif t == "generation_status_ack":
+            extra = _fmt_model_progress(msg.get("model_progress"))
+            self._log(
+                f"← generation_status_ack  phase={msg.get('phase', '?')}  "
+                f"elapsed={msg.get('elapsed_s', '?')}s  "
+                f"id={msg.get('generation_id', '')[:8]}…{extra}",
+                always=True,
+            )
 
         elif t == "session_started":
             self._log("← session_started")
@@ -617,18 +801,18 @@ class GenerationQueue:
 
     def __init__(
         self,
-        jobs:         list[Job],
-        mode:         str,
-        timeout:      float,
-        delay:        float,
-        verbose:      bool = False,
-        autocontinue: bool = False,
+        jobs:           list[Job],
+        mode:           str,
+        idle_timeout:   float | None,
+        delay:          float,
+        verbose:        bool = False,
+        autocontinue:   bool = False,
     ):
-        self.jobs         = jobs
-        self.mode         = mode
-        self.timeout      = timeout
-        self.delay        = delay
-        self.verbose      = verbose
+        self.jobs          = jobs
+        self.mode          = mode
+        self.idle_timeout = idle_timeout
+        self.delay = delay
+        self.verbose = verbose
         self.autocontinue = autocontinue
 
     async def run_all(self):
@@ -640,7 +824,15 @@ class GenerationQueue:
         print(f"\n{'═'*60}")
         print(f"  {name} Queue — {total} job(s)")
         print(f"  Endpoint : {_ws_url(self.mode)}")
-        print(f"  Timeout  : {self.timeout}s per video")
+        _idle = (
+            "unlimited (recv waits until server sends or closes)"
+            if self.idle_timeout is None
+            else f"{self.idle_timeout:.0f}s (+ ping probe if quiet)"
+        )
+        print(
+            f"  Session    : no wall-clock cap  |  idle {_idle}  |  "
+            "WS transport ping timeout disabled"
+        )
         print(f"  Delay    : {self.delay}s between jobs")
         print(f"{'═'*60}\n")
 
@@ -672,7 +864,7 @@ class GenerationQueue:
                     job.error = None
 
                 session = VideoSession(job, mode=self.mode, verbose=self.verbose)
-                success = await session.run(timeout=self.timeout)
+                success = await session.run(self.idle_timeout)
 
             job.finished_at = time.time()
             job.status      = JobStatus.DONE if success else JobStatus.FAILED
@@ -686,8 +878,11 @@ class GenerationQueue:
                 if self.autocontinue and i + 1 < len(self.jobs):
                     frame = extract_last_frame(job.output_path)
                     if frame:
-                        self.jobs[i + 1].params.initial_image = frame
-                        print(f"  → autocontinue: last frame → job {i + 2:02d}")
+                        nxt = self.jobs[i + 1].params
+                        nxt.initial_image = frame
+                        # Vary seed so a missed i2v path does not reproduce the same noise as clip 1.
+                        nxt.seed = int(time.time_ns() % (2**31 - 1)) or 1
+                        print(f"  → autocontinue: last frame → job {i + 2:02d}  seed={nxt.seed}")
             else:
                 failed += 1
                 print(f"  ✗ FAILED  {job.error}")
@@ -1168,10 +1363,15 @@ examples:
     # ── Queue / network ───────────────────────────────────────────────────────
     q = p.add_argument_group("queue & network")
     q.add_argument(
-        "--timeout", "-t",
-        type=float, default=None, metavar="SECS",
-        help="per-video timeout in seconds "
-             "(default: 240 for fastvideo, 480 for dreamverse)",
+        "--idle-timeout",
+        type=float,
+        default=None,
+        metavar="SECS",
+        help=(
+            "if the server sends no application message for this many seconds, "
+            "probe with a WebSocket ping (default: 120 hosted; with --server "
+            "default is unlimited — use this flag to set a finite idle cap)"
+        ),
     )
     q.add_argument(
         "--delay", "-d",
@@ -1227,11 +1427,21 @@ examples:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    p.add_argument(
+        "--server",
+        default=None, metavar="URL",
+        help="override WebSocket endpoint (e.g. ws://localhost:8765/ws); "
+             "use with server.py for fully local generation",
+    )
 
     return p
 
 
 async def async_main(args: argparse.Namespace):
+    global _SERVER_OVERRIDE
+    if args.server:
+        _SERVER_OVERRIDE = args.server
+
     mode    = args.mode
     cfg     = MODES[mode]
 
@@ -1252,7 +1462,17 @@ async def async_main(args: argparse.Namespace):
         sys.exit(2)
 
     # ── Resolve mode-specific defaults ───────────────────────────────────────
-    timeout = args.timeout if args.timeout is not None else cfg["default_timeout"]
+    if args.idle_timeout is not None:
+        idle_timeout: float | None = args.idle_timeout
+    elif args.server:
+        idle_timeout = None
+    else:
+        idle_timeout = 120.0
+
+    if idle_timeout is not None and idle_timeout < 10:
+        print("Error: --idle-timeout must be >= 10 seconds (or omit for unlimited with --server)")
+        sys.exit(1)
+
     delay   = args.delay   if args.delay   is not None else cfg["default_delay"]
     prefix  = args.prefix  if args.prefix  is not None else cfg["default_prefix"]
     preset_id    = args.preset_id    if args.preset_id    is not None else cfg["default_preset_id"]
@@ -1301,7 +1521,11 @@ async def async_main(args: argparse.Namespace):
             print()
         print(f"  Endpoint   : {_ws_url(mode)}")
         print(f"  Output dir : {output_dir.resolve()}")
-        print(f"  Timeout    : {timeout}s  Delay: {delay}s  Retries: {args.retries}")
+        _idle = "unlimited" if idle_timeout is None else f"{idle_timeout:.0f}s (+ ping)"
+        print(
+            f"  Limits     : no wall-clock cap  idle {_idle}  "
+            f"Delay: {delay}s  Retries: {args.retries}"
+        )
         if args.autoconcat:
             print("  autoconcat : after run, merge successful clips with ffmpeg; "
                   "remove fragments if merge succeeds")
@@ -1311,7 +1535,7 @@ async def async_main(args: argparse.Namespace):
     queue = GenerationQueue(
         jobs=jobs,
         mode=mode,
-        timeout=timeout,
+        idle_timeout=idle_timeout,
         delay=delay,
         verbose=args.verbose,
         autocontinue=args.autocontinue,
