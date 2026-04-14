@@ -7,7 +7,7 @@ TCP connections (model load + bind), runs one minimal ``videofentanyl.py``
 job, prints timings, then shuts the server down.
 
 **Interpreter:** uses ``REPO_ROOT/.venv/bin/python3`` when present (see README
-*Local server (Apple Silicon / MLX)*: ``uv venv``, ``uv pip install -r requirements.txt``,
+*Install*: ``uv venv``, ``uv pip install -r requirements.txt``,
 then ``uv pip install`` the ``ltx-*-mlx`` git URLs from ``requirements.txt`` comments).
 Pass ``--allow-system-python`` only if you intentionally skip a venv.
 

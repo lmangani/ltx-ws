@@ -16,8 +16,7 @@ build/
 # OS
 .DS_Store
 
-# Local benchmark outputs (scripts/benchmark_local_generation.py)
+# Runtime / local outputs (do not commit)
 benchmark_runs/
-
-# Hugging Face MLX snapshots (server.py default when --model is a repo id)
+fvserver_completed/
 models/
