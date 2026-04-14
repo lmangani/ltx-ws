@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """
-server.py — Local FastVideo/LTX2 WebSocket Server
-==================================================
-Runs a local WebSocket server that implements the same protocol as
-wss://1080p.fastvideo.org/ws, generating videos with FastVideo's
-LTX2-Distilled model on Apple MPS (or CPU as fallback).
+server.py — Local LTX WebSocket server (MLX)
+============================================
+Runs a local WebSocket server compatible with the **videofentanyl** client
+(same JSON + binary MP4 framing as the historical FastVideo-hosted API),
+using **ltx-2-mlx** ([dgrauet/ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx))
+on Apple Silicon.
 
 USAGE
 ─────
-  # Start the server (default: ws://0.0.0.0:8765/ws)
+  # Install MLX packages first (see README), then:
   python server.py
 
-  # Then run the client pointing at the local server
   python videofentanyl.py --server ws://localhost:8765/ws \\
       --prompt "a fox running through snow"
 
-  # Custom device settings
-  python server.py --port 9000 --num-frames 65 --height 480 --width 832
+  python server.py --port 9000 --num-frames 65 --height 480 --width 704
 
-PROTOCOL — FastVideo (1080p) — server side
-─────────────────────────────────────────────
+PROTOCOL — local LTX (same message shapes as legacy 1080p WS)
+──────────────────────────────────────────────────────────────
   ← session_init_v2    (client handshake; store session state; may include
                         ``initial_image`` / ``initialImage`` for i2v or autocontinue)
   ← simple_generate    (client triggers generation; optional ``seed``, ``num_frames``,
@@ -29,8 +28,7 @@ PROTOCOL — FastVideo (1080p) — server side
   → gpu_assigned       (device ready; includes generation_id for this job)
   → ltx2_stream_start
   → ltx2_segment_start
-  → generation_keepalive (periodic JSON while the model runs; elapsed_s / phase /
-    generation_id / optional model_progress from worker denoise steps)
+  → generation_keepalive (periodic JSON while the model runs; ``model_progress`` reserved)
   ← generation_status  (optional client ping while generating)
   → generation_status_ack (phase / elapsed_s / generation_id / optional model_progress)
   → [binary chunks]    (raw MP4 video data)
@@ -44,19 +42,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import base64
-import functools
 import json
 import logging
 import mimetypes
 import os
-import queue
 import re
 import shutil
 import sys
 import subprocess
 import tempfile
-import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -89,59 +83,24 @@ def _ensure(pkg: str, import_as: str | None = None):
 
 websockets = _ensure("websockets")
 
-
-def _prepend_repo_fastvideo_to_sys_path() -> None:
-    """
-    Prefer this repo's ``third_party/FastVideo`` on ``sys.path`` (and ``PYTHONPATH``).
-
-    Multiprocessing **spawn** workers do not import this module first; they may resolve
-    ``fastvideo`` from a venv while pipeline sources live under this repo. Prepended
-    ``PYTHONPATH`` improves (but does not guarantee) a single tree; patched
-    ``ltx2_pipeline`` therefore must not pass ctor kwargs that only exist in a submodule
-    copy of ``LTX2LatentPreparationStage`` (see ``scripts/fastvideo_install``).
-    """
-    root = Path(__file__).resolve().parent
-    fv = root / "third_party" / "FastVideo"
-    if not fv.is_dir() or not (fv / "fastvideo").is_dir():
-        return
-    s = str(fv.resolve())
-    if s not in sys.path:
-        sys.path.insert(0, s)
-    prev = os.environ.get("PYTHONPATH", "")
-    if prev:
-        parts = prev.split(os.pathsep)
-        if s not in parts:
-            os.environ["PYTHONPATH"] = s + os.pathsep + prev
-    else:
-        os.environ["PYTHONPATH"] = s
-    # Multiprocessing spawn workers import ``multiproc_executor`` before ``server.py``;
-    # they read this and prepend the same tree (see FastVideo worker patch).
-    os.environ["VIDEOFENTANYL_FASTVIDEO_SRC"] = s
-
-
-_prepend_repo_fastvideo_to_sys_path()
+from ltx_mlx_backend import (
+    LocalVideoGenerator,
+    hf_local_weights_directory,
+    looks_like_hf_repo_id,
+)
 
 # ── Constants / defaults ───────────────────────────────────────────────────────
 
 DEFAULT_HOST           = "0.0.0.0"
 DEFAULT_PORT           = 8765
-DEFAULT_MODEL          = "FastVideo/LTX2-Distilled-Diffusers"
-DEFAULT_NUM_GPUS       = 1
+DEFAULT_MODEL          = "dgrauet/ltx-2.3-mlx"  # full bf16 weights; use -q4/-q8 for less RAM
 DEFAULT_NUM_FRAMES     = 97    # ~4 s @ 24 fps; LTX requires (8k+1) frames: 9, 17, 25, … 97, 105, …
 DEFAULT_HEIGHT         = 480
-# LTX2 latent prep requires height and width divisible by 32 (848 is invalid).
-DEFAULT_WIDTH          = 832
+DEFAULT_WIDTH          = 704   # MLX LTX default width; must be multiple of 32
 DEFAULT_FPS            = 24
-DEFAULT_GUIDANCE_SCALE = 1.0   # LTX2-Distilled uses cfg=1.0
-# Distilled LTX2 is meant for few-step sampling; FastVideo's schema default (50)
-# is oriented at CUDA servers and is far too slow on Apple MPS (~tens of s/step).
-DEFAULT_INFER_STEPS    = 12
+DEFAULT_INFER_STEPS    = 8     # distilled one-stage default in ltx-2-mlx
 DEFAULT_CHUNK_SIZE     = 64 * 1024  # 64 KB per WebSocket binary message
-# JSON keepalives during long MPS runs so clients can use an idle timeout instead
-# of a short wall-clock cap (see videofentanyl.py).
 GENERATION_KEEPALIVE_INTERVAL_S = 15.0
-# Must match ``FV_PROGRESS_JSON`` lines emitted by patched FastVideo (e.g. ltx2_denoising).
-FV_PROGRESS_LOG_TAG = "FV_PROGRESS_JSON"
 
 # LTX2 frame requirement: num_frames must satisfy (frames - 1) % 8 == 0
 # e.g. 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 121, 129
@@ -181,18 +140,6 @@ def _largest_mp4_under(root: Path) -> Path | None:
     return best
 
 
-def _make_fv_mp_queue() -> Any:
-    """Multiprocessing queue compatible with FastVideo worker ``log_queue``."""
-    try:
-        from fastvideo.utils import get_mp_context
-
-        return get_mp_context().Queue()
-    except Exception:
-        import multiprocessing as mp
-
-        return mp.Queue()
-
-
 def _cleanup_temp_video(path: str | None) -> None:
     """Remove a temp MP4 and its parent directory (best-effort)."""
     if not path:
@@ -206,28 +153,6 @@ def _cleanup_temp_video(path: str | None) -> None:
             pass
     except OSError:
         pass
-
-
-def _apply_pytorch_mps_runtime_tuning() -> None:
-    """Best-effort runtime knobs for Metal / MPS (no-op if torch or MPS missing)."""
-    try:
-        import torch
-    except ImportError:
-        return
-    log.info("PyTorch %s", torch.__version__)
-    if not getattr(torch.backends, "mps", None) or not torch.backends.mps.is_available():
-        return
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
-    # Prefer bf16 accumulation where the build supports it (reduces upcasts).
-    mps = getattr(torch.backends, "mps", None)
-    if mps is not None and hasattr(mps, "allow_fp16_accumulation_in_bf16"):
-        try:
-            mps.allow_fp16_accumulation_in_bf16 = True  # type: ignore[attr-defined]
-        except Exception:
-            pass
 
 
 # ── Image helpers ──────────────────────────────────────────────────────────────
@@ -269,483 +194,6 @@ def _resolve_initial_image_payload(msg: dict, session: dict) -> dict | str | Non
                 return raw
     return None
 
-
-def _decode_initial_image(image_data: dict) -> str:
-    """
-    Turn an ``initial_image`` dict into something ``InputConfig(image_path=…)`` accepts:
-    ``https?://`` URL, existing filesystem path, or base64 / data-URL written to a temp file.
-    Caller should delete only temp files created here (names contain ``fvserver_img_``).
-    """
-    data_url: str = (image_data.get("data_url") or "").strip()
-    if data_url.startswith(("http://", "https://")):
-        return data_url
-    if data_url.startswith("file://"):
-        from urllib.parse import unquote
-        from urllib.request import url2pathname
-
-        path = url2pathname(unquote(data_url[7:]))
-        if os.path.isfile(path):
-            return path
-    if data_url and os.path.isfile(data_url):
-        return data_url
-
-    if data_url.startswith("data:"):
-        header, encoded = data_url.split(",", 1)
-        mime = header.split(";")[0].split(":")[1]
-    else:
-        mime = image_data.get("mime_type", "image/jpeg")
-        encoded = data_url
-
-    ext = mimetypes.guess_extension(mime) or ".jpg"
-    if ext == ".jpe":
-        ext = ".jpg"
-
-    fd, path = tempfile.mkstemp(suffix=ext, prefix="fvserver_img_")
-    with os.fdopen(fd, "wb") as f:
-        f.write(base64.b64decode(encoded))
-    return path
-
-
-# ── FastVideo wrapper ──────────────────────────────────────────────────────────
-
-class LocalVideoGenerator:
-    """
-    Thin wrapper around fastvideo.VideoGenerator for single-device (MPS/CPU)
-    inference.  The model is loaded once at startup and reused across requests.
-    """
-
-    def __init__(
-        self,
-        model:          str,
-        num_gpus:       int,
-        num_frames:     int,
-        height:         int,
-        width:          int,
-        fps:            int,
-        guidance_scale:           float,
-        model_dir:                str | None = None,
-        inference_steps:        int = DEFAULT_INFER_STEPS,
-        enable_stage_verification: bool = False,
-        enable_torch_compile:   bool = False,
-        spill_dir:                Path | None = None,
-        mac_ipc_safe_offload:   bool = False,
-    ) -> None:
-        self.model          = model
-        self.num_gpus       = num_gpus
-        self.num_frames     = num_frames
-        self.height         = height
-        self.width          = width
-        self.fps            = fps
-        self.guidance_scale = guidance_scale
-        self.model_dir      = model_dir
-        self.inference_steps = inference_steps
-        self.enable_stage_verification = enable_stage_verification
-        self.enable_torch_compile = enable_torch_compile
-        self.spill_dir              = spill_dir
-        self.mac_ipc_safe_offload   = mac_ipc_safe_offload
-        self._generator             = None
-        self._fv_log_queue          = _make_fv_mp_queue()
-        self._progress_lock         = threading.Lock()
-        self._model_progress: dict[str, Any] = {}
-        self._log_drain_thread: threading.Thread | None = None
-        self._log_drain_stop        = threading.Event()
-
-    # ── worker log queue → model_progress for WebSocket keepalives ────────────
-
-    def _reset_model_progress(self) -> None:
-        with self._progress_lock:
-            self._model_progress = {}
-
-    def model_progress_for_ws(self) -> dict[str, Any] | None:
-        """Latest structured progress from FastVideo workers (denoise steps, ETA)."""
-        with self._progress_lock:
-            if not self._model_progress.get("stage"):
-                return None
-            return dict(self._model_progress)
-
-    def _merge_fv_progress_payload(self, payload: dict[str, Any]) -> None:
-        stage = payload.get("stage")
-        if not stage:
-            return
-        step = payload.get("step")
-        total = payload.get("total")
-        pct: float | None = None
-        try:
-            si, st = int(step), int(total)
-            if st > 0:
-                pct = round(100.0 * min(si, st) / st, 1)
-        except (TypeError, ValueError):
-            pass
-        merged = {
-            "stage": stage,
-            "step": step,
-            "total": total,
-            "pct": pct,
-            "elapsed_s": payload.get("elapsed_s"),
-            "last_step_s": payload.get("last_step_s"),
-            "avg_step_s": payload.get("avg_step_s"),
-            "eta_s": payload.get("eta_s"),
-        }
-        with self._progress_lock:
-            self._model_progress = merged
-
-    def _fv_log_drain_loop(self) -> None:
-        while not self._log_drain_stop.is_set():
-            try:
-                rec = self._fv_log_queue.get(timeout=0.35)
-            except queue.Empty:
-                continue
-            except Exception:
-                continue
-            try:
-                msg = rec.getMessage()
-            except Exception:
-                continue
-            tag = FV_PROGRESS_LOG_TAG
-            if tag not in msg:
-                continue
-            try:
-                blob = msg.split(tag, 1)[1].strip()
-                payload = json.loads(blob)
-            except (json.JSONDecodeError, IndexError, TypeError, ValueError):
-                continue
-            if isinstance(payload, dict):
-                self._merge_fv_progress_payload(payload)
-
-    def _ensure_fv_log_drain_thread(self) -> None:
-        if self._log_drain_thread is not None and self._log_drain_thread.is_alive():
-            return
-        self._log_drain_stop.clear()
-        self._log_drain_thread = threading.Thread(
-            target=self._fv_log_drain_loop,
-            name="fvserver-fv-log-drain",
-            daemon=True,
-        )
-        self._log_drain_thread.start()
-
-    # ── lifecycle ─────────────────────────────────────────────────────────────
-
-    def load(self) -> None:
-        """Load model weights.  Blocks until ready.  Safe to call more than once."""
-        if self._generator is not None:
-            return
-
-        from fastvideo import VideoGenerator
-
-        local_path = self._resolve_model_path()
-        log.info("Loading model from %s …", local_path)
-
-        # Older FastVideo releases may not include recent model IDs in the
-        # pipeline registry.  When the registry returns None it falls back to
-        # a generic PipelineConfig that lacks LTX2-specific components
-        # (LTX2GemmaConfig text encoder, LTX2VAEConfig VAE, etc.), causing a
-        # crash during model loading.  Explicitly supplying LTX2T2VConfig here
-        # ensures the correct pipeline config is used regardless of which
-        # FastVideo version is installed.  In newer releases where the model IS
-        # registered, the passed instance simply overrides the registry result
-        # with an identical config — a safe no-op.
-        extra_kwargs: dict = {}
-        _model_lower = (self.model or local_path).lower()
-        if "ltx2" in _model_lower or "ltx-2" in _model_lower:
-            _ltx2_config_cls = None
-            _ltx2_import_err: ImportError | None = None
-
-            # Try the direct submodule path first (FastVideo ≥ LTX2 era).
-            try:
-                from fastvideo.configs.pipelines.ltx2 import LTX2T2VConfig as _LTX2T2VConfig
-                _ltx2_config_cls = _LTX2T2VConfig
-            except ImportError as _err:
-                _ltx2_import_err = _err
-                # Fall back to the package __init__ re-export in case the
-                # symbol is available there even though the direct path failed.
-                try:
-                    from fastvideo.configs.pipelines import LTX2T2VConfig as _LTX2T2VConfig2
-                    _ltx2_config_cls = _LTX2T2VConfig2
-                except ImportError:
-                    pass  # both paths failed; handled below
-
-            if _ltx2_config_cls is not None:
-                extra_kwargs["pipeline_config"] = _ltx2_config_cls()
-                log.info(
-                    "Providing explicit LTX2T2VConfig to guard against "
-                    "missing registry entry in installed FastVideo version."
-                )
-            else:
-                # Neither import path worked.  Log the root cause so the user
-                # can see exactly which module is missing, then abort with
-                # clear upgrade instructions.
-                log.warning(
-                    "Could not import LTX2T2VConfig: %s", _ltx2_import_err,
-                    exc_info=_ltx2_import_err,
-                )
-                try:
-                    import fastvideo as _fv
-                    installed_ver = getattr(_fv, "__version__", "unknown")
-                except ImportError:
-                    installed_ver = "not installed"
-                _installer = Path(__file__).resolve().parent / "scripts" / "fastvideo_install"
-                _install_hint = (
-                    f"  python {_installer}\n"
-                    "     (initializes submodule, applies macOS Triton workaround, "
-                    "installs editable)\n"
-                    "  # Standalone clone at DIR after git pull:\n"
-                    f"  python {_installer} --no-submodule --path DIR\n\n"
-                )
-                raise RuntimeError(
-                    f"Failed to load LTX2T2VConfig from the installed FastVideo "
-                    f"({installed_ver}).  See the ImportError logged above for "
-                    "the root cause.\n\n"
-                    "The installed FastVideo is likely too old and does not yet "
-                    "include LTX2 support.  Reinstall from a fresh checkout using "
-                    "the helper script from this repo:\n\n"
-                    f"{_install_hint}"
-                    "To confirm the correct version is active afterwards:\n\n"
-                    "  python -c \"import fastvideo; print(fastvideo.__version__)\"\n"
-                    "  python -c \"from fastvideo.configs.pipelines.ltx2 import "
-                    "LTX2T2VConfig; print('OK')\""
-                ) from _ltx2_import_err
-
-        _heavy = self.mac_ipc_safe_offload
-        if _heavy:
-            log.warning(
-                "mac-ipc-safe-offload: DiT/VAE/text-encoder CPU offload enabled "
-                "(much slower; only use if FastVideo workers fail with "
-                "_share_filename_ / MPS over multiprocessing pipes)."
-            )
-
-        # log_queue here (not on ``generate()``): workers inherit it at spawn.
-        # Passing a Queue through ``set_log_queue`` RPC pickles it and raises
-        # "Queue objects should only be shared between processes through inheritance".
-        self._generator = VideoGenerator.from_pretrained(
-            local_path,
-            num_gpus=self.num_gpus,
-            log_queue=self._fv_log_queue,
-            # Default: no heavy CPU offload (MPS throughput). Opt-in via
-            # --mac-ipc-safe-offload if worker IPC requires CPU-resident tensors.
-            dit_cpu_offload=_heavy,
-            vae_cpu_offload=_heavy,
-            text_encoder_cpu_offload=_heavy,
-            image_encoder_cpu_offload=False,
-            pin_cpu_memory=False,
-            # Throughput: skip per-stage verification (FastVideo default is True).
-            enable_stage_verification=self.enable_stage_verification,
-            enable_torch_compile=self.enable_torch_compile,
-            **extra_kwargs,
-        )
-        self._ensure_fv_log_drain_thread()
-        log.info("Model loaded ✓")
-
-    def _resolve_model_path(self) -> str:
-        """
-        Return a local filesystem path for the model.
-
-        * If ``self.model`` is already an existing directory, use it as-is.
-        * Otherwise treat it as a HuggingFace repo ID, download/cache it with
-          ``huggingface_hub.snapshot_download``, and return the local cache dir.
-          Passing a ``model_dir`` overrides the default HF cache location.
-        """
-        if Path(self.model).exists():
-            log.info("Using local model directory: %s", self.model)
-            return self.model
-
-        try:
-            from huggingface_hub import snapshot_download
-        except ImportError:
-            log.error(
-                "huggingface_hub is required to download models. "
-                "Install it with:  pip install huggingface_hub"
-            )
-            raise
-
-        log.info(
-            "Downloading model '%s' from HuggingFace (this may take a while on first run) …",
-            self.model,
-        )
-        kwargs: dict = dict(repo_id=self.model)
-        if self.model_dir:
-            kwargs["local_dir"] = self.model_dir
-            log.info("  → saving to: %s", self.model_dir)
-        else:
-            log.info("  → caching in default HuggingFace cache (~/.cache/huggingface/hub)")
-
-        local_path = snapshot_download(**kwargs)
-        log.info("Model available at: %s", local_path)
-        return local_path
-
-    # ── generation ────────────────────────────────────────────────────────────
-
-    async def generate(
-        self,
-        prompt:           str,
-        image_data:       dict | str | None = None,
-        seed:             int = 1024,
-        num_frames:       int | None = None,
-        height:           int | None = None,
-        width:            int | None = None,
-        negative_prompt:  str = "",
-        *,
-        job_id:           str | None = None,
-    ) -> str:
-        """
-        Generate a video asynchronously (runs `_generate_sync` in a thread
-        pool so the event loop stays responsive).
-
-        ``job_id`` — optional generation UUID prefix for temp dirs and spill files.
-
-        Returns the path of the saved MP4 file.
-        """
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            functools.partial(
-                self._generate_sync,
-                prompt,
-                image_data,
-                seed,
-                num_frames or self.num_frames,
-                height     or self.height,
-                width      or self.width,
-                negative_prompt,
-                job_id,
-            ),
-        )
-
-    def _salvage_mp4_to_spill(
-        self,
-        tmpdir: str,
-        preferred_out: str,
-        job_id: str | None,
-        prompt: str,
-        tag: str,
-    ) -> None:
-        """Copy any usable MP4 from the workdir into ``spill_dir`` after failures."""
-        if not self.spill_dir or not job_id:
-            return
-        root = Path(tmpdir)
-        src = Path(preferred_out)
-        if not (src.is_file() and src.stat().st_size > 0):
-            alt = _largest_mp4_under(root)
-            if alt is None:
-                log.warning(
-                    "  ◆ no MP4 found to salvage under %s (job %s)",
-                    tmpdir,
-                    job_id[:8],
-                )
-                return
-            src = alt
-        try:
-            self.spill_dir.mkdir(parents=True, exist_ok=True)
-            slug = _spill_slug(prompt)
-            dest = self.spill_dir / f"{job_id}_{slug}_{tag}.mp4"
-            shutil.copy2(src, dest)
-            log.info("  ◆ spill-salvaged (%s) → %s", tag, dest)
-        except OSError as exc:
-            log.error("  ✗ spill salvage failed: %s", exc)
-
-    def _generate_sync(
-        self,
-        prompt:           str,
-        image_data:       dict | str | None,
-        seed:             int,
-        num_frames:       int,
-        height:           int,
-        width:            int,
-        negative_prompt:  str,
-        job_id:           str | None = None,
-    ) -> str:
-        """Synchronous generation — executed in a thread-pool worker."""
-        self.load()
-
-        ah = _align_ltx2_spatial(height)
-        aw = _align_ltx2_spatial(width)
-        if ah != height or aw != width:
-            log.warning(
-                "LTX2 requires H×W divisible by %s; adjusted %s×%s → %s×%s",
-                LTX2_SPATIAL_ALIGN,
-                height,
-                width,
-                ah,
-                aw,
-            )
-            height, width = ah, aw
-
-        from fastvideo.api.schema import (
-            GenerationRequest,
-            InputConfig,
-            OutputConfig,
-            SamplingConfig,
-        )
-
-        tmp_image: str | None = None
-        prefix = f"fv_{job_id[:8]}_" if job_id else "fvserver_out_"
-        tmpdir = tempfile.mkdtemp(prefix=prefix)
-        out_path = os.path.join(tmpdir, "output.mp4")
-        retained_tmpdir = False
-        self._reset_model_progress()
-
-        try:
-            if isinstance(image_data, str) and image_data.strip():
-                p = image_data.strip()
-                if os.path.isfile(p) or p.startswith(("http://", "https://")):
-                    tmp_image = p
-            elif isinstance(image_data, dict) and image_data:
-                tmp_image = _decode_initial_image(image_data)
-
-            # LTX2 text_encoding asserts isinstance(negative_prompt, str); schema default is None.
-            request = GenerationRequest(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                inputs=InputConfig(image_path=tmp_image),
-                sampling=SamplingConfig(
-                    num_inference_steps=self.inference_steps,
-                    num_frames=num_frames,
-                    height=height,
-                    width=width,
-                    fps=self.fps,
-                    guidance_scale=self.guidance_scale,
-                    seed=seed,
-                ),
-                output=OutputConfig(
-                    output_path=out_path,
-                    save_video=True,
-                    return_frames=False,
-                ),
-            )
-
-            try:
-                result = self._generator.generate(request=request)
-            except BaseException:
-                self._salvage_mp4_to_spill(
-                    tmpdir, out_path, job_id, prompt, "ENCODE_FAIL",
-                )
-                raise
-
-            # generate() may return a list when multiple prompts are given
-            if isinstance(result, list):
-                result = result[0]
-
-            video_path: str | None = getattr(result, "video_path", None)
-            if not video_path or not os.path.exists(video_path):
-                # Fall back to the path we requested
-                video_path = out_path
-            if not os.path.exists(video_path):
-                self._salvage_mp4_to_spill(
-                    tmpdir, out_path, job_id, prompt, "MISSING_OUTPUT",
-                )
-                raise RuntimeError(
-                    f"Generation completed but output file not found: {video_path}"
-                )
-            retained_tmpdir = True
-            return video_path
-
-        finally:
-            if tmp_image and os.path.isfile(tmp_image) and "fvserver_img_" in tmp_image:
-                try:
-                    os.unlink(tmp_image)
-                except OSError:
-                    pass
-            if not retained_tmpdir:
-                shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ── Single-flight generation queue (in-memory, self-cleaning) ───────────────────
@@ -968,7 +416,7 @@ class RequestHandler:
             # ── gpu_assigned ──────────────────────────────────────────────────
             await self._send_json(
                 type="gpu_assigned",
-                gpu_id="mps:0",
+                gpu_id="mlx:0",
                 session_timeout=7200,
                 generation_id=generation_id,
             )
@@ -1219,8 +667,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="server",
         description=(
-            "Local FastVideo/LTX2 WebSocket server.\n"
-            "Implements the same protocol as wss://1080p.fastvideo.org/ws."
+            "Local LTX-2.3 WebSocket server (MLX via ltx-2-mlx).\n"
+            "Same JSON/binary protocol as videofentanyl ``--server`` expects."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -1251,28 +699,18 @@ examples:
     mdl.add_argument(
         "--model", default=DEFAULT_MODEL,
         help=(
-            f"HuggingFace model ID or path to a local model directory "
-            f"(default: {DEFAULT_MODEL}). "
-            f"Pass a local path (e.g. ./models/LTX2-Distilled-Diffusers) to skip "
-            f"the HuggingFace download and load weights directly from disk."
+            f"HuggingFace MLX weights repo or local directory "
+            f"(default: {DEFAULT_MODEL}; large download, ~64GB+ RAM typical). "
+            f"See ltx-2-mlx README for quantized variants (q4/q8)."
         ),
     )
     mdl.add_argument(
         "--model-dir", default=None, dest="model_dir", metavar="DIR",
         help=(
-            "Directory where the model will be downloaded/cached when --model is a "
-            "HuggingFace model ID. If omitted the default HuggingFace cache is used "
-            "(~/.cache/huggingface/hub). Ignored when --model is already a local path."
+            "When --model is a HuggingFace repo id, store snapshot_download here. "
+            "If omitted, uses ./models/<org>__<name>/ or $VIDEOFENTANYL_MODELS/<org>__<name>/. "
+            "Missing files are fetched automatically (same as huggingface-cli download)."
         ),
-    )
-    mdl.add_argument(
-        "--num-gpus", type=int, default=DEFAULT_NUM_GPUS, dest="num_gpus",
-        help=f"number of devices (default: {DEFAULT_NUM_GPUS})",
-    )
-    mdl.add_argument(
-        "--attention-backend", default=None, dest="attention_backend",
-        metavar="BACKEND",
-        help="attention backend: TORCH_SDPA (MPS/CPU default) or FLASH_ATTN (CUDA)",
     )
 
     vid = p.add_argument_group("video")
@@ -1296,32 +734,26 @@ examples:
     )
     vid.add_argument(
         "--fps", type=int, default=DEFAULT_FPS,
-        help=f"frames per second (default: {DEFAULT_FPS})",
-    )
-    vid.add_argument(
-        "--guidance-scale", type=float, default=DEFAULT_GUIDANCE_SCALE,
-        dest="guidance_scale",
-        help=f"CFG guidance scale (default: {DEFAULT_GUIDANCE_SCALE})",
+        help=(
+            f"nominal fps (default: {DEFAULT_FPS}); MLX mux may use fixed rate — "
+            "reserved for future pipeline options"
+        ),
     )
 
-    perf = p.add_argument_group("performance (especially Apple MPS)")
+    perf = p.add_argument_group("performance (MLX)")
     perf.add_argument(
         "--infer-steps", type=int, default=DEFAULT_INFER_STEPS, dest="infer_steps",
         metavar="N",
         help=(
-            f"denoising steps (default: {DEFAULT_INFER_STEPS}, minimum 1). "
-            "Distilled LTX2 is intended for low step counts; 50 matches FastVideo's "
-            "generic default but is often impractical on MPS — raise for quality, "
-            "lower for speed."
+            f"denoising steps for one-stage distilled sampling "
+            f"(default: {DEFAULT_INFER_STEPS}, minimum 1)."
         ),
     )
     perf.add_argument(
-        "--stage-verification", action="store_true", dest="stage_verification",
-        help="enable FastVideo per-stage checks (slower; default off for throughput)",
-    )
-    perf.add_argument(
-        "--torch-compile", action="store_true", dest="torch_compile",
-        help="enable torch.compile in FastVideo (PyTorch 2.4+; experimental on MPS)",
+        "--mlx-low-memory",
+        action="store_true",
+        dest="mlx_low_memory",
+        help="pass low_memory=True to ltx-2-mlx (staged loads; slower, less RAM)",
     )
 
     misc = p.add_argument_group("misc")
@@ -1340,15 +772,6 @@ examples:
         ),
     )
     misc.add_argument(
-        "--mac-ipc-safe-offload",
-        action="store_true",
-        help=(
-            "opt-in: enable DiT/VAE/text-encoder CPU offload (very slow on MPS).  "
-            "Only if FastVideo multiprocessing workers error with CPU-only tensor "
-            "sharing; default keeps models on device for normal speed."
-        ),
-    )
-    misc.add_argument(
         "--verbose", "-v", action="store_true",
         help="verbose per-connection logging",
     )
@@ -1358,16 +781,6 @@ examples:
 def main() -> None:
     parser = build_parser()
     args   = parser.parse_args()
-
-    # ── Attention backend ─────────────────────────────────────────────────────
-    # For Apple MPS, TORCH_SDPA (PyTorch native scaled dot-product attention)
-    # is required; FLASH_ATTN is CUDA-only.
-    if args.attention_backend:
-        os.environ["FASTVIDEO_ATTENTION_BACKEND"] = args.attention_backend
-    elif "FASTVIDEO_ATTENTION_BACKEND" not in os.environ:
-        os.environ["FASTVIDEO_ATTENTION_BACKEND"] = "TORCH_SDPA"
-
-    _apply_pytorch_mps_runtime_tuning()
 
     if args.infer_steps < 1:
         parser.error("--infer-steps must be >= 1")
@@ -1393,23 +806,24 @@ def main() -> None:
         args.height, args.width = ah, aw
 
     # ── Banner ────────────────────────────────────────────────────────────────
-    _model_is_local = Path(args.model).exists()
+    _mp = Path(args.model).expanduser()
+    _model_is_local = _mp.is_dir()
     if _model_is_local:
         _model_source = f"local  ({args.model})"
-    elif args.model_dir:
-        _model_source = f"HuggingFace → {args.model_dir}  ({args.model})"
+    elif looks_like_hf_repo_id(args.model):
+        _dest = hf_local_weights_directory(args.model, args.model_dir)
+        _model_source = f"HuggingFace → {_dest}  ({args.model})"
     else:
-        _model_source = f"HuggingFace cache  ({args.model})"
+        _model_source = f"{args.model}"
     print(f"\n{'═' * 60}")
-    print(f"  FastVideo Local Server  (server.py)")
+    print(f"  LTX local server (MLX · ltx-2-mlx)")
     print(f"  Model    : {_model_source}")
-    print(f"  Device   : Apple MPS  (FASTVIDEO_ATTENTION_BACKEND="
-          f"{os.environ.get('FASTVIDEO_ATTENTION_BACKEND')})")
+    print(f"  Runtime  : Apple Silicon / MLX")
     print(f"  Endpoint : ws://{args.host}:{args.port}/ws")
     print(f"  Video    : {args.num_frames} frames @ "
           f"{args.height}×{args.width}  {args.fps} fps")
-    print(f"  CFG      : {args.guidance_scale}")
     print(f"  Denoise  : {args.infer_steps} steps  (use --infer-steps to tune)")
+    print(f"  low_mem  : {args.mlx_low_memory}")
     print(f"{'═' * 60}\n")
 
     spill_dir = Path(args.spill_dir).expanduser().resolve()
@@ -1418,19 +832,15 @@ def main() -> None:
 
     # ── Load model (before WebSocket bind — first client is never a cold-start) ─
     generator = LocalVideoGenerator(
-        model                       = args.model,
-        num_gpus                    = args.num_gpus,
-        num_frames                  = args.num_frames,
-        height                      = args.height,
-        width                       = args.width,
-        fps                         = args.fps,
-        guidance_scale              = args.guidance_scale,
-        model_dir                   = args.model_dir,
-        inference_steps             = args.infer_steps,
-        enable_stage_verification   = args.stage_verification,
-        enable_torch_compile        = args.torch_compile,
-        spill_dir                   = spill_dir,
-        mac_ipc_safe_offload        = args.mac_ipc_safe_offload,
+        model               = args.model,
+        num_frames          = args.num_frames,
+        height              = args.height,
+        width               = args.width,
+        fps                 = float(args.fps),
+        model_dir           = args.model_dir,
+        inference_steps     = args.infer_steps,
+        spill_dir           = spill_dir,
+        low_memory          = args.mlx_low_memory,
     )
     log.info("Loading weights before accepting connections …")
     generator.load()

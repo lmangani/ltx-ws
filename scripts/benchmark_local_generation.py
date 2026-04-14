@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-benchmark_local_generation.py — reproducible local FastVideo/LTX2 timing
-========================================================================
+benchmark_local_generation.py — reproducible local LTX (MLX) timing
+=====================================================================
 Starts ``server.py`` (unless disabled), waits until the WebSocket port accepts
 TCP connections (model load + bind), runs one minimal ``videofentanyl.py``
 job, prints timings, then shuts the server down.
 
-**Interpreter:** uses ``REPO_ROOT/.venv/bin/python3`` when present (same workflow as
-README *Local Server (Apple MPS)*: ``uv venv`` → ``python scripts/fastvideo_install``
-→ client extras). Pass ``--allow-system-python`` only if you intentionally skip a venv.
+**Interpreter:** uses ``REPO_ROOT/.venv/bin/python3`` when present (see README
+*Local server (Apple Silicon / MLX)*: ``uv venv``, ``uv pip install -r requirements.txt``,
+then ``uv pip install`` the ``ltx-*-mlx`` git URLs from ``requirements.txt`` comments).
+Pass ``--allow-system-python`` only if you intentionally skip a venv.
 
 Default workload matches a short distilled run (~2 s @ 24 fps, 8 denoise steps).
 
 Examples
 --------
-  # One-time / upgraded FastVideo tree (from repo root, venv active or not)
-  ./scripts/benchmark_local_generation.py --run-install
-
   # Full benchmark (free port 8765 first if something else listens)
   source .venv/bin/activate   # optional; script still picks .venv/bin/python3
   ./scripts/benchmark_local_generation.py
@@ -55,7 +53,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SERVER_PY = REPO_ROOT / "server.py"
 CLIENT_PY = REPO_ROOT / "videofentanyl.py"
-FASTVIDEO_INSTALL = REPO_ROOT / "scripts" / "fastvideo_install"
 
 # LTX2 temporal constraint: (num_frames - 1) % 8 == 0.  49 frames @ 24 fps ≈ 2.04 s.
 DEFAULT_NUM_FRAMES = 49
@@ -78,7 +75,7 @@ def resolve_interpreter(
 ) -> Path:
     """
     Prefer ./.venv/bin/python3 so ``server.py`` / ``videofentanyl.py`` match README
-    local setup (patched FastVideo, Torch MPS, deps).
+    local MLX setup (ltx-2-mlx + deps).
     """
     if explicit is not None:
         p = explicit.expanduser().resolve()
@@ -98,11 +95,15 @@ def resolve_interpreter(
 
     print(
         "Error: no virtualenv at ./.venv/bin/python3\n\n"
-        "Local generation needs a venv plus patched FastVideo (see README "
-        "« Local Server (Apple MPS) »). From the repo root:\n\n"
+        "Local generation needs a venv with ltx-2-mlx (see README "
+        "« Local server (Apple Silicon / MLX) »). From the repo root:\n\n"
         "  uv venv --python 3.12 --seed && source .venv/bin/activate\n"
-        "  python scripts/fastvideo_install\n"
-        "  uv pip install websockets av Pillow huggingface_hub\n\n"
+        "  uv pip install -r requirements.txt\n"
+        "  uv pip install \\\n"
+        '    "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git'
+        '#subdirectory=packages/ltx-core-mlx" \\\n'
+        '    "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git'
+        '#subdirectory=packages/ltx-pipelines-mlx"\n\n'
         "Then re-run this script (it uses .venv/bin/python3 automatically).\n\n"
         "Escape hatch (not recommended): --allow-system-python\n",
         file=sys.stderr,
@@ -267,14 +268,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="If ./.venv is missing, use the interpreter running this script",
     )
-    p.add_argument(
-        "--run-install",
-        action="store_true",
-        help=(
-            "Run scripts/fastvideo_install with the same interpreter before benchmarking "
-            "(README one-time / after git pull + submodule update)"
-        ),
-    )
     return p
 
 
@@ -287,8 +280,6 @@ def main() -> int:
     )
     port = args.port
     server_url = args.server_url or f"ws://127.0.0.1:{port}/ws"
-
-    install_cmd = [str(py), str(FASTVIDEO_INSTALL)]
 
     server_cmd = [
         str(py),
@@ -305,6 +296,7 @@ def main() -> int:
     client_cmd = [
         str(py),
         str(CLIENT_PY),
+        "--mode", "ltx",
         "--server", server_url,
         "--prompt", args.prompt,
         "--output-dir", str(out_dir),
@@ -314,8 +306,6 @@ def main() -> int:
 
     if args.dry_run:
         print("[dry-run] python:", py)
-        if args.run_install:
-            print("[dry-run] install:", subprocess.list2cmdline(install_cmd))
         print("[dry-run] server:", subprocess.list2cmdline(server_cmd))
         print("[dry-run] client:", subprocess.list2cmdline(client_cmd))
         return 0
@@ -326,22 +316,6 @@ def main() -> int:
     if not CLIENT_PY.is_file():
         print(f"Error: missing {CLIENT_PY}", file=sys.stderr)
         return 2
-
-    if args.run_install:
-        if not FASTVIDEO_INSTALL.is_file():
-            print(f"Error: missing {FASTVIDEO_INSTALL}", file=sys.stderr)
-            return 2
-        print(f"Running FastVideo install: {subprocess.list2cmdline(install_cmd)}\n", flush=True)
-        ir = subprocess.run(
-            install_cmd,
-            cwd=str(REPO_ROOT),
-        )
-        if ir.returncode != 0:
-            print(
-                f"Error: scripts/fastvideo_install exited with {ir.returncode}",
-                file=sys.stderr,
-            )
-            return ir.returncode
 
     print(f"Using interpreter: {py}", flush=True)
 

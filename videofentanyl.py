@@ -1,34 +1,37 @@
 #!/usr/bin/env python3
 """
-videofentanyl.py — Unified FastVideo / Dreamverse Queue Manager
-===============================================================
+videofentanyl.py — Unified LTX (local MLX) / Dreamverse Queue Manager
+======================================================================
 Supports two generation backends selectable via --mode:
 
-  fastvideo  (default)  wss://1080p.fastvideo.org/ws
-                        Short 1080p clips (~5–10s), single-segment
+  ltx  (default)        **requires** ``--server ws://…/ws`` — local ``server.py``
+                        (ltx-2-mlx on Apple Silicon), single-segment clips
   dreamverse            wss://dreamverse.fastvideo.org/ws
                         Long-form videos (~30s, 6 segments), GPT-expanded prompt
 
 USAGE
 ─────
-  # FastVideo 1080p (default mode)
-  python videofentanyl.py --prompt "a fox running through snow"
+  # Local LTX (MLX) — server must be running (see README)
+  python videofentanyl.py --server ws://localhost:8765/ws --prompt "a fox in snow"
 
   # Dreamverse long-form
   python videofentanyl.py --mode dreamverse --prompt "a dog learns to fly"
 
-  # 5 videos from the same prompt (fastvideo)
-  python videofentanyl.py --prompt "sunset over the ocean" --count 5
+  # 5 videos from the same prompt (ltx + --server)
+  python videofentanyl.py --server ws://localhost:8765/ws \\
+      --prompt "sunset over the ocean" --count 5
 
   # Multiple prompts (dreamverse)
   python videofentanyl.py --mode dreamverse \\
       --prompt "dog on skateboard" --prompt "volcano at night"
 
-  # Image-to-video
-  python videofentanyl.py --prompt "the scene comes alive" --image photo.jpg
+  # Image-to-video (ltx + local server)
+  python videofentanyl.py --server ws://localhost:8765/ws \\
+      --prompt "the scene comes alive" --image photo.jpg
 
-  # AI prompt enhancement (fastvideo)
-  python videofentanyl.py --prompt "girl walking in rain" --enhance
+  # AI prompt enhancement (ltx: forwarded to server if supported)
+  python videofentanyl.py --server ws://localhost:8765/ws \\
+      --prompt "girl walking in rain" --enhance
 
   # Skip GPT expansion (dreamverse)
   python videofentanyl.py --mode dreamverse --prompt "detailed scene…" --no-enhance
@@ -37,8 +40,8 @@ USAGE
   python videofentanyl.py --prompt "test" --count 3 --dry-run --verbose \\
       --output-dir ./videos --prefix clip
 
-PROTOCOL — FastVideo (1080p)
-─────────────────────────────
+PROTOCOL — LTX local (single-segment)
+────────────────────────────────────
   connect → session_init_v2  (handshake)
           → simple_generate  (trigger generation)
           → generation_status  (optional; client may poll while waiting)
@@ -143,19 +146,20 @@ USER_AGENT = (
 )
 
 MODES: dict[str, dict] = {
-    "fastvideo": {
-        "host":             "1080p.fastvideo.org",
-        "display_name":     "FastVideo",
+    "ltx": {
+        "host":             "",  # must use --server (no public MLX endpoint)
+        "display_name":     "LTX (MLX local)",
         "default_prompt":   (
             'people clap as a romantic song ends and a girl speaks italian '
             '"orca madonna raghi"'
         ),
         "default_delay":    1.0,
-        "default_prefix":   "video",
+        "default_prefix":   "ltx",
         "default_preset_id": "simple_custom_prompt",
         "default_preset_label": "",
         "default_enhance":  False,
         "multi_segment":    False,   # single-clip, uses simple_generate
+        "requires_server":  True,
     },
     "dreamverse": {
         "host":             "dreamverse.fastvideo.org",
@@ -177,7 +181,12 @@ _SERVER_OVERRIDE: str | None = None   # set by --server flag
 def _ws_url(mode: str) -> str:
     if _SERVER_OVERRIDE:
         return _SERVER_OVERRIDE
-    return f"wss://{MODES[mode]['host']}/ws"
+    host = MODES[mode].get("host") or ""
+    if not host.strip():
+        raise RuntimeError(
+            f"mode {mode!r} has no public WebSocket host — set --server ws://HOST:PORT/ws"
+        )
+    return f"wss://{host}/ws"
 
 def _ws_headers(mode: str) -> dict:
     if _SERVER_OVERRIDE:
@@ -200,7 +209,7 @@ class JobStatus(Enum):
 
 @dataclasses.dataclass
 class GenerationParams:
-    """Unified parameters for both FastVideo and Dreamverse sessions."""
+    """Unified parameters for LTX local and Dreamverse sessions."""
     prompt:                   str
     preset_id:                str            = "simple_custom_prompt"
     preset_label:             str            = ""
@@ -278,10 +287,10 @@ def msg_session_init_v2(p: GenerationParams, mode: str) -> str:
             "auto_extension_enabled":  p.auto_extension_enabled,
             "loop_generation_enabled": p.loop_generation_enabled,
         })
-    else:  # fastvideo
-        # Mirror Dreamverse: carry ``initial_image`` on session_init so the server
-        # fallback (server.py) works for autocontinue / i2v and for
-        # clients that only attach the start frame to session_init_v2.
+    else:  # ltx — single-clip local server
+        # Carry ``initial_image`` on session_init so the server fallback (server.py)
+        # works for autocontinue / i2v and for clients that only attach the start
+        # frame to session_init_v2.
         return json.dumps({
             "type":                    "session_init_v2",
             "preset_id":               p.preset_id,
@@ -295,7 +304,7 @@ def msg_session_init_v2(p: GenerationParams, mode: str) -> str:
 
 
 def msg_simple_generate(p: GenerationParams) -> str:
-    """FastVideo only — trigger generation after session_init_v2."""
+    """LTX local (single-segment) — trigger generation after session_init_v2."""
     d: dict[str, Any] = {
         "type":                "simple_generate",
         "preset_id":           p.preset_id,
@@ -357,7 +366,7 @@ class VideoSession:
     """
     One WebSocket connection → one video (single-segment or multi-segment).
 
-    FastVideo flow:
+    LTX local flow:
       connect → session_init_v2 → simple_generate → recv binary → save
 
     Dreamverse flow:
@@ -1274,14 +1283,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="videofentanyl",
         description=(
-            "Unified FastVideo / Dreamverse queue manager.\n"
-            "Select backend with --mode (default: fastvideo)."
+            "Unified LTX (local MLX) / Dreamverse queue manager.\n"
+            "Select backend with --mode (default: ltx; ltx requires --server)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  # FastVideo 1080p (default)
-  python videofentanyl.py --prompt "a fox running through snow"
+  # LTX local (default — needs --server)
+  python videofentanyl.py --server ws://127.0.0.1:8765/ws \\
+      --prompt "a fox running through snow"
 
   # Dreamverse long-form (~30s, GPT-expanded)
   python videofentanyl.py --mode dreamverse --prompt "a dog learns to fly"
@@ -1307,8 +1317,8 @@ examples:
     # ── Mode ──────────────────────────────────────────────────────────────────
     p.add_argument(
         "--mode", "-m",
-        choices=list(MODES.keys()), default="fastvideo",
-        help="generation backend (default: fastvideo)",
+        choices=list(MODES.keys()), default="ltx",
+        help="generation backend (default: ltx; ltx requires --server)",
     )
 
     # ── Generation ────────────────────────────────────────────────────────────
@@ -1327,7 +1337,7 @@ examples:
         "--enhance", "-e",
         action="store_true", default=None,
         help="enable AI prompt enhancement / GPT rewrite "
-             "(fastvideo: off by default; dreamverse: on by default)",
+             "(ltx: off by default; dreamverse: on by default)",
     )
     gen.add_argument(
         "--no-enhance",
@@ -1377,7 +1387,7 @@ examples:
         "--delay", "-d",
         type=float, default=None, metavar="SECS",
         help="delay between consecutive jobs "
-             "(default: 1.0s for fastvideo, 2.0s for dreamverse)",
+             "(default: 1.0s for ltx, 2.0s for dreamverse)",
     )
     q.add_argument(
         "--retries", "-r",
@@ -1395,7 +1405,7 @@ examples:
     o.add_argument(
         "--prefix",
         default=None, metavar="STR",
-        help="filename prefix (default: 'video' for fastvideo, "
+        help="filename prefix (default: 'ltx' for ltx, "
              "'dreamverse' for dreamverse)",
     )
     o.add_argument(
@@ -1413,7 +1423,7 @@ examples:
         "--autocontinue",
         action="store_true",
         help="extract the last frame of each clip and use it as the first "
-             "frame (--image) of the next one; ideal for 1080p multi-clip runs",
+             "frame (--image) of the next one; ideal for multi-clip local runs",
     )
     p.add_argument(
         "--autoconcat",
@@ -1444,6 +1454,15 @@ async def async_main(args: argparse.Namespace):
 
     mode    = args.mode
     cfg     = MODES[mode]
+
+    if cfg.get("requires_server") and not args.server:
+        print(
+            "Error: mode 'ltx' requires a local WebSocket server.\n"
+            "  Example:  --server ws://127.0.0.1:8765/ws\n"
+            "Start server.py first (see README — ltx-2-mlx / MLX).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     # ── Resolve prompts ───────────────────────────────────────────────────────
     prompts: list[str] = args.prompts or [cfg["default_prompt"]]
