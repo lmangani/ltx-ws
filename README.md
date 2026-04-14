@@ -1,6 +1,6 @@
 # <img width="488" height="58" alt="image" src="https://github.com/user-attachments/assets/7065ad1b-020e-42f2-862d-5c0c3654dd65" />
 
-A unified command-line tool for **local LTX-2.3 (MLX)** and **Dreamverse** (hosted) in a single script.
+A unified command-line tool for **local LTX-2.3 (MLX)** and **Dreamverse** (hosted) in a single script. Home: **[lmangani/ltx-ws](https://github.com/lmangani/ltx-ws)**.
 
 > Default `ltx` mode targets `server.py` on Apple Silicon via [ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx). Dreamverse still uses the FastVideo-hosted WebSocket API.
 
@@ -12,11 +12,19 @@ A unified command-line tool for **local LTX-2.3 (MLX)** and **Dreamverse** (host
 
 ### Install
 
-Grab the unified script and install dependencies:
+Clone the repo (includes `server.py`, `videofentanyl.py`, and MLX notes in the README):
 
 ```bash
-curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/videofentanyl.py
-curl -O https://raw.githubusercontent.com/lmangani/videofentanyl/main/requirements.txt
+git clone https://github.com/lmangani/ltx-ws.git
+cd ltx-ws
+pip install -r requirements.txt
+```
+
+Or download only the client and requirements:
+
+```bash
+curl -O https://raw.githubusercontent.com/lmangani/ltx-ws/main/videofentanyl.py
+curl -O https://raw.githubusercontent.com/lmangani/ltx-ws/main/requirements.txt
 pip install -r requirements.txt
 ```
 
