@@ -21,6 +21,7 @@ Everything below is **local-only**: your Mac, Metal / MLX, and optional Hugging 
 - **Weight paths** — `./models/<org>__<name>/` by default, or `--model-dir`, or base directory `$VIDEOFENTANYL_MODELS`.
 - **Per-job overrides** — Client `simple_generate` may send `seed`, `num_frames`, `height`, `width`, `num_steps` (server snaps frames to **8k+1** and resolution to **multiples of 32**).
 - **Image/audio/video inputs** — Session / generate payloads support image keys plus `audio_input` and `source_video`; client supports `--image`, `--audio`, `--video` (path or `http(s)` URL).
+- **Cross-machine safe media upload** — Client serializes `--image`, `--audio`, and `--video` as payload data, so server and client can run on different hosts without shared filesystem paths.
 - **Operation routing** — `--generation-mode generate|a2v|retake|extend` maps to matching MLX pipelines, including `--retake-start`, `--retake-end`, `--extend-frames`, `--extend-direction`.
 - **Long runs without stalling** — Server emits `generation_keepalive` JSON during inference; client may send `generation_status` and receive `generation_status_ack` (with reserved `model_progress` for future use).
 - **Disconnect safety** — Finished MP4s are copied to `--spill-dir` if the client drops while streaming (`fvserver_completed` by default).

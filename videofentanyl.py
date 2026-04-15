@@ -1118,6 +1118,7 @@ def try_autoconcat_clips(
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
+MAX_MEDIA_DOWNLOAD_BYTES = 512 * 1024 * 1024
 
 
 def _parse_http_content_type(header: str | None) -> str | None:
@@ -1147,6 +1148,18 @@ def _image_payload(name: str, mime: str, raw: bytes) -> dict:
         "name": name,
         "mime_type": mime,
         "data_url": f"data:{mime};base64,{data}",
+    }
+
+
+def _binary_payload(name: str, mime: str, raw: bytes, fallback_mime: str) -> dict:
+    mt = (mime or "").strip().lower()
+    if not mt:
+        mt = fallback_mime
+    data = base64.b64encode(raw).decode()
+    return {
+        "name": name,
+        "mime_type": mt,
+        "data_url": f"data:{mt};base64,{data}",
     }
 
 
@@ -1226,6 +1239,79 @@ def load_image_payload(path_or_url: str) -> dict:
     if not mime or not mime.startswith("image/"):
         mime = "image/jpeg"
     return _image_payload(p.name, mime, p.read_bytes())
+
+
+def _download_url_to_temp_binary(url: str, max_bytes: int) -> tuple[Path, str | None]:
+    req = urllib.request.Request(
+        url.strip(),
+        headers={"User-Agent": USER_AGENT},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            ctype = _parse_http_content_type(resp.headers.get("Content-Type"))
+            raw = resp.read(max_bytes + 1)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"URL returned HTTP {e.code}: {url}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Failed to download URL: {e.reason}") from e
+    if len(raw) > max_bytes:
+        raise ValueError(
+            f"Input exceeds {max_bytes // (1024 * 1024)} MiB: {url}"
+        )
+    name = _filename_from_url(url)
+    mime = ctype
+    if not mime:
+        mime, _ = mimetypes.guess_type(name)
+    ext = Path(name).suffix or ".bin"
+    fd, path_str = tempfile.mkstemp(suffix=ext, prefix="videofentanyl_media_", dir=None)
+    path = Path(path_str)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        return path, mime
+    except Exception:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def load_media_payload(path_or_url: str, *, kind: str) -> dict:
+    """
+    Load audio/video input from local path or URL and return data_url payload dict.
+    This keeps client/server decoupled when they run on different machines.
+    """
+    s = path_or_url.strip()
+    if kind == "audio":
+        fallback = "audio/mpeg"
+    elif kind == "video":
+        fallback = "video/mp4"
+    else:
+        fallback = "application/octet-stream"
+
+    if _is_http_url(s):
+        tmp: Path | None = None
+        try:
+            tmp, mime = _download_url_to_temp_binary(s, MAX_MEDIA_DOWNLOAD_BYTES)
+            raw = tmp.read_bytes()
+            name = _filename_from_url(s)
+            return _binary_payload(name, mime or fallback, raw, fallback)
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    p = Path(s)
+    if not p.exists():
+        raise FileNotFoundError(f"{kind.title()} not found: {path_or_url}")
+    mime, _ = mimetypes.guess_type(str(p))
+    if not mime:
+        mime = fallback
+    return _binary_payload(p.name, mime, p.read_bytes(), fallback)
 
 
 def split_audio_for_jobs(
@@ -1390,6 +1476,8 @@ def build_jobs(
     Each prompt is repeated `count` times before moving to the next prompt.
     """
     initial_image = load_image_payload(image_path) if image_path else None
+    audio_input = load_media_payload(audio_path, kind="audio") if audio_path else None
+    source_video = load_media_payload(video_path, kind="video") if video_path else None
     jobs: list[Job] = []
     job_id = 1
     for prompt in prompts:
@@ -1402,8 +1490,8 @@ def build_jobs(
                 params=GenerationParams(
                     prompt=prompt,
                     initial_image=initial_image,
-                    audio_input=audio_path,
-                    source_video=video_path,
+                    audio_input=audio_input,
+                    source_video=source_video,
                     **params_kwargs,
                 ),
                 output_path=output_dir / fname,
@@ -1814,7 +1902,7 @@ async def async_main(args: argparse.Namespace):
             sys.exit(2)
         for i, job in enumerate(jobs):
             seg = segs[i]
-            job.params.audio_input = str(seg)
+            job.params.audio_input = load_media_payload(str(seg), kind="audio")
             job.cleanup_paths.append(seg)
 
     # ── Dry run ───────────────────────────────────────────────────────────────
@@ -1828,9 +1916,15 @@ async def async_main(args: argparse.Namespace):
             if job.params.initial_image:
                 print(f"        image   : {job.params.initial_image['name']}")
             if job.params.audio_input:
-                print(f"        audio   : {job.params.audio_input}")
+                if isinstance(job.params.audio_input, dict):
+                    print(f"        audio   : {job.params.audio_input.get('name', 'audio')}")
+                else:
+                    print(f"        audio   : {job.params.audio_input}")
             if job.params.source_video:
-                print(f"        video   : {job.params.source_video}")
+                if isinstance(job.params.source_video, dict):
+                    print(f"        video   : {job.params.source_video.get('name', 'video')}")
+                else:
+                    print(f"        video   : {job.params.source_video}")
             print()
         print(f"  Endpoint   : {_ws_url(mode)}")
         print(f"  Output dir : {output_dir.resolve()}")
