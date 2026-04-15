@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import functools
+import inspect
 import logging
 import mimetypes
 import os
@@ -79,6 +80,20 @@ def _snapshot_download_weights(snapshot_download: Any, repo_id: str, dest: Path)
         kw["local_dir_use_symlinks"] = False
     out = snapshot_download(**kw)
     return str(Path(out).resolve())
+
+
+def _model_snapshot_present(dest: Path) -> bool:
+    """
+    Heuristic to detect an already materialized HF snapshot in ``dest``.
+    """
+    if not dest.is_dir():
+        return False
+    try:
+        has_config = (dest / "config.json").is_file() or (dest / "embedded_config.json").is_file()
+        has_weights = any(dest.glob("*.safetensors"))
+    except OSError:
+        return False
+    return bool(has_config and has_weights)
 
 
 def hf_local_weights_directory(repo_id: str, explicit_model_dir: str | None) -> Path:
@@ -251,6 +266,32 @@ def _decode_media_input(
     return None, None
 
 
+def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
+    """
+    Call ``pipe.generate_and_save`` while tolerating API drift between ltx-2-mlx versions.
+
+    - Drops unsupported kwargs.
+    - Maps ``num_steps`` -> ``steps`` when needed.
+    """
+    fn = getattr(pipe, "generate_and_save", None)
+    if fn is None:
+        raise RuntimeError(f"{type(pipe).__name__} has no generate_and_save()")
+
+    sig = inspect.signature(fn)
+    params = sig.parameters
+    accepted = set(params.keys())
+    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+    call_kwargs = dict(kwargs)
+    if "num_steps" in call_kwargs and "num_steps" not in accepted and "steps" in accepted:
+        call_kwargs["steps"] = call_kwargs.pop("num_steps")
+
+    if not has_varkw:
+        call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepted}
+
+    fn(**call_kwargs)
+
+
 class LocalVideoGenerator:
     """
     ``ImageToVideoPipeline`` from ``ltx-2-mlx``: text-to-video when no image,
@@ -279,6 +320,7 @@ class LocalVideoGenerator:
         self.spill_dir = spill_dir
         self.low_memory = bool(low_memory)
         self._model_path: str | None = None
+        self._pipe_classes: dict[str, Any] = {}
         self._pipes: dict[str, Any] = {}
 
     def _resolve_model_dir(self) -> str:
@@ -298,6 +340,9 @@ class LocalVideoGenerator:
                 ) from e
             dest = hf_local_weights_directory(raw, self.model_dir)
             dest.mkdir(parents=True, exist_ok=True)
+            if _model_snapshot_present(dest):
+                log.info("Using existing local MLX snapshot for %r at %s", raw, dest)
+                return str(dest)
             log.info(
                 "Ensuring Hugging Face weights %r under %s "
                 "(huggingface_hub.snapshot_download; same payload as `huggingface-cli download`) …",
@@ -331,16 +376,30 @@ class LocalVideoGenerator:
             ) from e
         path = self._resolve_model_dir()
         self._model_path = path
-        log.info("Loading MLX LTX weights from %s …", path)
-        # Lazily loaded per mode, but instantiate once to validate availability early.
-        self._pipes["t2v"] = TextToVideoPipeline(model_dir=path, low_memory=self.low_memory)
-        self._pipes["i2v"] = ImageToVideoPipeline(model_dir=path, low_memory=self.low_memory)
-        self._pipes["a2v"] = AudioToVideoPipeline(model_dir=path, low_memory=self.low_memory)
-        self._pipes["retake"] = RetakePipeline(model_dir=path, low_memory=self.low_memory)
-        self._pipes["extend"] = ExtendPipeline(model_dir=path, low_memory=self.low_memory)
-        for pipe in self._pipes.values():
-            pipe.load()
-        log.info("MLX pipeline ready ✓")
+        self._pipe_classes = {
+            "t2v": TextToVideoPipeline,
+            "i2v": ImageToVideoPipeline,
+            "a2v": AudioToVideoPipeline,
+            "retake": RetakePipeline,
+            "extend": ExtendPipeline,
+        }
+        log.info("MLX model path resolved ✓ %s", path)
+
+    def _get_pipe(self, key: str) -> Any:
+        if key in self._pipes:
+            return self._pipes[key]
+        self.load()
+        if self._model_path is None:
+            raise RuntimeError("MLX model path not initialized")
+        cls = self._pipe_classes.get(key)
+        if cls is None:
+            raise RuntimeError(f"Unsupported pipeline key: {key}")
+        log.info("Loading MLX pipeline %s from %s …", key, self._model_path)
+        pipe = cls(model_dir=self._model_path, low_memory=self.low_memory)
+        pipe.load()
+        self._pipes[key] = pipe
+        log.info("MLX pipeline ready ✓ (%s)", key)
+        return pipe
 
     def model_progress_for_ws(self) -> dict[str, Any] | None:
         return None
@@ -474,8 +533,9 @@ class LocalVideoGenerator:
 
             try:
                 if mode == "a2v":
-                    pipe = self._pipes["a2v"]
-                    pipe.generate_and_save(
+                    pipe = self._get_pipe("a2v")
+                    _invoke_generate_and_save(
+                        pipe,
                         prompt=req.prompt,
                         output_path=out_path,
                         audio_path=tmp_audio,
@@ -491,8 +551,9 @@ class LocalVideoGenerator:
                         raise RuntimeError("retake mode requires source video input")
                     start_frame = int(req.retake_start if req.retake_start is not None else 1)
                     end_frame = int(req.retake_end if req.retake_end is not None else start_frame)
-                    pipe = self._pipes["retake"]
-                    pipe.generate_and_save(
+                    pipe = self._get_pipe("retake")
+                    _invoke_generate_and_save(
+                        pipe,
                         prompt=req.prompt,
                         output_path=out_path,
                         video_path=tmp_video,
@@ -509,8 +570,9 @@ class LocalVideoGenerator:
                         raise RuntimeError("extend mode requires source video input")
                     ext_frames = int(req.extend_frames if req.extend_frames is not None else 2)
                     direction = (req.extend_direction or "after").strip().lower()
-                    pipe = self._pipes["extend"]
-                    pipe.generate_and_save(
+                    pipe = self._get_pipe("extend")
+                    _invoke_generate_and_save(
+                        pipe,
                         prompt=req.prompt,
                         output_path=out_path,
                         video_path=tmp_video,
@@ -523,8 +585,9 @@ class LocalVideoGenerator:
                         num_steps=steps,
                     )
                 elif tmp_image:
-                    pipe = self._pipes["i2v"]
-                    pipe.generate_and_save(
+                    pipe = self._get_pipe("i2v")
+                    _invoke_generate_and_save(
+                        pipe,
                         prompt=req.prompt,
                         output_path=out_path,
                         image=tmp_image,
@@ -535,8 +598,9 @@ class LocalVideoGenerator:
                         num_steps=steps,
                     )
                 else:
-                    pipe = self._pipes["t2v"]
-                    pipe.generate_and_save(
+                    pipe = self._get_pipe("t2v")
+                    _invoke_generate_and_save(
+                        pipe,
                         prompt=req.prompt,
                         output_path=out_path,
                         height=height,

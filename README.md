@@ -90,7 +90,7 @@ python server.py --model dgrauet/ltx-2.3-mlx-q4 --model-dir "$HOME/mlx-weights/l
 python server.py
 ```
 
-Listens on **`ws://0.0.0.0:8765/ws`** by default. The model is loaded **before** the socket accepts connections, so the first client does not pay cold-start load time.
+Listens on **`ws://0.0.0.0:8765/ws`** by default. Model path and pipeline registry are resolved at startup; the first use of each pipeline (`t2v`/`i2v`/`a2v`/`retake`/`extend`) is lazy-loaded.
 
 Useful variants:
 

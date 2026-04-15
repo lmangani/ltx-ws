@@ -905,7 +905,7 @@ def main() -> None:
     spill_dir.mkdir(parents=True, exist_ok=True)
     log.info("Disconnect spill directory: %s", spill_dir)
 
-    # ── Load model (before WebSocket bind — first client is never a cold-start) ─
+    # ── Resolve model/pipeline registry before WebSocket bind ─
     generator = LocalVideoGenerator(
         model               = args.model,
         num_frames          = args.num_frames,
@@ -919,7 +919,7 @@ def main() -> None:
     )
     log.info("Loading weights before accepting connections …")
     generator.load()
-    log.info("Server ready — model is in memory.")
+    log.info("Server ready — model path resolved; first used pipeline loads on demand.")
 
     # ── Start server ──────────────────────────────────────────────────────────
     server = VideoServer(
