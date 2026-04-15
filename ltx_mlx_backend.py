@@ -16,8 +16,11 @@ import os
 import re
 import shutil
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
+from urllib.request import url2pathname, urlopen
 
 log = logging.getLogger("fvserver")
 
@@ -30,6 +33,27 @@ _HF_REPO_ID_RE = re.compile(
 )
 REPO_ROOT = Path(__file__).resolve().parent
 VIDEOFENTANYL_MODELS_ENV = "VIDEOFENTANYL_MODELS"
+MAX_REMOTE_INPUT_BYTES = 512 * 1024 * 1024  # 512 MiB safety ceiling for remote audio/video
+
+
+@dataclass
+class GenerationRequest:
+    prompt: str
+    image_data: dict | str | None = None
+    audio_data: dict | str | None = None
+    source_video_data: dict | str | None = None
+    seed: int = 1024
+    num_frames: int | None = None
+    height: int | None = None
+    width: int | None = None
+    negative_prompt: str = ""
+    mode: str = "generate"  # generate|a2v|retake|extend
+    num_steps: int | None = None
+    retake_start: int | None = None
+    retake_end: int | None = None
+    extend_frames: int | None = None
+    extend_direction: str = "after"
+    job_id: str | None = None
 
 
 def looks_like_hf_repo_id(model: str) -> bool:
@@ -150,6 +174,83 @@ def _decode_initial_image_dict(image_data: dict) -> str:
     return path
 
 
+def _download_remote_to_temp(url: str, prefix: str, suffix_hint: str = "") -> str:
+    req_url = (url or "").strip()
+    if not req_url.startswith(("http://", "https://")):
+        raise ValueError(f"Unsupported remote input URL: {url!r}")
+    with urlopen(req_url, timeout=180) as resp:
+        payload = resp.read(MAX_REMOTE_INPUT_BYTES + 1)
+    if len(payload) > MAX_REMOTE_INPUT_BYTES:
+        raise RuntimeError(
+            f"Remote media exceeds {MAX_REMOTE_INPUT_BYTES // (1024 * 1024)} MiB limit"
+        )
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix_hint)
+    with os.fdopen(fd, "wb") as f:
+        f.write(payload)
+    return path
+
+
+def _decode_media_input(
+    media_data: dict | str | None,
+    *,
+    temp_prefix: str,
+    default_suffix: str,
+) -> tuple[str | None, str | None]:
+    """
+    Resolve media input to a local path or URL.
+
+    Returns: (resolved_path_or_url, temp_file_to_cleanup_or_none)
+    """
+    if media_data is None:
+        return None, None
+
+    if isinstance(media_data, str):
+        raw = media_data.strip()
+        if not raw:
+            return None, None
+        if raw.startswith(("http://", "https://")):
+            tmp = _download_remote_to_temp(raw, temp_prefix, default_suffix)
+            return tmp, tmp
+        if raw.startswith("file://"):
+            path = url2pathname(unquote(raw[7:]))
+            if os.path.isfile(path):
+                return path, None
+            raise FileNotFoundError(f"File URL does not exist: {raw}")
+        if os.path.isfile(raw):
+            return raw, None
+        raise FileNotFoundError(f"Media input not found: {raw}")
+
+    if isinstance(media_data, dict):
+        data_url = str(media_data.get("data_url") or "").strip()
+        if not data_url:
+            return None, None
+        if data_url.startswith(("http://", "https://")):
+            tmp = _download_remote_to_temp(data_url, temp_prefix, default_suffix)
+            return tmp, tmp
+        if data_url.startswith("file://"):
+            path = url2pathname(unquote(data_url[7:]))
+            if os.path.isfile(path):
+                return path, None
+            raise FileNotFoundError(f"File URL does not exist: {data_url}")
+        if os.path.isfile(data_url):
+            return data_url, None
+        if data_url.startswith("data:"):
+            header, encoded = data_url.split(",", 1)
+            mime = header.split(";")[0].split(":")[1]
+        else:
+            mime = str(media_data.get("mime_type") or "")
+            encoded = data_url
+        ext = mimetypes.guess_extension(mime) or default_suffix
+        if ext == ".jpe":
+            ext = ".jpg"
+        fd, path = tempfile.mkstemp(prefix=temp_prefix, suffix=ext)
+        with os.fdopen(fd, "wb") as f:
+            f.write(base64.b64decode(encoded))
+        return path, path
+
+    return None, None
+
+
 class LocalVideoGenerator:
     """
     ``ImageToVideoPipeline`` from ``ltx-2-mlx``: text-to-video when no image,
@@ -177,7 +278,8 @@ class LocalVideoGenerator:
         self.inference_steps = max(1, int(inference_steps))
         self.spill_dir = spill_dir
         self.low_memory = bool(low_memory)
-        self._pipe = None
+        self._model_path: str | None = None
+        self._pipes: dict[str, Any] = {}
 
     def _resolve_model_dir(self) -> str:
         raw = (self.model or "").strip()
@@ -208,10 +310,16 @@ class LocalVideoGenerator:
         return raw
 
     def load(self) -> None:
-        if self._pipe is not None:
+        if self._model_path is not None:
             return
         try:
-            from ltx_pipelines_mlx import ImageToVideoPipeline
+            from ltx_pipelines_mlx import (
+                AudioToVideoPipeline,
+                ExtendPipeline,
+                ImageToVideoPipeline,
+                RetakePipeline,
+                TextToVideoPipeline,
+            )
         except ImportError as e:
             raise RuntimeError(
                 "Missing ltx_pipelines_mlx. Install the MLX monorepo packages, e.g.:\n"
@@ -222,9 +330,16 @@ class LocalVideoGenerator:
                 "#subdirectory=packages/ltx-pipelines-mlx\""
             ) from e
         path = self._resolve_model_dir()
+        self._model_path = path
         log.info("Loading MLX LTX weights from %s …", path)
-        self._pipe = ImageToVideoPipeline(model_dir=path, low_memory=self.low_memory)
-        self._pipe.load()
+        # Lazily loaded per mode, but instantiate once to validate availability early.
+        self._pipes["t2v"] = TextToVideoPipeline(model_dir=path, low_memory=self.low_memory)
+        self._pipes["i2v"] = ImageToVideoPipeline(model_dir=path, low_memory=self.low_memory)
+        self._pipes["a2v"] = AudioToVideoPipeline(model_dir=path, low_memory=self.low_memory)
+        self._pipes["retake"] = RetakePipeline(model_dir=path, low_memory=self.low_memory)
+        self._pipes["extend"] = ExtendPipeline(model_dir=path, low_memory=self.low_memory)
+        for pipe in self._pipes.values():
+            pipe.load()
         log.info("MLX pipeline ready ✓")
 
     def model_progress_for_ws(self) -> dict[str, Any] | None:
@@ -234,11 +349,19 @@ class LocalVideoGenerator:
         self,
         prompt: str,
         image_data: dict | str | None = None,
+        audio_data: dict | str | None = None,
+        source_video_data: dict | str | None = None,
         seed: int = 1024,
         num_frames: int | None = None,
         height: int | None = None,
         width: int | None = None,
         negative_prompt: str = "",
+        mode: str = "generate",
+        num_steps: int | None = None,
+        retake_start: int | None = None,
+        retake_end: int | None = None,
+        extend_frames: int | None = None,
+        extend_direction: str = "after",
         *,
         job_id: str | None = None,
     ) -> str:
@@ -247,14 +370,24 @@ class LocalVideoGenerator:
             None,
             functools.partial(
                 self._generate_sync,
-                prompt,
-                image_data,
-                seed,
-                num_frames or self.num_frames,
-                height or self.height,
-                width or self.width,
-                negative_prompt,
-                job_id,
+                GenerationRequest(
+                    prompt=prompt,
+                    image_data=image_data,
+                    audio_data=audio_data,
+                    source_video_data=source_video_data,
+                    seed=seed,
+                    num_frames=num_frames or self.num_frames,
+                    height=height or self.height,
+                    width=width or self.width,
+                    negative_prompt=negative_prompt,
+                    mode=mode or "generate",
+                    num_steps=num_steps,
+                    retake_start=retake_start,
+                    retake_end=retake_end,
+                    extend_frames=extend_frames,
+                    extend_direction=extend_direction or "after",
+                    job_id=job_id,
+                ),
             ),
         )
 
@@ -289,81 +422,137 @@ class LocalVideoGenerator:
         except OSError as exc:
             log.error("  ✗ spill salvage failed: %s", exc)
 
-    def _generate_sync(
-        self,
-        prompt: str,
-        image_data: dict | str | None,
-        seed: int,
-        num_frames: int,
-        height: int,
-        width: int,
-        negative_prompt: str,
-        job_id: str | None = None,
-    ) -> str:
-        del negative_prompt  # one-stage MLX distilled path; reserved for future CFG APIs
+    def _generate_sync(self, req: GenerationRequest) -> str:
+        del req.negative_prompt  # reserved for future CFG-enabled variants
         self.load()
 
-        ah = _align_ltx2_spatial(height)
-        aw = _align_ltx2_spatial(width)
-        if ah != height or aw != width:
+        assert self._model_path is not None
+        ah = _align_ltx2_spatial(int(req.height or self.height))
+        aw = _align_ltx2_spatial(int(req.width or self.width))
+        if ah != int(req.height or self.height) or aw != int(req.width or self.width):
             log.warning(
                 "LTX requires H×W divisible by %s; adjusted %s×%s → %s×%s",
                 LTX2_SPATIAL_ALIGN,
-                height,
-                width,
+                req.height,
+                req.width,
                 ah,
                 aw,
             )
-            height, width = ah, aw
+        height, width = ah, aw
 
-        nf = _nearest_valid_frames(int(num_frames))
+        nf = _nearest_valid_frames(int(req.num_frames or self.num_frames))
+        mode = (req.mode or "generate").strip().lower()
+        steps = max(1, int(req.num_steps or self.inference_steps))
 
         tmp_image: str | None = None
-        prefix = f"fv_{job_id[:8]}_" if job_id else "fvserver_out_"
+        tmp_audio: str | None = None
+        tmp_video: str | None = None
+        prefix = f"fv_{req.job_id[:8]}_" if req.job_id else "fvserver_out_"
         tmpdir = tempfile.mkdtemp(prefix=prefix)
         out_path = os.path.join(tmpdir, "output.mp4")
         retained_tmpdir = False
 
         try:
-            if isinstance(image_data, str) and image_data.strip():
-                p = image_data.strip()
-                if os.path.isfile(p) or p.startswith(("http://", "https://")):
-                    tmp_image = p
-            elif isinstance(image_data, dict) and image_data:
-                tmp_image = _decode_initial_image_dict(image_data)
+            tmp_image, tmp_image_cleanup = _decode_media_input(
+                req.image_data,
+                temp_prefix="fvserver_img_",
+                default_suffix=".jpg",
+            )
+            if not tmp_image and isinstance(req.image_data, dict):
+                tmp_image = _decode_initial_image_dict(req.image_data)
+                tmp_image_cleanup = tmp_image
+            tmp_audio, tmp_audio_cleanup = _decode_media_input(
+                req.audio_data,
+                temp_prefix="fvserver_audio_",
+                default_suffix=".wav",
+            )
+            tmp_video, tmp_video_cleanup = _decode_media_input(
+                req.source_video_data,
+                temp_prefix="fvserver_video_",
+                default_suffix=".mp4",
+            )
 
-            assert self._pipe is not None
             try:
-                if tmp_image:
-                    self._pipe.generate_and_save(
-                        prompt=prompt,
+                if mode == "a2v":
+                    pipe = self._pipes["a2v"]
+                    pipe.generate_and_save(
+                        prompt=req.prompt,
+                        output_path=out_path,
+                        audio_path=tmp_audio,
+                        image=tmp_image,
+                        height=height,
+                        width=width,
+                        num_frames=nf,
+                        seed=int(req.seed),
+                        num_steps=steps,
+                    )
+                elif mode == "retake":
+                    if not tmp_video:
+                        raise RuntimeError("retake mode requires source video input")
+                    start_frame = int(req.retake_start if req.retake_start is not None else 1)
+                    end_frame = int(req.retake_end if req.retake_end is not None else start_frame)
+                    pipe = self._pipes["retake"]
+                    pipe.generate_and_save(
+                        prompt=req.prompt,
+                        output_path=out_path,
+                        video_path=tmp_video,
+                        start_frame=start_frame,
+                        end_frame=end_frame,
+                        height=height,
+                        width=width,
+                        num_frames=nf,
+                        seed=int(req.seed),
+                        num_steps=steps,
+                    )
+                elif mode == "extend":
+                    if not tmp_video:
+                        raise RuntimeError("extend mode requires source video input")
+                    ext_frames = int(req.extend_frames if req.extend_frames is not None else 2)
+                    direction = (req.extend_direction or "after").strip().lower()
+                    pipe = self._pipes["extend"]
+                    pipe.generate_and_save(
+                        prompt=req.prompt,
+                        output_path=out_path,
+                        video_path=tmp_video,
+                        extend_frames=ext_frames,
+                        direction=direction,
+                        height=height,
+                        width=width,
+                        num_frames=nf,
+                        seed=int(req.seed),
+                        num_steps=steps,
+                    )
+                elif tmp_image:
+                    pipe = self._pipes["i2v"]
+                    pipe.generate_and_save(
+                        prompt=req.prompt,
                         output_path=out_path,
                         image=tmp_image,
                         height=height,
                         width=width,
                         num_frames=nf,
-                        seed=int(seed),
-                        num_steps=self.inference_steps,
+                        seed=int(req.seed),
+                        num_steps=steps,
                     )
                 else:
-                    self._pipe.generate_and_save(
-                        prompt=prompt,
+                    pipe = self._pipes["t2v"]
+                    pipe.generate_and_save(
+                        prompt=req.prompt,
                         output_path=out_path,
-                        image=None,
                         height=height,
                         width=width,
                         num_frames=nf,
-                        seed=int(seed),
-                        num_steps=self.inference_steps,
+                        seed=int(req.seed),
+                        num_steps=steps,
                     )
             except BaseException:
-                self._salvage_mp4_to_spill(tmpdir, out_path, job_id, prompt, "ENCODE_FAIL")
+                self._salvage_mp4_to_spill(tmpdir, out_path, req.job_id, req.prompt, "ENCODE_FAIL")
                 raise
 
             video_path = out_path
             if not os.path.exists(video_path):
                 self._salvage_mp4_to_spill(
-                    tmpdir, out_path, job_id, prompt, "MISSING_OUTPUT",
+                    tmpdir, out_path, req.job_id, req.prompt, "MISSING_OUTPUT",
                 )
                 raise RuntimeError(
                     f"Generation completed but output file not found: {video_path}"
@@ -372,10 +561,15 @@ class LocalVideoGenerator:
             return video_path
 
         finally:
-            if tmp_image and os.path.isfile(tmp_image) and "fvserver_img_" in tmp_image:
-                try:
-                    os.unlink(tmp_image)
-                except OSError:
-                    pass
+            for tmp, marker in (
+                (tmp_image, "fvserver_img_"),
+                (tmp_audio, "fvserver_audio_"),
+                (tmp_video, "fvserver_video_"),
+            ):
+                if tmp and os.path.isfile(tmp) and marker in tmp:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
             if not retained_tmpdir:
                 shutil.rmtree(tmpdir, ignore_errors=True)

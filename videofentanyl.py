@@ -223,6 +223,14 @@ class GenerationParams:
     num_frames:                Optional[int] = None
     height:                     Optional[int] = None
     width:                      Optional[int] = None
+    num_steps:                  Optional[int] = None
+    generation_mode:            str           = "generate"  # generate|a2v|retake|extend
+    audio_input:            Optional[dict] = None
+    source_video:           Optional[dict] = None
+    retake_start:              Optional[int] = None
+    retake_end:                Optional[int] = None
+    extend_frames:             Optional[int] = None
+    extend_direction:      Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -243,6 +251,7 @@ class Job:
     segment_count: int = 0
     chunk_count:   int = 0
     file_bytes:    int = 0
+    cleanup_paths: list[Path] = dataclasses.field(default_factory=list)
 
     @property
     def elapsed(self) -> float:
@@ -291,16 +300,19 @@ def msg_session_init_v2(p: GenerationParams, mode: str) -> str:
         # Carry ``initial_image`` on session_init so the server fallback (server.py)
         # works for autocontinue / i2v and for clients that only attach the start
         # frame to session_init_v2.
-        return json.dumps({
+        payload = {
             "type":                    "session_init_v2",
             "preset_id":               p.preset_id,
             "curated_prompts":         [],
             "initial_image":           p.initial_image,
+            "audio_input":             p.audio_input,
+            "source_video":            p.source_video,
             "single_clip_mode":        p.single_clip_mode,
             "enhancement_enabled":     p.enhancement_enabled,
             "auto_extension_enabled":  p.auto_extension_enabled,
             "loop_generation_enabled": p.loop_generation_enabled,
-        })
+        }
+        return json.dumps(payload)
 
 
 def msg_simple_generate(p: GenerationParams) -> str:
@@ -322,6 +334,22 @@ def msg_simple_generate(p: GenerationParams) -> str:
         d["height"] = int(p.height)
     if p.width is not None:
         d["width"] = int(p.width)
+    if p.num_steps is not None:
+        d["num_steps"] = int(p.num_steps)
+    if p.generation_mode:
+        d["mode"] = p.generation_mode
+    if p.audio_input is not None:
+        d["audio_input"] = p.audio_input
+    if p.source_video is not None:
+        d["source_video"] = p.source_video
+    if p.retake_start is not None:
+        d["retake_start"] = int(p.retake_start)
+    if p.retake_end is not None:
+        d["retake_end"] = int(p.retake_end)
+    if p.extend_frames is not None:
+        d["extend_frames"] = int(p.extend_frames)
+    if p.extend_direction:
+        d["extend_direction"] = str(p.extend_direction)
     return json.dumps(d)
 
 
@@ -824,6 +852,15 @@ class GenerationQueue:
         self.verbose = verbose
         self.autocontinue = autocontinue
 
+    @staticmethod
+    def _cleanup_job_temps(job: Job) -> None:
+        for p in job.cleanup_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError as exc:
+                print(f"  [cleanup] warning: could not remove temp file {p}: {exc}")
+        job.cleanup_paths.clear()
+
     async def run_all(self):
         total  = len(self.jobs)
         done   = 0
@@ -895,6 +932,10 @@ class GenerationQueue:
             else:
                 failed += 1
                 print(f"  ✗ FAILED  {job.error}")
+
+            # Cleanup per-job temporary artifacts (e.g. audiocontinue split chunks),
+            # regardless of success/failure, once retries for this job are done.
+            self._cleanup_job_temps(job)
 
             print()
 
@@ -1187,6 +1228,97 @@ def load_image_payload(path_or_url: str) -> dict:
     return _image_payload(p.name, mime, p.read_bytes())
 
 
+def split_audio_for_jobs(
+    audio_path: str,
+    *,
+    segment_seconds: float,
+    required_segments: int,
+) -> tuple[list[Path], Path]:
+    """
+    Split one audio file into sequential chunks for audiocontinue.
+
+    Returns: (segment_paths, temp_directory).
+    Caller owns cleanup (unlink each segment and remove temp directory).
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError(
+            "--audiocontinue requires ffmpeg on PATH "
+            "(used to segment input audio)"
+        )
+    source_temp: Path | None = None
+    raw_audio = audio_path.strip()
+    if _is_http_url(raw_audio):
+        req = urllib.request.Request(
+            raw_audio,
+            headers={"User-Agent": USER_AGENT},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                payload = resp.read(512 * 1024 * 1024 + 1)
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"Audio URL returned HTTP {e.code}: {raw_audio}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Failed to download audio: {e.reason}") from e
+        if len(payload) > 512 * 1024 * 1024:
+            raise RuntimeError("Audio URL exceeds 512 MiB limit")
+        ext = Path(urlparse(raw_audio).path).suffix or ".wav"
+        fd, tmp_path = tempfile.mkstemp(prefix="videofentanyl_audio_", suffix=ext)
+        source_temp = Path(tmp_path)
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+        src = source_temp.resolve()
+    else:
+        src = Path(raw_audio).expanduser().resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"Audio not found: {audio_path}")
+    if segment_seconds <= 0:
+        raise ValueError("segment_seconds must be > 0")
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="videofentanyl_audio_segments_"))
+    ext = src.suffix if src.suffix else ".wav"
+    out_tpl = temp_dir / f"seg_%04d{ext}"
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(src),
+        "-f",
+        "segment",
+        "-segment_time",
+        f"{segment_seconds:.6f}",
+        "-c",
+        "copy",
+        str(out_tpl),
+    ]
+    cp = subprocess.run(cmd, capture_output=True, text=True)
+    if source_temp is not None:
+        source_temp.unlink(missing_ok=True)
+    if cp.returncode != 0:
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except OSError:
+            pass
+        err = (cp.stderr or cp.stdout or "unknown ffmpeg error").strip()
+        raise RuntimeError(f"ffmpeg audio segmentation failed: {err}")
+
+    segs = sorted(temp_dir.glob(f"seg_*{ext}"))
+    if len(segs) < required_segments:
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"Audio produced {len(segs)} segment(s), but {required_segments} job(s) are queued. "
+            "Increase source audio length, reduce --count, or reduce clip duration."
+        )
+    return segs[:required_segments], temp_dir
+
+
 def extract_last_frame(video_path: Path) -> Optional[dict]:
     """Extract the last full frame from a video file without calling external tools.
 
@@ -1250,6 +1382,8 @@ def build_jobs(
     ext:           str,
     max_attempts:  int,
     image_path:    str | None = None,
+    audio_path:    str | None = None,
+    video_path:    str | None = None,
 ) -> list[Job]:
     """
     Build the sequential job list.
@@ -1268,6 +1402,8 @@ def build_jobs(
                 params=GenerationParams(
                     prompt=prompt,
                     initial_image=initial_image,
+                    audio_input=audio_path,
+                    source_video=video_path,
                     **params_kwargs,
                 ),
                 output_path=output_dir / fname,
@@ -1334,6 +1470,34 @@ examples:
         help="videos to generate per prompt (default: 1)",
     )
     gen.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        metavar="N",
+        help="override random seed for local server",
+    )
+    gen.add_argument(
+        "--num-frames",
+        type=int,
+        default=None,
+        metavar="N",
+        help="override frame count for local server",
+    )
+    gen.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        metavar="PX",
+        help="override output height for local server",
+    )
+    gen.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        metavar="PX",
+        help="override output width for local server",
+    )
+    gen.add_argument(
         "--enhance", "-e",
         action="store_true", default=None,
         help="enable AI prompt enhancement / GPT rewrite "
@@ -1348,6 +1512,56 @@ examples:
         "--image", "-i",
         metavar="PATH_OR_URL",
         help="input image for image-to-video (local path or http(s) URL)",
+    )
+    gen.add_argument(
+        "--audio",
+        metavar="PATH_OR_URL",
+        help="audio input for audio-to-video mode (local path or http(s) URL)",
+    )
+    gen.add_argument(
+        "--video",
+        metavar="PATH_OR_URL",
+        help="source video for retake/extend mode (local path or http(s) URL)",
+    )
+    gen.add_argument(
+        "--generation-mode",
+        choices=("generate", "a2v", "retake", "extend"),
+        default="generate",
+        help="local generation route (default: generate)",
+    )
+    gen.add_argument(
+        "--num-steps",
+        type=int,
+        default=None,
+        metavar="N",
+        help="override denoising steps for local server (uses server default when omitted)",
+    )
+    gen.add_argument(
+        "--retake-start",
+        type=int,
+        default=None,
+        metavar="N",
+        help="retake start latent frame index (generation-mode=retake)",
+    )
+    gen.add_argument(
+        "--retake-end",
+        type=int,
+        default=None,
+        metavar="N",
+        help="retake end latent frame index (generation-mode=retake)",
+    )
+    gen.add_argument(
+        "--extend-frames",
+        type=int,
+        default=None,
+        metavar="N",
+        help="number of latent frames to extend (generation-mode=extend)",
+    )
+    gen.add_argument(
+        "--extend-direction",
+        choices=("before", "after"),
+        default=None,
+        help="extend direction for generation-mode=extend",
     )
     gen.add_argument(
         "--preset-id",
@@ -1433,6 +1647,15 @@ examples:
              "needs ffmpeg on PATH)",
     )
     p.add_argument(
+        "--audiocontinue",
+        action="store_true",
+        help=(
+            "music-video helper: implies --autocontinue --autoconcat --autocompact, "
+            "splits --audio into per-clip segments, and assigns one segment per job "
+            "for generation-mode a2v"
+        ),
+    )
+    p.add_argument(
         "--autocompact",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -1454,6 +1677,7 @@ async def async_main(args: argparse.Namespace):
 
     mode    = args.mode
     cfg     = MODES[mode]
+    temp_audio_segment_dir: Path | None = None
 
     if cfg.get("requires_server") and not args.server:
         print(
@@ -1473,11 +1697,46 @@ async def async_main(args: argparse.Namespace):
     if args.count < 1:
         print("Error: --count must be >= 1")
         sys.exit(1)
+    if args.audiocontinue:
+        args.autocontinue = True
+        args.autoconcat = True
+        args.autocompact = True
+        if args.generation_mode == "generate":
+            args.generation_mode = "a2v"
     if args.autoconcat and not args.autocontinue:
         print("Error: --autoconcat requires --autocontinue")
         sys.exit(2)
     if args.autocompact and not args.autoconcat:
         print("Error: --autocompact requires --autoconcat")
+        sys.exit(2)
+    if args.generation_mode != "generate" and mode != "ltx":
+        print("Error: --generation-mode is supported only with --mode ltx")
+        sys.exit(2)
+    if args.audiocontinue and args.generation_mode != "a2v":
+        print("Error: --audiocontinue only supports --generation-mode a2v")
+        sys.exit(2)
+    if args.generation_mode == "a2v" and not args.audio:
+        print("Error: --generation-mode a2v requires --audio")
+        sys.exit(2)
+    if args.audiocontinue and not args.audio:
+        print("Error: --audiocontinue requires --audio")
+        sys.exit(2)
+    if args.generation_mode == "retake":
+        if not args.video:
+            print("Error: --generation-mode retake requires --video")
+            sys.exit(2)
+        if args.retake_start is None or args.retake_end is None:
+            print("Error: retake mode requires both --retake-start and --retake-end")
+            sys.exit(2)
+    if args.generation_mode == "extend":
+        if not args.video:
+            print("Error: --generation-mode extend requires --video")
+            sys.exit(2)
+        if args.extend_frames is None:
+            print("Error: extend mode requires --extend-frames")
+            sys.exit(2)
+    if args.num_steps is not None and args.num_steps < 1:
+        print("Error: --num-steps must be >= 1")
         sys.exit(2)
 
     # ── Resolve mode-specific defaults ───────────────────────────────────────
@@ -1513,6 +1772,16 @@ async def async_main(args: argparse.Namespace):
         "single_clip_mode":        not cfg["multi_segment"],
         "auto_extension_enabled":  args.auto_extension,
         "loop_generation_enabled": args.loop,
+        "seed":                    args.seed,
+        "num_frames":              args.num_frames,
+        "height":                  args.height,
+        "width":                   args.width,
+        "num_steps":               args.num_steps,
+        "generation_mode":         args.generation_mode,
+        "retake_start":            args.retake_start,
+        "retake_end":              args.retake_end,
+        "extend_frames":           args.extend_frames,
+        "extend_direction":        args.extend_direction,
     }
 
     # ── Build jobs ────────────────────────────────────────────────────────────
@@ -1526,7 +1795,27 @@ async def async_main(args: argparse.Namespace):
         ext=args.ext.lstrip("."),
         max_attempts=max(1, args.retries),
         image_path=args.image,
+        audio_path=args.audio,
+        video_path=args.video,
     )
+
+    segment_seconds: float | None = None
+    if args.audiocontinue:
+        nf = int(args.num_frames) if args.num_frames is not None else 97
+        segment_seconds = max(0.25, nf / 24.0)
+        try:
+            segs, temp_audio_segment_dir = split_audio_for_jobs(
+                args.audio,
+                segment_seconds=segment_seconds,
+                required_segments=len(jobs),
+            )
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(2)
+        for i, job in enumerate(jobs):
+            seg = segs[i]
+            job.params.audio_input = str(seg)
+            job.cleanup_paths.append(seg)
 
     # ── Dry run ───────────────────────────────────────────────────────────────
     if args.dry_run:
@@ -1535,8 +1824,13 @@ async def async_main(args: argparse.Namespace):
             print(f"  [{job.id:02d}] {job.output_path.name}")
             print(f"        prompt  : {job.params.prompt[:72]!r}")
             print(f"        enhance : {job.params.enhancement_enabled}")
+            print(f"        genmode : {job.params.generation_mode}")
             if job.params.initial_image:
                 print(f"        image   : {job.params.initial_image['name']}")
+            if job.params.audio_input:
+                print(f"        audio   : {job.params.audio_input}")
+            if job.params.source_video:
+                print(f"        video   : {job.params.source_video}")
             print()
         print(f"  Endpoint   : {_ws_url(mode)}")
         print(f"  Output dir : {output_dir.resolve()}")
@@ -1548,6 +1842,10 @@ async def async_main(args: argparse.Namespace):
         if args.autoconcat:
             print("  autoconcat : after run, merge successful clips with ffmpeg; "
                   "remove fragments if merge succeeds")
+        if args.audiocontinue:
+            print(f"  audiocontinue : ON  ({len(jobs)} segment(s), ~{segment_seconds:.2f}s each)")
+        if temp_audio_segment_dir is not None:
+            shutil.rmtree(temp_audio_segment_dir, ignore_errors=True)
         return
 
     # ── Run queue ─────────────────────────────────────────────────────────────
@@ -1559,16 +1857,20 @@ async def async_main(args: argparse.Namespace):
         verbose=args.verbose,
         autocontinue=args.autocontinue,
     )
-    done, failed = await queue.run_all()
-    if args.autoconcat:
-        await asyncio.to_thread(
-            try_autoconcat_clips,
-            jobs,
-            prefix,
-            args.ext.lstrip("."),
-            args.verbose,
-            args.autocompact,
-        )
+    try:
+        done, failed = await queue.run_all()
+        if args.autoconcat:
+            await asyncio.to_thread(
+                try_autoconcat_clips,
+                jobs,
+                prefix,
+                args.ext.lstrip("."),
+                args.verbose,
+                args.autocompact,
+            )
+    finally:
+        if temp_audio_segment_dir is not None:
+            shutil.rmtree(temp_audio_segment_dir, ignore_errors=True)
     sys.exit(0 if failed == 0 else 1)
 
 

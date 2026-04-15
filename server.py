@@ -195,6 +195,52 @@ def _resolve_initial_image_payload(msg: dict, session: dict) -> dict | str | Non
     return None
 
 
+def _resolve_audio_payload(msg: dict, session: dict) -> dict | str | None:
+    keys = (
+        "audio_input",
+        "audioInput",
+        "input_audio",
+        "inputAudio",
+        "audio_path",
+        "audioPath",
+        "audio",
+        "inputs",
+    )
+    for source in (msg, session):
+        for key in keys:
+            raw = source.get(key)
+            if key == "inputs" and isinstance(raw, dict):
+                nested = raw.get("audio_path") or raw.get("audioPath") or raw.get("audio")
+                if isinstance(nested, (str, dict)) and nested:
+                    return nested
+            if isinstance(raw, (str, dict)) and raw:
+                return raw
+    return None
+
+
+def _resolve_source_video_payload(msg: dict, session: dict) -> dict | str | None:
+    keys = (
+        "source_video",
+        "sourceVideo",
+        "video_path",
+        "videoPath",
+        "video",
+        "input_video",
+        "inputVideo",
+        "inputs",
+    )
+    for source in (msg, session):
+        for key in keys:
+            raw = source.get(key)
+            if key == "inputs" and isinstance(raw, dict):
+                nested = raw.get("video_path") or raw.get("videoPath") or raw.get("video")
+                if isinstance(nested, (str, dict)) and nested:
+                    return nested
+            if isinstance(raw, (str, dict)) and raw:
+                return raw
+    return None
+
+
 
 # ── Single-flight generation queue (in-memory, self-cleaning) ───────────────────
 
@@ -381,7 +427,9 @@ class RequestHandler:
             return
 
         # Resolve initial image: prefer simple_generate, then session_init_v2.
-        initial_image: dict | None = _resolve_initial_image_payload(msg, self._session)
+        initial_image: dict | str | None = _resolve_initial_image_payload(msg, self._session)
+        audio_input = _resolve_audio_payload(msg, self._session)
+        source_video = _resolve_source_video_payload(msg, self._session)
 
         def _msg_int(name: str, default: int) -> int:
             raw = msg.get(name)
@@ -396,6 +444,20 @@ class RequestHandler:
         gen_num_frames = _msg_int("num_frames", self.generator.num_frames)
         gen_height = _msg_int("height", self.generator.height)
         gen_width = _msg_int("width", self.generator.width)
+        gen_num_steps = _msg_int("num_steps", self.generator.inference_steps)
+        gen_retake_start = _msg_int("retake_start", 1)
+        gen_retake_end = _msg_int("retake_end", gen_retake_start)
+        gen_extend_frames = _msg_int("extend_frames", 2)
+        gen_extend_direction = str(msg.get("extend_direction") or "after").strip().lower()
+
+        mode = str(msg.get("mode") or msg.get("generation_mode") or "").strip().lower()
+        if not mode:
+            if source_video:
+                mode = "extend" if ("extend" in str(msg.get("operation", "")).lower()) else "retake"
+            elif audio_input:
+                mode = "a2v"
+            else:
+                mode = "generate"
 
         async def _notify_queue(**kwargs: Any) -> None:
             await self._send_json(**kwargs)
@@ -403,14 +465,19 @@ class RequestHandler:
         async with self.scheduler.generation_slot(_notify_queue) as generation_id:
             t_start = time.time()
             log.info(
-                "  ▶ generation %s  prompt=%r  start_image=%s  seed=%s  %s×%s  frames=%s",
+                "  ▶ generation %s  mode=%s  prompt=%r  image=%s  audio=%s  video=%s "
+                "seed=%s  %s×%s  frames=%s  steps=%s",
                 generation_id,
+                mode,
                 prompt[:72],
                 "yes" if initial_image else "no",
+                "yes" if audio_input else "no",
+                "yes" if source_video else "no",
                 gen_seed,
                 gen_height,
                 gen_width,
                 gen_num_frames,
+                gen_num_steps,
             )
 
             # ── gpu_assigned ──────────────────────────────────────────────────
@@ -461,11 +528,19 @@ class RequestHandler:
                     self.generator.generate(
                         prompt=prompt,
                         image_data=initial_image,
+                        audio_data=audio_input,
+                        source_video_data=source_video,
                         negative_prompt=negative_prompt,
                         seed=gen_seed,
                         num_frames=gen_num_frames,
                         height=gen_height,
                         width=gen_width,
+                        mode=mode,
+                        num_steps=gen_num_steps,
+                        retake_start=gen_retake_start,
+                        retake_end=gen_retake_end,
+                        extend_frames=gen_extend_frames,
+                        extend_direction=gen_extend_direction,
                         job_id=generation_id,
                     )
                 )

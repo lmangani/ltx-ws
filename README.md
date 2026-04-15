@@ -4,7 +4,7 @@
 
 | Component | Role |
 |-----------|------|
-| [`server.py`](server.py) | WebSocket server: loads [ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx), runs **text-to-video** and **image-to-video**, streams **MP4** to clients. |
+| [`server.py`](server.py) | WebSocket server: loads [ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx), runs **T2V/I2V/A2V/retake/extend**, streams **MP4** to clients. |
 | [`videofentanyl.py`](videofentanyl.py) | CLI client: queues jobs, speaks the same JSON + binary protocol (`--mode ltx` + `--server`). |
 | [`ltx_mlx_backend.py`](ltx_mlx_backend.py) | MLX pipeline adapter, Hugging Face weight resolution, frame/spatial alignment. |
 | [`scripts/benchmark_local_generation.py`](scripts/benchmark_local_generation.py) | Spawns (or attaches to) `server.py`, runs one client job, prints timings + `BENCHMARK_JSON:…`. |
@@ -15,17 +15,19 @@ Everything below is **local-only**: your Mac, Metal / MLX, and optional Hugging 
 
 ## Features
 
-- **MLX on Metal** — Inference via [`ltx_pipelines_mlx.ImageToVideoPipeline`](https://github.com/dgrauet/ltx-2-mlx) (text-only and image-conditioned clips).
+- **MLX on Metal** — Inference via [`ltx_pipelines_mlx`](https://github.com/dgrauet/ltx-2-mlx): `TextToVideoPipeline`, `ImageToVideoPipeline`, `AudioToVideoPipeline`, `RetakePipeline`, `ExtendPipeline`.
 - **Automatic weight download** — For a Hugging Face repo id (`org/model`), the server calls [`huggingface_hub.snapshot_download`](https://huggingface.co/docs/huggingface_hub/guides/download) on load (equivalent to `huggingface-cli download`). Resumes partial downloads.
 - **Default weights** — [`dgrauet/ltx-2.3-mlx`](https://huggingface.co/dgrauet/ltx-2.3-mlx) (full MLX bf16; very large). Use [`ltx-2.3-mlx-q8`](https://huggingface.co/dgrauet/ltx-2.3-mlx-q8) or [`-q4`](https://huggingface.co/dgrauet/ltx-2.3-mlx-q4) for less RAM/disk.
 - **Weight paths** — `./models/<org>__<name>/` by default, or `--model-dir`, or base directory `$VIDEOFENTANYL_MODELS`.
-- **Per-job overrides** — Client `simple_generate` may send `seed`, `num_frames`, `height`, `width` (server snaps frames to **8k+1** and resolution to **multiples of 32**).
-- **Image input** — Session / generate payloads support `initial_image` / `initialImage` / data URLs; client supports `--image` (path or `https://` URL).
+- **Per-job overrides** — Client `simple_generate` may send `seed`, `num_frames`, `height`, `width`, `num_steps` (server snaps frames to **8k+1** and resolution to **multiples of 32**).
+- **Image/audio/video inputs** — Session / generate payloads support image keys plus `audio_input` and `source_video`; client supports `--image`, `--audio`, `--video` (path or `http(s)` URL).
+- **Operation routing** — `--generation-mode generate|a2v|retake|extend` maps to matching MLX pipelines, including `--retake-start`, `--retake-end`, `--extend-frames`, `--extend-direction`.
 - **Long runs without stalling** — Server emits `generation_keepalive` JSON during inference; client may send `generation_status` and receive `generation_status_ack` (with reserved `model_progress` for future use).
 - **Disconnect safety** — Finished MP4s are copied to `--spill-dir` if the client drops while streaming (`fvserver_completed` by default).
 - **Single-flight generation** — One active MLX job at a time; extra clients wait in a fair queue (`queue_status` / `gpu_assigned`).
 - **Client batching** — Multiple `--prompt`s, `--count`, `--delay`, `--retries`, `--dry-run`, `--verbose`.
 - **Autocontinue / autoconcat** — Chain clips using the last frame of each as the next start image; optional `ffmpeg` stream-copy merge into one file (`--autoconcat`).
+- **Audiocontinue** — `--audiocontinue` auto-enables `--autocontinue --autoconcat --autocompact`, splits one input audio track into clip-length chunks, and feeds each chunk sequentially in `a2v` mode.
 
 ---
 
@@ -112,6 +114,21 @@ python videofentanyl.py --server ws://127.0.0.1:8765/ws \
   --prompt "animate gently" --image ./photo.jpg
 
 python videofentanyl.py --server ws://127.0.0.1:8765/ws \
+  --generation-mode a2v --audio ./music.wav --prompt "a musician performing"
+
+python videofentanyl.py --server ws://127.0.0.1:8765/ws \
+  --generation-mode retake --video ./source.mp4 --retake-start 1 --retake-end 3 \
+  --prompt "A different scene"
+
+python videofentanyl.py --server ws://127.0.0.1:8765/ws \
+  --generation-mode extend --video ./source.mp4 --extend-frames 2 --extend-direction after \
+  --prompt "Continue the motion"
+
+python videofentanyl.py --server ws://127.0.0.1:8765/ws \
+  --generation-mode a2v --audio ./song.wav --count 5 \
+  --num-frames 121 --audiocontinue --prompt "music video"
+
+python videofentanyl.py --server ws://127.0.0.1:8765/ws \
   --prompt "a river in a canyon" --count 4 --autocontinue
 
 python videofentanyl.py --server ws://127.0.0.1:8765/ws \
@@ -159,7 +176,7 @@ JSON messages use a `type` field. After `simple_generate`, the server streams **
 
 ```
 client →  session_init_v2          (session + optional initial image for i2v / autocontinue)
-client →  simple_generate         (prompt; optional seed, num_frames, height, width, image keys)
+client →  simple_generate         (prompt + mode; optional seed/frames/size/steps + image/audio/video keys)
 server ←  queue_status             (while waiting for the single MLX slot)
 server ←  gpu_assigned             (generation_id, gpu_id reports mlx:0)
 server ←  ltx2_stream_start       (single-segment stream)
@@ -205,7 +222,13 @@ The client implements this flow for `--mode ltx` when `--server` is set.
 | `--server` | — | WebSocket URL, e.g. `ws://127.0.0.1:8765/ws`. |
 | `--prompt` / `-p` | *(built-in demo)* | Repeat for multiple prompts. |
 | `--count` / `-n` | `1` | Videos per prompt. |
+| `--seed`, `--num-frames`, `--height`, `--width`, `--num-steps` | — | Per-job generation overrides for local server. |
+| `--generation-mode` | `generate` | Local route: `generate`, `a2v`, `retake`, `extend`. |
 | `--image` / `-i` | — | Image-to-video: path or `http(s)` URL. |
+| `--audio` | — | Audio-to-video input for `--generation-mode a2v`. |
+| `--video` | — | Source video for `--generation-mode retake|extend`. |
+| `--retake-start`, `--retake-end` | — | Retake frame range for `--generation-mode retake`. |
+| `--extend-frames`, `--extend-direction` | — | Extend parameters for `--generation-mode extend`. |
 | `--enhance` / `-e` | off | Sets `enhancement_enabled` in the client handshake; **this MLX server does not run GPT rewrite** — generation uses the prompt you send. |
 | `--preset-id`, `--preset-label` | — | Override `session_init_v2` preset fields. |
 | `--auto-extension`, `--loop` | off | Forwarded session flags. |
@@ -219,6 +242,7 @@ The client implements this flow for `--mode ltx` when `--server` is set.
 | `--dry-run` | off | Print plan, exit. |
 | `--autocontinue` | off | Last frame → next job’s start image. |
 | `--autoconcat` | off | After queue: `ffmpeg -c copy` merge (**requires** `--autocontinue` + ffmpeg). |
+| `--audiocontinue` | off | Music-video helper for `a2v`: implies `--autocontinue --autoconcat --autocompact`, splits `--audio` per clip and assigns one segment per job. |
 
 Saved files look like: **`{prefix}_{NNN}_{slug}_{timestamp}.mp4`**. After a successful **`--autoconcat`**, fragments are removed and **`{prefix}_merged_{timestamp}.mp4`** is written.
 
