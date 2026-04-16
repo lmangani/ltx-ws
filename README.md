@@ -98,6 +98,7 @@ Useful variants:
 python server.py --port 9000
 python server.py --model dgrauet/ltx-2.3-mlx-q8 --infer-steps 8 --num-frames 65
 python server.py --height 512 --width 768 --mlx-low-memory
+python server.py --lora Kijai/LTX2.3_comfy 1.0
 ```
 
 ---
@@ -203,6 +204,7 @@ The client implements this flow for `--mode ltx` when `--server` is set.
 | `--port` | `8765` | TCP port; path **`/ws`**. |
 | `--model` | `dgrauet/ltx-2.3-mlx` | HF repo id or local weights directory. |
 | `--model-dir` | *(see Models)* | Store HF snapshot here; overrides default `./models/<org>__<name>/`. |
+| `--lora <path_or_repo> <scale>` | off | Global LoRA(s) applied to all requests; repeat flag to stack multiple LoRAs. |
 | `--num-frames` | `97` | Target length; adjusted to **8k+1** (e.g. 9, 25, 49, 97). |
 | `--height` | `480` | Snapped to multiple of **32**. |
 | `--width` | `704` | Snapped to multiple of **32**. |

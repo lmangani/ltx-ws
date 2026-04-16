@@ -54,6 +54,8 @@ class GenerationRequest:
     retake_end: int | None = None
     extend_frames: int | None = None
     extend_direction: str = "after"
+    lora_specs: list[tuple[str, float]] | None = None
+    video_conditioning_specs: list[tuple[dict | str, float]] | None = None
     job_id: str | None = None
 
 
@@ -266,6 +268,27 @@ def _decode_media_input(
     return None, None
 
 
+def _decode_weighted_media_inputs(
+    items: list[tuple[dict | str, float]] | None,
+    *,
+    temp_prefix: str,
+    default_suffix: str,
+) -> tuple[list[tuple[str, float]], list[str]]:
+    decoded: list[tuple[str, float]] = []
+    temps: list[str] = []
+    for src, weight in (items or []):
+        path, cleanup = _decode_media_input(
+            src,
+            temp_prefix=temp_prefix,
+            default_suffix=default_suffix,
+        )
+        if path:
+            decoded.append((path, float(weight)))
+        if cleanup:
+            temps.append(cleanup)
+    return decoded, temps
+
+
 def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     """
     Call ``pipe.generate_and_save`` while tolerating API drift between ltx-2-mlx versions.
@@ -307,6 +330,7 @@ class LocalVideoGenerator:
         fps: float,
         model_dir: str | None,
         inference_steps: int,
+        default_lora_specs: list[tuple[str, float]] | None = None,
         spill_dir: Path | None = None,
         low_memory: bool = False,
     ) -> None:
@@ -317,6 +341,7 @@ class LocalVideoGenerator:
         self.fps = float(fps)
         self.model_dir = model_dir
         self.inference_steps = max(1, int(inference_steps))
+        self.default_lora_specs = list(default_lora_specs or [])
         self.spill_dir = spill_dir
         self.low_memory = bool(low_memory)
         self._model_path: str | None = None
@@ -358,13 +383,7 @@ class LocalVideoGenerator:
         if self._model_path is not None:
             return
         try:
-            from ltx_pipelines_mlx import (
-                AudioToVideoPipeline,
-                ExtendPipeline,
-                ImageToVideoPipeline,
-                RetakePipeline,
-                TextToVideoPipeline,
-            )
+            import ltx_pipelines_mlx as lpm
         except ImportError as e:
             raise RuntimeError(
                 "Missing ltx_pipelines_mlx. Install the MLX monorepo packages, e.g.:\n"
@@ -377,12 +396,15 @@ class LocalVideoGenerator:
         path = self._resolve_model_dir()
         self._model_path = path
         self._pipe_classes = {
-            "t2v": TextToVideoPipeline,
-            "i2v": ImageToVideoPipeline,
-            "a2v": AudioToVideoPipeline,
-            "retake": RetakePipeline,
-            "extend": ExtendPipeline,
+            "t2v": lpm.TextToVideoPipeline,
+            "i2v": lpm.ImageToVideoPipeline,
+            "a2v": lpm.AudioToVideoPipeline,
+            "retake": lpm.RetakePipeline,
+            "extend": lpm.ExtendPipeline,
         }
+        ic_cls = getattr(lpm, "ICLoraPipeline", None)
+        if ic_cls is not None:
+            self._pipe_classes["ic_lora"] = ic_cls
         log.info("MLX model path resolved ✓ %s", path)
 
     def _get_pipe(self, key: str) -> Any:
@@ -421,6 +443,8 @@ class LocalVideoGenerator:
         retake_end: int | None = None,
         extend_frames: int | None = None,
         extend_direction: str = "after",
+        lora_specs: list[tuple[str, float]] | None = None,
+        video_conditioning_specs: list[tuple[dict | str, float]] | None = None,
         *,
         job_id: str | None = None,
     ) -> str:
@@ -445,6 +469,8 @@ class LocalVideoGenerator:
                     retake_end=retake_end,
                     extend_frames=extend_frames,
                     extend_direction=extend_direction or "after",
+                    lora_specs=lora_specs,
+                    video_conditioning_specs=video_conditioning_specs,
                     job_id=job_id,
                 ),
             ),
@@ -502,10 +528,14 @@ class LocalVideoGenerator:
         nf = _nearest_valid_frames(int(req.num_frames or self.num_frames))
         mode = (req.mode or "generate").strip().lower()
         steps = max(1, int(req.num_steps or self.inference_steps))
+        effective_loras: list[tuple[str, float]] = []
+        effective_loras.extend(self.default_lora_specs)
+        effective_loras.extend(req.lora_specs or [])
 
         tmp_image: str | None = None
         tmp_audio: str | None = None
         tmp_video: str | None = None
+        tmp_video_conditioning_cleanup: list[str] = []
         prefix = f"fv_{req.job_id[:8]}_" if req.job_id else "fvserver_out_"
         tmpdir = tempfile.mkdtemp(prefix=prefix)
         out_path = os.path.join(tmpdir, "output.mp4")
@@ -530,6 +560,12 @@ class LocalVideoGenerator:
                 temp_prefix="fvserver_video_",
                 default_suffix=".mp4",
             )
+            vc_items, vc_cleanup = _decode_weighted_media_inputs(
+                req.video_conditioning_specs,
+                temp_prefix="fvserver_vcond_",
+                default_suffix=".mp4",
+            )
+            tmp_video_conditioning_cleanup = vc_cleanup
 
             try:
                 if mode == "a2v":
@@ -545,6 +581,7 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
+                        lora_paths=effective_loras,
                     )
                 elif mode == "retake":
                     if not tmp_video:
@@ -564,6 +601,7 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
+                        lora_paths=effective_loras,
                     )
                 elif mode == "extend":
                     if not tmp_video:
@@ -583,6 +621,25 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
+                        lora_paths=effective_loras,
+                    )
+                elif mode == "ic_lora":
+                    if not effective_loras:
+                        raise RuntimeError("ic_lora mode requires at least one LoRA spec")
+                    if not vc_items:
+                        raise RuntimeError("ic_lora mode requires video_conditioning entries")
+                    pipe = self._get_pipe("ic_lora")
+                    _invoke_generate_and_save(
+                        pipe,
+                        prompt=req.prompt,
+                        output_path=out_path,
+                        lora_paths=[(str(p), float(s)) for p, s in effective_loras],
+                        video_conditioning=[(str(p), float(s)) for p, s in vc_items],
+                        height=height,
+                        width=width,
+                        num_frames=nf,
+                        seed=int(req.seed),
+                        num_steps=steps,
                     )
                 elif tmp_image:
                     pipe = self._get_pipe("i2v")
@@ -596,6 +653,7 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
+                        lora_paths=effective_loras,
                     )
                 else:
                     pipe = self._get_pipe("t2v")
@@ -608,6 +666,7 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
+                        lora_paths=effective_loras,
                     )
             except BaseException:
                 self._salvage_mp4_to_spill(tmpdir, out_path, req.job_id, req.prompt, "ENCODE_FAIL")
@@ -631,6 +690,12 @@ class LocalVideoGenerator:
                 (tmp_video, "fvserver_video_"),
             ):
                 if tmp and os.path.isfile(tmp) and marker in tmp:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+            for tmp in tmp_video_conditioning_cleanup:
+                if tmp and os.path.isfile(tmp) and "fvserver_vcond_" in tmp:
                     try:
                         os.unlink(tmp)
                     except OSError:

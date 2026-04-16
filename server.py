@@ -241,6 +241,48 @@ def _resolve_source_video_payload(msg: dict, session: dict) -> dict | str | None
     return None
 
 
+def _resolve_lora_specs(msg: dict, session: dict) -> list[tuple[str, float]]:
+    raw = msg.get("lora_paths") or session.get("lora_paths") or []
+    out: list[tuple[str, float]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            path = str(item[0]).strip()
+            try:
+                scale = float(item[1])
+            except (TypeError, ValueError):
+                continue
+            if path:
+                out.append((path, scale))
+        elif isinstance(item, str):
+            path = item.strip()
+            if path:
+                out.append((path, 1.0))
+    return out
+
+
+def _resolve_video_conditioning_specs(msg: dict, session: dict) -> list[tuple[dict | str, float]]:
+    raw = msg.get("video_conditioning") or session.get("video_conditioning") or []
+    out: list[tuple[dict | str, float]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            src = item[0]
+            if not isinstance(src, (dict, str)):
+                continue
+            try:
+                scale = float(item[1])
+            except (TypeError, ValueError):
+                continue
+            if src:
+                out.append((src, scale))
+        elif isinstance(item, (dict, str)) and item:
+            out.append((item, 1.0))
+    return out
+
+
 
 # ── Single-flight generation queue (in-memory, self-cleaning) ───────────────────
 
@@ -430,6 +472,8 @@ class RequestHandler:
         initial_image: dict | str | None = _resolve_initial_image_payload(msg, self._session)
         audio_input = _resolve_audio_payload(msg, self._session)
         source_video = _resolve_source_video_payload(msg, self._session)
+        lora_specs = _resolve_lora_specs(msg, self._session)
+        video_conditioning_specs = _resolve_video_conditioning_specs(msg, self._session)
 
         def _msg_int(name: str, default: int) -> int:
             raw = msg.get(name)
@@ -456,6 +500,8 @@ class RequestHandler:
                 mode = "extend" if ("extend" in str(msg.get("operation", "")).lower()) else "retake"
             elif audio_input:
                 mode = "a2v"
+            elif lora_specs and video_conditioning_specs:
+                mode = "ic_lora"
             else:
                 mode = "generate"
 
@@ -466,13 +512,15 @@ class RequestHandler:
             t_start = time.time()
             log.info(
                 "  ▶ generation %s  mode=%s  prompt=%r  image=%s  audio=%s  video=%s "
-                "seed=%s  %s×%s  frames=%s  steps=%s",
+                "loras=%s vcond=%s seed=%s  %s×%s  frames=%s  steps=%s",
                 generation_id,
                 mode,
                 prompt[:72],
                 "yes" if initial_image else "no",
                 "yes" if audio_input else "no",
                 "yes" if source_video else "no",
+                len(lora_specs),
+                len(video_conditioning_specs),
                 gen_seed,
                 gen_height,
                 gen_width,
@@ -541,6 +589,8 @@ class RequestHandler:
                         retake_end=gen_retake_end,
                         extend_frames=gen_extend_frames,
                         extend_direction=gen_extend_direction,
+                        lora_specs=lora_specs,
+                        video_conditioning_specs=video_conditioning_specs,
                         job_id=generation_id,
                     )
                 )
@@ -787,6 +837,17 @@ examples:
             "Missing files are fetched automatically (same as huggingface-cli download)."
         ),
     )
+    mdl.add_argument(
+        "--lora",
+        action="append",
+        nargs=2,
+        metavar=("LORA", "SCALE"),
+        default=None,
+        help=(
+            "Optional global LoRA applied to all requests; repeatable. "
+            "Format: --lora <local_path_or_hf_repo> <scale>"
+        ),
+    )
 
     vid = p.add_argument_group("video")
     vid.add_argument(
@@ -859,6 +920,17 @@ def main() -> None:
 
     if args.infer_steps < 1:
         parser.error("--infer-steps must be >= 1")
+    default_loras: list[tuple[str, float]] = []
+    if args.lora:
+        for item in args.lora:
+            path = str(item[0]).strip()
+            try:
+                scale = float(item[1])
+            except (TypeError, ValueError):
+                parser.error(f"invalid --lora scale: {item[1]!r}")
+            if not path:
+                parser.error("--lora path/repo cannot be empty")
+            default_loras.append((path, scale))
 
     # ── Validate / adjust num_frames ─────────────────────────────────────────
     valid_frames = _nearest_valid_frames(args.num_frames)
@@ -898,6 +970,8 @@ def main() -> None:
     print(f"  Video    : {args.num_frames} frames @ "
           f"{args.height}×{args.width}  {args.fps} fps")
     print(f"  Denoise  : {args.infer_steps} steps  (use --infer-steps to tune)")
+    if default_loras:
+        print(f"  LoRA     : {len(default_loras)} global spec(s) (applied to all requests)")
     print(f"  low_mem  : {args.mlx_low_memory}")
     print(f"{'═' * 60}\n")
 
@@ -914,6 +988,7 @@ def main() -> None:
         fps                 = float(args.fps),
         model_dir           = args.model_dir,
         inference_steps     = args.infer_steps,
+        default_lora_specs  = default_loras,
         spill_dir           = spill_dir,
         low_memory          = args.mlx_low_memory,
     )

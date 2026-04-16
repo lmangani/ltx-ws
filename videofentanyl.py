@@ -231,6 +231,8 @@ class GenerationParams:
     retake_end:                Optional[int] = None
     extend_frames:             Optional[int] = None
     extend_direction:      Optional[str] = None
+    lora_specs: list[tuple[str, float]] = dataclasses.field(default_factory=list)
+    video_conditioning_specs: list[tuple[dict, float]] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -350,6 +352,12 @@ def msg_simple_generate(p: GenerationParams) -> str:
         d["extend_frames"] = int(p.extend_frames)
     if p.extend_direction:
         d["extend_direction"] = str(p.extend_direction)
+    if p.lora_specs:
+        d["lora_paths"] = [[path, float(scale)] for path, scale in p.lora_specs]
+    if p.video_conditioning_specs:
+        d["video_conditioning"] = [
+            [payload, float(scale)] for payload, scale in p.video_conditioning_specs
+        ]
     return json.dumps(d)
 
 
@@ -1470,6 +1478,7 @@ def build_jobs(
     image_path:    str | None = None,
     audio_path:    str | None = None,
     video_path:    str | None = None,
+    video_conditioning_specs: list[tuple[dict, float]] | None = None,
 ) -> list[Job]:
     """
     Build the sequential job list.
@@ -1492,6 +1501,7 @@ def build_jobs(
                     initial_image=initial_image,
                     audio_input=audio_input,
                     source_video=source_video,
+                    video_conditioning_specs=video_conditioning_specs or [],
                     **params_kwargs,
                 ),
                 output_path=output_dir / fname,
@@ -1613,7 +1623,7 @@ examples:
     )
     gen.add_argument(
         "--generation-mode",
-        choices=("generate", "a2v", "retake", "extend"),
+        choices=("generate", "a2v", "retake", "extend", "ic_lora"),
         default="generate",
         help="local generation route (default: generate)",
     )
@@ -1650,6 +1660,22 @@ examples:
         choices=("before", "after"),
         default=None,
         help="extend direction for generation-mode=extend",
+    )
+    gen.add_argument(
+        "--lora",
+        action="append",
+        nargs=2,
+        metavar=("LORA", "SCALE"),
+        default=None,
+        help="LoRA spec for generation-mode=ic_lora; repeatable: --lora <path_or_repo> <scale>",
+    )
+    gen.add_argument(
+        "--video-conditioning",
+        action="append",
+        nargs=2,
+        metavar=("VIDEO", "SCALE"),
+        default=None,
+        help="Weighted conditioning video for generation-mode=ic_lora; repeatable",
     )
     gen.add_argument(
         "--preset-id",
@@ -1823,9 +1849,38 @@ async def async_main(args: argparse.Namespace):
         if args.extend_frames is None:
             print("Error: extend mode requires --extend-frames")
             sys.exit(2)
+    if args.generation_mode == "ic_lora":
+        if not args.lora:
+            print("Error: --generation-mode ic_lora requires at least one --lora <path_or_repo> <scale>")
+            sys.exit(2)
+        if not args.video_conditioning:
+            print("Error: --generation-mode ic_lora requires --video-conditioning <video> <scale>")
+            sys.exit(2)
     if args.num_steps is not None and args.num_steps < 1:
         print("Error: --num-steps must be >= 1")
         sys.exit(2)
+
+    lora_specs: list[tuple[str, float]] = []
+    if args.lora:
+        for entry in args.lora:
+            path = str(entry[0]).strip()
+            try:
+                scale = float(entry[1])
+            except (TypeError, ValueError):
+                print(f"Error: invalid LoRA scale: {entry[1]!r}")
+                sys.exit(2)
+            lora_specs.append((path, scale))
+
+    vc_specs: list[tuple[dict, float]] = []
+    if args.video_conditioning:
+        for entry in args.video_conditioning:
+            src = str(entry[0]).strip()
+            try:
+                scale = float(entry[1])
+            except (TypeError, ValueError):
+                print(f"Error: invalid video-conditioning scale: {entry[1]!r}")
+                sys.exit(2)
+            vc_specs.append((load_media_payload(src, kind="video"), scale))
 
     # ── Resolve mode-specific defaults ───────────────────────────────────────
     if args.idle_timeout is not None:
@@ -1870,6 +1925,7 @@ async def async_main(args: argparse.Namespace):
         "retake_end":              args.retake_end,
         "extend_frames":           args.extend_frames,
         "extend_direction":        args.extend_direction,
+        "lora_specs":              lora_specs,
     }
 
     # ── Build jobs ────────────────────────────────────────────────────────────
@@ -1885,6 +1941,7 @@ async def async_main(args: argparse.Namespace):
         image_path=args.image,
         audio_path=args.audio,
         video_path=args.video,
+        video_conditioning_specs=vc_specs,
     )
 
     segment_seconds: float | None = None
@@ -1925,6 +1982,10 @@ async def async_main(args: argparse.Namespace):
                     print(f"        video   : {job.params.source_video.get('name', 'video')}")
                 else:
                     print(f"        video   : {job.params.source_video}")
+            if job.params.lora_specs:
+                print(f"        loras   : {len(job.params.lora_specs)}")
+            if job.params.video_conditioning_specs:
+                print(f"        vcond   : {len(job.params.video_conditioning_specs)}")
             print()
         print(f"  Endpoint   : {_ws_url(mode)}")
         print(f"  Output dir : {output_dir.resolve()}")
