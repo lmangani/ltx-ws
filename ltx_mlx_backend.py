@@ -20,7 +20,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname, urlopen
 
 log = logging.getLogger("fvserver")
@@ -192,15 +192,23 @@ def _decode_initial_image_dict(image_data: dict) -> str:
     return path
 
 
-def _download_remote_to_temp(url: str, prefix: str, suffix_hint: str = "") -> str:
+def _download_remote_to_temp(
+    url: str,
+    prefix: str,
+    suffix_hint: str = "",
+    max_bytes: int | None = MAX_REMOTE_INPUT_BYTES,
+) -> str:
     req_url = (url or "").strip()
     if not req_url.startswith(("http://", "https://")):
         raise ValueError(f"Unsupported remote input URL: {url!r}")
     with urlopen(req_url, timeout=180) as resp:
-        payload = resp.read(MAX_REMOTE_INPUT_BYTES + 1)
-    if len(payload) > MAX_REMOTE_INPUT_BYTES:
+        if max_bytes is None:
+            payload = resp.read()
+        else:
+            payload = resp.read(max_bytes + 1)
+    if max_bytes is not None and len(payload) > max_bytes:
         raise RuntimeError(
-            f"Remote media exceeds {MAX_REMOTE_INPUT_BYTES // (1024 * 1024)} MiB limit"
+            f"Remote media exceeds {max_bytes // (1024 * 1024)} MiB limit"
         )
     fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix_hint)
     with os.fdopen(fd, "wb") as f:
@@ -239,7 +247,45 @@ def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
     if p.is_file():
         return str(p.resolve()), None
     if raw.startswith(("http://", "https://")):
-        tmp = _download_remote_to_temp(raw, "fvserver_lora_", ".safetensors")
+        parsed = urlparse(raw)
+        # Support Hugging Face resolve URLs directly by routing through hf_hub_download,
+        # which handles large files and cache efficiently.
+        if parsed.netloc.endswith("huggingface.co") and "/resolve/" in parsed.path:
+            parts = [p for p in parsed.path.strip("/").split("/") if p]
+            # Expected: <repo_owner>/<repo_name>/resolve/<revision>/<filename...>
+            if len(parts) >= 5 and parts[2] == "resolve":
+                repo_id = f"{parts[0]}/{parts[1]}"
+                revision = parts[3]
+                filename = "/".join(parts[4:])
+                try:
+                    from huggingface_hub import hf_hub_download
+                except ImportError as e:
+                    raise RuntimeError(
+                        "huggingface_hub is required to download LoRA from Hugging Face"
+                    ) from e
+                cache_root = _local_lora_cache_dir()
+                cache_root.mkdir(parents=True, exist_ok=True)
+                log.info(
+                    "Downloading/using cached LoRA %s (%s @ %s) …",
+                    repo_id,
+                    filename,
+                    revision,
+                )
+                local = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=filename,
+                    revision=revision,
+                    local_dir=str(cache_root / repo_id.replace("/", "__")),
+                )
+                return str(Path(local).resolve()), None
+
+        # Generic URL fallback (no 512MiB cap for LoRA artifacts).
+        tmp = _download_remote_to_temp(
+            raw,
+            "fvserver_lora_",
+            ".safetensors",
+            max_bytes=None,
+        )
         return tmp, tmp
 
     if looks_like_hf_repo_id(raw):
