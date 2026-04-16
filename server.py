@@ -85,15 +85,24 @@ websockets = _ensure("websockets")
 
 from ltx_mlx_backend import (
     LocalVideoGenerator,
-    hf_local_weights_directory,
     looks_like_hf_repo_id,
+    preview_mlx_weights_source,
 )
 
 # ── Constants / defaults ───────────────────────────────────────────────────────
 
 DEFAULT_HOST           = "0.0.0.0"
 DEFAULT_PORT           = 8765
-DEFAULT_MODEL          = "dgrauet/ltx-2.3-mlx"  # full bf16 weights; use -q4/-q8 for less RAM
+# Full bf16 HF repo (also used when RAM auto-select picks the largest variant).
+DEFAULT_MODEL          = "dgrauet/ltx-2.3-mlx"
+MODEL_AUTO             = "auto"  # --model default: pick HF repo from installed RAM
+MODEL_MLX_BF16       = DEFAULT_MODEL
+MODEL_MLX_Q8         = "dgrauet/ltx-2.3-mlx-q8"
+MODEL_MLX_Q4         = "dgrauet/ltx-2.3-mlx-q4"
+# Unified-memory Macs: hw.memsize is the relevant pool for MLX (no separate VRAM).
+RAM_GB_BF16_MIN      = 64.0
+RAM_GB_Q8_MIN        = 32.0
+RAM_GB_Q4_MIN        = 16.0
 DEFAULT_GLOBAL_LORA_PATH = (
     "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/"
     "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
@@ -115,6 +124,7 @@ ENV_DEFAULT_LORA = "LTX_WS_DEFAULT_LORA"
 ENV_DEFAULT_LORA_SCALE = "LTX_WS_DEFAULT_LORA_SCALE"
 ENV_DEFAULT_LORAS = "LTX_WS_DEFAULT_LORAS"  # comma-separated: path:scale,path:scale
 ENV_ENABLE_LORA = "LTX_WS_ENABLE_LORA"
+ENV_DEFAULT_MODEL = "LTX_WS_MODEL"  # if set, used as --model default when omitted (use "auto" or a repo id)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -163,6 +173,76 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if not raw:
         return default
     return raw in ("1", "true", "yes", "on", "y")
+
+
+def _parser_default_model_arg() -> str:
+    """Default for ``--model`` when the flag is omitted: ``$LTX_WS_MODEL`` or ``auto``."""
+    v = (os.environ.get(ENV_DEFAULT_MODEL) or "").strip()
+    return v if v else MODEL_AUTO
+
+
+def _physical_memory_bytes() -> int | None:
+    """Best-effort total physical RAM (bytes).
+
+    Apple Silicon uses unified memory for MLX (no separate VRAM bucket to query).
+    """
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["sysctl", "-n", "hw.memsize"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            return int(out)
+        except (subprocess.CalledProcessError, ValueError, OSError):
+            return None
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/meminfo", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        parts = line.split()
+                        return int(parts[1]) * 1024  # kB → bytes
+        except (OSError, ValueError, IndexError):
+            return None
+    return None
+
+
+def _select_hf_repo_for_ram(ram_bytes: int | None) -> tuple[str, str]:
+    """Return ``(HF repo id, short log line)`` for RAM-based auto model."""
+    if ram_bytes is None:
+        return (
+            MODEL_MLX_BF16,
+            f"RAM unknown — defaulting to {MODEL_MLX_BF16} (pass explicit --model to override)",
+        )
+    ram_gb = ram_bytes / (1024**3)
+    if ram_gb >= RAM_GB_BF16_MIN:
+        return MODEL_MLX_BF16, f"~{ram_gb:.1f} GiB RAM → bf16 ({MODEL_MLX_BF16})"
+    if ram_gb >= RAM_GB_Q8_MIN:
+        return MODEL_MLX_Q8, f"~{ram_gb:.1f} GiB RAM → int8 ({MODEL_MLX_Q8})"
+    if ram_gb >= RAM_GB_Q4_MIN:
+        return MODEL_MLX_Q4, f"~{ram_gb:.1f} GiB RAM → int4 ({MODEL_MLX_Q4})"
+    return (
+        MODEL_MLX_Q4,
+        f"~{ram_gb:.1f} GiB RAM (below {RAM_GB_Q4_MIN:.0f} GiB guidance) → int4 ({MODEL_MLX_Q4}); "
+        "expect memory pressure",
+    )
+
+
+def _resolve_model_cli_value(raw: str) -> tuple[str, str | None]:
+    """Expand ``auto`` to an HF repo; explicit repo ids and local paths pass through.
+
+    Returns ``(resolved_model, auto_note)`` where ``auto_note`` is set only when
+    ``raw`` was ``auto`` (case-insensitive).
+    """
+    s = (raw or "").strip()
+    if not s:
+        return raw, None
+    if s.lower() != MODEL_AUTO.lower():
+        return s, None
+    mem = _physical_memory_bytes()
+    repo, note = _select_hf_repo_for_ram(mem)
+    return repo, note
 
 
 def _spill_slug(prompt: str, maxlen: int = 48) -> str:
@@ -876,19 +956,26 @@ examples:
 
     mdl = p.add_argument_group("model")
     mdl.add_argument(
-        "--model", default=DEFAULT_MODEL,
+        "--model",
+        default=_parser_default_model_arg(),
         help=(
-            f"HuggingFace MLX weights repo or local directory "
-            f"(default: {DEFAULT_MODEL}; large download, ~64GB+ RAM typical). "
-            f"See ltx-2-mlx README for quantized variants (q4/q8)."
+            "HuggingFace MLX weights repo, local directory, or "
+            f"'{MODEL_AUTO}' (default when flag omitted: {MODEL_AUTO}, "
+            f"unless ${ENV_DEFAULT_MODEL} is set). "
+            f"'{MODEL_AUTO}' maps RAM → bf16 (≥{RAM_GB_BF16_MIN:.0f} GiB), "
+            f"q8 (≥{RAM_GB_Q8_MIN:.0f} GiB), q4 otherwise; "
+            "Apple Silicon uses unified memory (no separate VRAM). "
+            "Any explicit repo id or path skips auto-selection."
         ),
     )
     mdl.add_argument(
         "--model-dir", default=None, dest="model_dir", metavar="DIR",
         help=(
-            "When --model is a HuggingFace repo id, store snapshot_download here. "
-            "If omitted, uses ./models/<org>__<name>/ or $VIDEOFENTANYL_MODELS/<org>__<name>/. "
-            "Missing files are fetched automatically (same as huggingface-cli download)."
+            "When --model is a HuggingFace repo id, store snapshot_download here "
+            "(default: ./models/<org>__<name>/ or $VIDEOFENTANYL_MODELS/…). "
+            "When --model is a shorthand or non-path label, may point at an existing "
+            "local weights directory (see README). "
+            "Missing Hub files are fetched automatically."
         ),
     )
     mdl.add_argument(
@@ -983,6 +1070,13 @@ def main() -> None:
     parser = build_parser()
     args   = parser.parse_args()
 
+    if not (args.model or "").strip():
+        parser.error("--model cannot be empty")
+    resolved_model, model_auto_note = _resolve_model_cli_value(args.model)
+    args.model = resolved_model
+    if model_auto_note:
+        log.info("Model selection: %s", model_auto_note)
+
     if args.infer_steps < 1:
         parser.error("--infer-steps must be >= 1")
     default_loras: list[tuple[str, float]] = []
@@ -1021,19 +1115,19 @@ def main() -> None:
         )
         args.height, args.width = ah, aw
 
-    # ── Banner ────────────────────────────────────────────────────────────────
-    _mp = Path(args.model).expanduser()
-    _model_is_local = _mp.is_dir()
-    if _model_is_local:
-        _model_source = f"local  ({args.model})"
-    elif looks_like_hf_repo_id(args.model):
-        _dest = hf_local_weights_directory(args.model, args.model_dir)
-        _model_source = f"HuggingFace → {_dest}  ({args.model})"
+    # ── Banner (preview paths only; Hub download happens in generator.load()) ─
+    _preview = preview_mlx_weights_source(args.model, args.model_dir)
+    if looks_like_hf_repo_id(args.model):
+        _model_source = f"HuggingFace → {_preview}  ({args.model})"
+    elif Path(_preview).is_dir():
+        _model_source = f"local  ({_preview})"
     else:
-        _model_source = f"{args.model}"
+        _model_source = f"{args.model}  (expected: {_preview})"
     print(f"\n{'═' * 60}")
     print(f"  LTX local server (MLX · ltx-2-mlx)")
     print(f"  Model    : {_model_source}")
+    if model_auto_note:
+        print(f"  RAM pick : {model_auto_note}")
     print(f"  Runtime  : Apple Silicon / MLX")
     print(f"  Endpoint : ws://{args.host}:{args.port}/ws")
     print(f"  Video    : {args.num_frames} frames @ "

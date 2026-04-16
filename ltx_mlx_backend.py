@@ -116,6 +116,118 @@ def hf_local_weights_directory(repo_id: str, explicit_model_dir: str | None) -> 
     return (root / safe).resolve()
 
 
+def _looks_like_models_dir_leaf(name: str) -> bool:
+    """True if ``name`` is a single path segment (safe to join under ``models/``)."""
+    s = (name or "").strip()
+    if not s or s in (".", "..") or s.startswith(".."):
+        return False
+    if "/" in s or "\\" in s:
+        return False
+    return Path(s).name == s
+
+
+def _path_candidates_for_user_string(user_path: str) -> list[Path]:
+    """For a filesystem path string: absolutes resolve once; relatives try cwd then repo root.
+
+    This fixes ``python /path/to/server.py`` started from ``$HOME`` where
+    ``./models/foo`` must resolve next to the checkout, not under ``$HOME``.
+    """
+    raw = (user_path or "").strip()
+    if not raw:
+        return []
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return [p.resolve()]
+    return [(Path.cwd() / p).resolve(), (REPO_ROOT / p).resolve()]
+
+
+def _first_existing_dir(user_path: str) -> Path | None:
+    for c in _path_candidates_for_user_string(user_path):
+        if c.is_dir():
+            return c
+    return None
+
+
+def _resolve_non_hf_disk_path(model: str, explicit_model_dir: str | None) -> str | None:
+    """
+    Resolve to an existing weights directory without calling the Hub.
+
+    Tries: ``--model`` as a directory path (cwd, then repo root for relatives),
+    then ``--model-dir`` the same way, then ``models/<model>/`` under cwd and
+    under repo root for a shorthand leaf (e.g. ``ltx-2.3-mlx``).
+    """
+    raw = (model or "").strip()
+    if not raw:
+        return None
+
+    hit = _first_existing_dir(raw)
+    if hit is not None:
+        return str(hit)
+
+    md = (explicit_model_dir or "").strip()
+    if md:
+        hit = _first_existing_dir(md)
+        if hit is not None:
+            return str(hit)
+
+    if _looks_like_models_dir_leaf(raw):
+        leaf = Path(raw).name
+        for base in (Path.cwd(), REPO_ROOT):
+            candidate = (base / "models" / leaf).resolve()
+            try:
+                candidate.relative_to(base.resolve())
+            except ValueError:
+                continue
+            if candidate.is_dir():
+                return str(candidate)
+
+    return None
+
+
+def preview_mlx_weights_source(model: str, explicit_model_dir: str | None) -> str:
+    """Where weights are expected on disk (for UI); may not exist yet for fresh HF pulls."""
+    raw = (model or "").strip()
+    got = _resolve_non_hf_disk_path(raw, explicit_model_dir)
+    if got is not None:
+        return got
+    if looks_like_hf_repo_id(raw):
+        return str(hf_local_weights_directory(raw, explicit_model_dir))
+    return raw
+
+
+def resolve_mlx_weights_directory(model: str, explicit_model_dir: str | None) -> str:
+    """Resolve ``model`` and optional ``explicit_model_dir`` to an on-disk MLX weights tree."""
+    raw = (model or "").strip()
+    disk = _resolve_non_hf_disk_path(raw, explicit_model_dir)
+    if disk is not None:
+        return disk
+
+    if looks_like_hf_repo_id(raw):
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as e:
+            raise RuntimeError(
+                "huggingface_hub is required to download MLX weights from Hugging Face. "
+                "Install with:  pip install huggingface_hub\n"
+                "Or use a local directory for --model."
+            ) from e
+        dest = hf_local_weights_directory(raw, explicit_model_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+        if _model_snapshot_present(dest):
+            log.info("Using existing local MLX snapshot for %r at %s", raw, dest)
+            return str(dest)
+        log.info(
+            "Ensuring Hugging Face weights %r under %s "
+            "(huggingface_hub.snapshot_download; same payload as `huggingface-cli download`) …",
+            raw,
+            dest,
+        )
+        _snapshot_download_weights(snapshot_download, raw, dest)
+        return str(dest)
+
+    return raw
+
+
 def _spill_slug(prompt: str, maxlen: int = 48) -> str:
     s = re.sub(r"[^\w\s-]+", "", prompt.lower().strip())[:maxlen]
     s = re.sub(r"[\s_]+", "_", s).strip("_")
@@ -451,35 +563,7 @@ class LocalVideoGenerator:
         self._resolved_default_loras: list[tuple[str, float]] | None = None
 
     def _resolve_model_dir(self) -> str:
-        raw = (self.model or "").strip()
-        local = Path(raw).expanduser()
-        if local.is_dir():
-            return str(local.resolve())
-
-        if looks_like_hf_repo_id(raw):
-            try:
-                from huggingface_hub import snapshot_download
-            except ImportError as e:
-                raise RuntimeError(
-                    "huggingface_hub is required to download MLX weights from Hugging Face. "
-                    "Install with:  pip install huggingface_hub\n"
-                    "Or use a local directory for --model."
-                ) from e
-            dest = hf_local_weights_directory(raw, self.model_dir)
-            dest.mkdir(parents=True, exist_ok=True)
-            if _model_snapshot_present(dest):
-                log.info("Using existing local MLX snapshot for %r at %s", raw, dest)
-                return str(dest)
-            log.info(
-                "Ensuring Hugging Face weights %r under %s "
-                "(huggingface_hub.snapshot_download; same payload as `huggingface-cli download`) …",
-                raw,
-                dest,
-            )
-            _snapshot_download_weights(snapshot_download, raw, dest)
-            return str(dest)
-
-        return raw
+        return resolve_mlx_weights_directory(self.model, self.model_dir)
 
     def load(self) -> None:
         if self._model_path is not None:

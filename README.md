@@ -69,17 +69,47 @@ Use `pip` instead of `uv pip` if you prefer.
 
 ## Model weights
 
-1. **Hugging Face repo id** (default `dgrauet/ltx-2.3-mlx`) — On first `server.py` startup, weights are downloaded under `./models/dgrauet__ltx-2.3-mlx/` (unless overridden).
+1. **Hugging Face repo id** — On first `server.py` startup, weights are downloaded under `./models/<org>__<name>/` (unless `--model-dir` or `$VIDEOFENTANYL_MODELS` applies).
 2. **Local directory** — Pass an existing folder path to `--model` instead of `org/name`.
+
+**Single-folder names (e.g. `./models/ltx-2.3-mlx/`)**
+
+Hugging Face ids look like `author/model` (with a **slash**). A bare name like `ltx-2.3-mlx` is **not** a Hub id; if it is passed through unchanged, `ltx_pipelines_mlx` may try `https://huggingface.co/ltx-2.3-mlx` and fail with **404**.
+
+The server resolves local weights in this order before any Hub download:
+
+1. `--model` is an existing directory path (relative or absolute). For **relative** paths it checks **the current working directory first**, then the **repository root** (the folder that contains `ltx_mlx_backend.py`), so you can start the server from another directory and still use `./models/...` next to the checkout.
+2. **`--model-dir`** uses the same rule (cwd, then repo root) when the path is relative.
+3. **`<repo>/models/<name>/`** and **`./models/<name>/` from cwd** for a shorthand leaf name (no `/` in `<name>`) — then `--model <name>` alone is enough if one of those folders exists.
+
+**RAM-based default (`--model` omitted or `auto`)**
+
+If you do not pass `--model`, the server defaults to **`auto`**: it reads total physical RAM (on macOS, `sysctl hw.memsize`; Apple Silicon uses **unified memory**, so this is the same pool MLX uses—there is no separate VRAM to probe) and picks a pre-converted MLX repo:
+
+| Variant | Hugging Face repo | Approx. weights | Auto when RAM is |
+|--------|-------------------|-----------------|------------------|
+| bf16 | `dgrauet/ltx-2.3-mlx` | ~42 GB | **≥ 64 GiB** |
+| int8 | `dgrauet/ltx-2.3-mlx-q8` | ~21 GiB | **≥ 32 GiB** and under 64 GiB |
+| int4 | `dgrauet/ltx-2.3-mlx-q4` | ~12 GiB | **under 32 GiB** (still chosen if RAM is below 16 GiB, with a startup warning) |
+
+Pass an explicit **`--model <repo or path>`** to skip auto-selection. You can also set **`LTX_WS_MODEL`** to the default when the flag is omitted (e.g. `LTX_WS_MODEL=dgrauet/ltx-2.3-mlx-q8` or `LTX_WS_MODEL=auto`).
 
 **Practical defaults**
 
 ```bash
+# Same as omitting --model: resolve from installed RAM
+python server.py --model auto
+
 # Smaller quantised model (recommended for many machines)
 python server.py --model dgrauet/ltx-2.3-mlx-q8
 
 # Explicit download directory
 python server.py --model dgrauet/ltx-2.3-mlx-q4 --model-dir "$HOME/mlx-weights/ltx-q4"
+
+# Custom snapshot folder under ./models/ (any of these work if the directory exists)
+python server.py --model ./models/ltx-2.3-mlx
+python server.py --model ltx-2.3-mlx
+python server.py --model ltx-2.3-mlx --model-dir ./models/ltx-2.3-mlx
 ```
 
 ---
@@ -99,11 +129,18 @@ python server.py --port 9000
 python server.py --model dgrauet/ltx-2.3-mlx-q8 --infer-steps 8 --num-frames 65
 python server.py --height 512 --width 768 --mlx-low-memory
 python server.py --enable-lora --lora Kijai/LTX2.3_comfy 1.0
+# multiple LoRAs (repeat --lora)
+python server.py --enable-lora \
+  --lora Kijai/LTX2.3_comfy 1.0 \
+  --lora /path/to/another_lora.safetensors 0.6
 # enable default LoRA via env
 LTX_WS_ENABLE_LORA=1 python server.py
 # override default LoRA via env (still requires enable)
 LTX_WS_DEFAULT_LORA="https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors" \
 LTX_WS_DEFAULT_LORA_SCALE="1.0" LTX_WS_ENABLE_LORA=1 python server.py
+# multi-default via env (comma-separated path:scale)
+LTX_WS_DEFAULT_LORAS="Kijai/LTX2.3_comfy:1.0,/path/to/another_lora.safetensors:0.6" \
+LTX_WS_ENABLE_LORA=1 python server.py
 ```
 
 ---
@@ -141,6 +178,53 @@ python videofentanyl.py --server ws://127.0.0.1:8765/ws \
 python videofentanyl.py --server ws://127.0.0.1:8765/ws \
   --prompt "timelapse" --count 3 --autocontinue --autoconcat
 ```
+
+### Duration and aspect-ratio examples
+
+`--num-frames` controls clip duration (`seconds ≈ frames / 24`).  
+Use `8k+1` frame counts (for example: `49`, `97`, `121`, `193`).
+
+```bash
+# ~2.0s clip (49 / 24)
+python videofentanyl.py --server ws://127.0.0.1:8765/ws \
+  --prompt "cinematic close-up of a singer" --num-frames 49
+
+# ~4.0s clip (97 / 24)
+python videofentanyl.py --server ws://127.0.0.1:8765/ws \
+  --prompt "a fox running through snow" --num-frames 97
+
+# ~5.0s clip (121 / 24)
+python videofentanyl.py --server ws://127.0.0.1:8765/ws \
+  --prompt "street dance performance at night" --num-frames 121
+```
+
+Social/vertical outputs are controlled with `--height` and `--width` (server snaps to multiples of 32):
+
+```bash
+# 9:16 vertical (stories/reels style), text-to-video
+python videofentanyl.py --server ws://127.0.0.1:8765/ws \
+  --prompt "fashion model walking through neon alley" \
+  --height 1024 --width 576 --num-frames 97
+
+# 9:16 vertical with starting image (image-to-video)
+python videofentanyl.py --server ws://127.0.0.1:8765/ws \
+  --prompt "slow cinematic movement, subtle wind in hair" \
+  --image ./vertical_start.jpg \
+  --height 1024 --width 576 --num-frames 121
+
+# 4:5 vertical post format with starting image
+python videofentanyl.py --server ws://127.0.0.1:8765/ws \
+  --prompt "product reveal with soft studio lighting" \
+  --image ./post_4x5.jpg \
+  --height 960 --width 768 --num-frames 97
+
+# 1:1 square format
+python videofentanyl.py --server ws://127.0.0.1:8765/ws \
+  --prompt "loopable abstract animation" \
+  --height 768 --width 768 --num-frames 97
+```
+
+Tip: when using a starting image, match `--height/--width` to the image orientation for best framing (portrait source image + portrait output).
 
 **Dry-run** (print queue, no network):
 
@@ -207,10 +291,10 @@ The client implements this flow for `--mode ltx` when `--server` is set.
 |--------|---------|-------------|
 | `--host` | `0.0.0.0` | Bind address. |
 | `--port` | `8765` | TCP port; path **`/ws`**. |
-| `--model` | `dgrauet/ltx-2.3-mlx` | HF repo id or local weights directory. |
+| `--model` | `auto` (or `$LTX_WS_MODEL`) | HF repo id, local weights directory, or **`auto`** (RAM → bf16 / q8 / q4; see [Model weights](#model-weights)). |
 | `--model-dir` | *(see Models)* | Store HF snapshot here; overrides default `./models/<org>__<name>/`. |
 | `--enable-lora` | off | Enable global LoRA handling on the server. |
-| `--lora <path_or_repo_or_url> <scale>` | off unless enabled | Global LoRA(s) applied to all requests; repeat flag to stack multiple LoRAs. |
+| `--lora <path_or_repo_or_url> <scale>` | off unless enabled | Global LoRA(s) applied to all requests; **repeat flag** to stack multiple LoRAs. |
 | `--num-frames` | `97` | Target length; adjusted to **8k+1** (e.g. 9, 25, 49, 97). |
 | `--height` | `480` | Snapped to multiple of **32**. |
 | `--width` | `704` | Snapped to multiple of **32**. |
@@ -226,7 +310,7 @@ When enabled, LoRA defaults can be configured in `server.py` constants and overr
 - `LTX_WS_ENABLE_LORA`
 - `LTX_WS_DEFAULT_LORA`
 - `LTX_WS_DEFAULT_LORA_SCALE`
-- `LTX_WS_DEFAULT_LORAS` (comma-separated `path:scale,path:scale`)
+- `LTX_WS_DEFAULT_LORAS` (comma-separated `path:scale,path:scale`) for multiple defaults
 
 LoRA artifacts are resolved from local path, URL, or Hugging Face repo id. Downloaded LoRAs are cached under `./loras/` by default; override with:
 - `VIDEOFENTANYL_LORA_DIR`
