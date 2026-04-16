@@ -556,6 +556,11 @@ class LocalVideoGenerator:
     def model_progress_for_ws(self) -> dict[str, Any] | None:
         return None
 
+    def default_lora_count(self) -> int:
+        if self._resolved_default_loras is not None:
+            return len(self._resolved_default_loras)
+        return len(self.default_lora_specs)
+
     async def generate(
         self,
         prompt: str,
@@ -709,6 +714,14 @@ class LocalVideoGenerator:
                     resolved_loras.append((lora_path, float(lora_scale)))
                     if lora_cleanup:
                         tmp_lora_cleanup.append(lora_cleanup)
+            if resolved_loras:
+                log.info(
+                    "Applying %d LoRA(s) for mode=%s (request=%d, defaults=%d)",
+                    len(resolved_loras),
+                    mode,
+                    len(req.lora_specs or []),
+                    self.default_lora_count(),
+                )
 
             try:
                 if mode == "a2v":

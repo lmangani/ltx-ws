@@ -525,6 +525,7 @@ class RequestHandler:
         source_video = _resolve_source_video_payload(msg, self._session)
         lora_specs = _resolve_lora_specs(msg, self._session)
         video_conditioning_specs = _resolve_video_conditioning_specs(msg, self._session)
+        total_loras = len(lora_specs) + self.generator.default_lora_count()
 
         def _msg_int(name: str, default: int) -> int:
             raw = msg.get(name)
@@ -563,14 +564,16 @@ class RequestHandler:
             t_start = time.time()
             log.info(
                 "  ▶ generation %s  mode=%s  prompt=%r  image=%s  audio=%s  video=%s "
-                "loras=%s vcond=%s seed=%s  %s×%s  frames=%s  steps=%s",
+                "loras=%s (req=%s default=%s) vcond=%s seed=%s  %s×%s  frames=%s  steps=%s",
                 generation_id,
                 mode,
                 prompt[:72],
                 "yes" if initial_image else "no",
                 "yes" if audio_input else "no",
                 "yes" if source_video else "no",
+                total_loras,
                 len(lora_specs),
+                self.generator.default_lora_count(),
                 len(video_conditioning_specs),
                 gen_seed,
                 gen_height,
