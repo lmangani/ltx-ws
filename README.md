@@ -98,7 +98,12 @@ Useful variants:
 python server.py --port 9000
 python server.py --model dgrauet/ltx-2.3-mlx-q8 --infer-steps 8 --num-frames 65
 python server.py --height 512 --width 768 --mlx-low-memory
-python server.py --lora Kijai/LTX2.3_comfy 1.0
+python server.py --enable-lora --lora Kijai/LTX2.3_comfy 1.0
+# enable default LoRA via env
+LTX_WS_ENABLE_LORA=1 python server.py
+# override default LoRA via env (still requires enable)
+LTX_WS_DEFAULT_LORA="https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors" \
+LTX_WS_DEFAULT_LORA_SCALE="1.0" LTX_WS_ENABLE_LORA=1 python server.py
 ```
 
 ---
@@ -204,7 +209,8 @@ The client implements this flow for `--mode ltx` when `--server` is set.
 | `--port` | `8765` | TCP port; path **`/ws`**. |
 | `--model` | `dgrauet/ltx-2.3-mlx` | HF repo id or local weights directory. |
 | `--model-dir` | *(see Models)* | Store HF snapshot here; overrides default `./models/<org>__<name>/`. |
-| `--lora <path_or_repo> <scale>` | off | Global LoRA(s) applied to all requests; repeat flag to stack multiple LoRAs. |
+| `--enable-lora` | off | Enable global LoRA handling on the server. |
+| `--lora <path_or_repo_or_url> <scale>` | off unless enabled | Global LoRA(s) applied to all requests; repeat flag to stack multiple LoRAs. |
 | `--num-frames` | `97` | Target length; adjusted to **8k+1** (e.g. 9, 25, 49, 97). |
 | `--height` | `480` | Snapped to multiple of **32**. |
 | `--width` | `704` | Snapped to multiple of **32**. |
@@ -214,6 +220,13 @@ The client implements this flow for `--mode ltx` when `--server` is set.
 | `--chunk-size` | `65536` | Max bytes per WebSocket binary frame. |
 | `--spill-dir` | `fvserver_completed` | Salvage directory on client disconnect. |
 | `--verbose` | off | Extra per-connection logs. |
+
+Default global LoRA is **disabled unless enabled** with `--enable-lora` (or env below).  
+When enabled, LoRA defaults can be configured in `server.py` constants and overridden via env:
+- `LTX_WS_ENABLE_LORA`
+- `LTX_WS_DEFAULT_LORA`
+- `LTX_WS_DEFAULT_LORA_SCALE`
+- `LTX_WS_DEFAULT_LORAS` (comma-separated `path:scale,path:scale`)
 
 ---
 

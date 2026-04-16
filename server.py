@@ -94,6 +94,11 @@ from ltx_mlx_backend import (
 DEFAULT_HOST           = "0.0.0.0"
 DEFAULT_PORT           = 8765
 DEFAULT_MODEL          = "dgrauet/ltx-2.3-mlx"  # full bf16 weights; use -q4/-q8 for less RAM
+DEFAULT_GLOBAL_LORA_PATH = (
+    "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/"
+    "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
+)
+DEFAULT_GLOBAL_LORA_SCALE = 1.0
 DEFAULT_NUM_FRAMES     = 97    # ~4 s @ 24 fps; LTX requires (8k+1) frames: 9, 17, 25, … 97, 105, …
 DEFAULT_HEIGHT         = 480
 DEFAULT_WIDTH          = 704   # MLX LTX default width; must be multiple of 32
@@ -106,12 +111,58 @@ GENERATION_KEEPALIVE_INTERVAL_S = 15.0
 # e.g. 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 121, 129
 LTX2_SPATIAL_ALIGN = 32
 
+ENV_DEFAULT_LORA = "LTX_WS_DEFAULT_LORA"
+ENV_DEFAULT_LORA_SCALE = "LTX_WS_DEFAULT_LORA_SCALE"
+ENV_DEFAULT_LORAS = "LTX_WS_DEFAULT_LORAS"  # comma-separated: path:scale,path:scale
+ENV_ENABLE_LORA = "LTX_WS_ENABLE_LORA"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("fvserver")
+
+
+def _default_loras_from_env() -> list[tuple[str, float]]:
+    multi = (os.environ.get(ENV_DEFAULT_LORAS) or "").strip()
+    if multi:
+        specs: list[tuple[str, float]] = []
+        for part in multi.split(","):
+            entry = part.strip()
+            if not entry:
+                continue
+            if ":" in entry:
+                path, s = entry.rsplit(":", 1)
+                try:
+                    scale = float(s.strip())
+                except ValueError:
+                    continue
+            else:
+                path = entry
+                scale = 1.0
+            path = path.strip()
+            if path:
+                specs.append((path, scale))
+        if specs:
+            return specs
+
+    path = os.environ.get(ENV_DEFAULT_LORA, DEFAULT_GLOBAL_LORA_PATH).strip()
+    if not path:
+        return []
+    scale_raw = os.environ.get(ENV_DEFAULT_LORA_SCALE, str(DEFAULT_GLOBAL_LORA_SCALE)).strip()
+    try:
+        scale = float(scale_raw)
+    except ValueError:
+        scale = DEFAULT_GLOBAL_LORA_SCALE
+    return [(path, scale)]
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on", "y")
 
 
 def _spill_slug(prompt: str, maxlen: int = 48) -> str:
@@ -845,7 +896,18 @@ examples:
         default=None,
         help=(
             "Optional global LoRA applied to all requests; repeatable. "
-            "Format: --lora <local_path_or_hf_repo> <scale>"
+            "Format: --lora <local_path_or_hf_repo_or_url> <scale>. "
+            f"Default comes from {ENV_DEFAULT_LORA}/{ENV_DEFAULT_LORA_SCALE} "
+            f"or {ENV_DEFAULT_LORAS}."
+        ),
+    )
+    mdl.add_argument(
+        "--enable-lora",
+        action="store_true",
+        default=_env_bool(ENV_ENABLE_LORA, False),
+        help=(
+            "Enable global LoRA loading. Disabled by default. "
+            f"Can also be enabled via {ENV_ENABLE_LORA}=1"
         ),
     )
 
@@ -921,7 +983,11 @@ def main() -> None:
     if args.infer_steps < 1:
         parser.error("--infer-steps must be >= 1")
     default_loras: list[tuple[str, float]] = []
+    if args.enable_lora:
+        default_loras = _default_loras_from_env()
     if args.lora:
+        if not args.enable_lora:
+            parser.error("--lora requires --enable-lora")
         for item in args.lora:
             path = str(item[0]).strip()
             try:
@@ -970,8 +1036,12 @@ def main() -> None:
     print(f"  Video    : {args.num_frames} frames @ "
           f"{args.height}×{args.width}  {args.fps} fps")
     print(f"  Denoise  : {args.infer_steps} steps  (use --infer-steps to tune)")
-    if default_loras:
+    if args.enable_lora and default_loras:
         print(f"  LoRA     : {len(default_loras)} global spec(s) (applied to all requests)")
+    elif args.enable_lora:
+        print("  LoRA     : enabled (no defaults configured)")
+    else:
+        print("  LoRA     : disabled (use --enable-lora)")
     print(f"  low_mem  : {args.mlx_low_memory}")
     print(f"{'═' * 60}\n")
 

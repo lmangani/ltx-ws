@@ -34,6 +34,7 @@ _HF_REPO_ID_RE = re.compile(
 )
 REPO_ROOT = Path(__file__).resolve().parent
 VIDEOFENTANYL_MODELS_ENV = "VIDEOFENTANYL_MODELS"
+VIDEOFENTANYL_LORA_DIR_ENV = "VIDEOFENTANYL_LORA_DIR"
 MAX_REMOTE_INPUT_BYTES = 512 * 1024 * 1024  # 512 MiB safety ceiling for remote audio/video
 
 
@@ -205,6 +206,60 @@ def _download_remote_to_temp(url: str, prefix: str, suffix_hint: str = "") -> st
     with os.fdopen(fd, "wb") as f:
         f.write(payload)
     return path
+
+
+def _local_lora_cache_dir() -> Path:
+    env = (os.environ.get(VIDEOFENTANYL_LORA_DIR_ENV) or "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    return (REPO_ROOT / "loras").resolve()
+
+
+def _pick_safetensors_file(root: Path) -> Path | None:
+    candidates = sorted(root.rglob("*.safetensors"))
+    if not candidates:
+        return None
+    # Prefer explicit loras/ subdir when present.
+    for c in candidates:
+        if "loras" in {p.lower() for p in c.parts}:
+            return c
+    return candidates[0]
+
+
+def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
+    """
+    Resolve LoRA spec to a local safetensors path.
+    Returns (path, cleanup_temp_path_or_none).
+    """
+    raw = (spec or "").strip()
+    if not raw:
+        raise ValueError("Empty LoRA spec")
+
+    p = Path(raw).expanduser()
+    if p.is_file():
+        return str(p.resolve()), None
+    if raw.startswith(("http://", "https://")):
+        tmp = _download_remote_to_temp(raw, "fvserver_lora_", ".safetensors")
+        return tmp, tmp
+
+    if looks_like_hf_repo_id(raw):
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as e:
+            raise RuntimeError(
+                "huggingface_hub is required to download LoRA from Hugging Face"
+            ) from e
+        dest_root = _local_lora_cache_dir()
+        dest = (dest_root / raw.replace("/", "__")).resolve()
+        dest.mkdir(parents=True, exist_ok=True)
+        snap = _snapshot_download_weights(snapshot_download, raw, dest)
+        snap_path = Path(snap)
+        lora_file = _pick_safetensors_file(snap_path)
+        if lora_file is None:
+            raise RuntimeError(f"No .safetensors LoRA file found under {snap_path}")
+        return str(lora_file.resolve()), None
+
+    raise FileNotFoundError(f"LoRA spec not found or unsupported: {raw}")
 
 
 def _decode_media_input(
@@ -531,11 +586,13 @@ class LocalVideoGenerator:
         effective_loras: list[tuple[str, float]] = []
         effective_loras.extend(self.default_lora_specs)
         effective_loras.extend(req.lora_specs or [])
+        resolved_loras: list[tuple[str, float]] = []
 
         tmp_image: str | None = None
         tmp_audio: str | None = None
         tmp_video: str | None = None
         tmp_video_conditioning_cleanup: list[str] = []
+        tmp_lora_cleanup: list[str] = []
         prefix = f"fv_{req.job_id[:8]}_" if req.job_id else "fvserver_out_"
         tmpdir = tempfile.mkdtemp(prefix=prefix)
         out_path = os.path.join(tmpdir, "output.mp4")
@@ -566,6 +623,11 @@ class LocalVideoGenerator:
                 default_suffix=".mp4",
             )
             tmp_video_conditioning_cleanup = vc_cleanup
+            for lora_spec, lora_scale in effective_loras:
+                lora_path, lora_cleanup = _resolve_lora_path(str(lora_spec))
+                resolved_loras.append((lora_path, float(lora_scale)))
+                if lora_cleanup:
+                    tmp_lora_cleanup.append(lora_cleanup)
 
             try:
                 if mode == "a2v":
@@ -581,7 +643,7 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
-                        lora_paths=effective_loras,
+                        lora_paths=resolved_loras,
                     )
                 elif mode == "retake":
                     if not tmp_video:
@@ -601,7 +663,7 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
-                        lora_paths=effective_loras,
+                        lora_paths=resolved_loras,
                     )
                 elif mode == "extend":
                     if not tmp_video:
@@ -621,10 +683,10 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
-                        lora_paths=effective_loras,
+                        lora_paths=resolved_loras,
                     )
                 elif mode == "ic_lora":
-                    if not effective_loras:
+                    if not resolved_loras:
                         raise RuntimeError("ic_lora mode requires at least one LoRA spec")
                     if not vc_items:
                         raise RuntimeError("ic_lora mode requires video_conditioning entries")
@@ -633,7 +695,7 @@ class LocalVideoGenerator:
                         pipe,
                         prompt=req.prompt,
                         output_path=out_path,
-                        lora_paths=[(str(p), float(s)) for p, s in effective_loras],
+                        lora_paths=[(str(p), float(s)) for p, s in resolved_loras],
                         video_conditioning=[(str(p), float(s)) for p, s in vc_items],
                         height=height,
                         width=width,
@@ -653,7 +715,7 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
-                        lora_paths=effective_loras,
+                        lora_paths=resolved_loras,
                     )
                 else:
                     pipe = self._get_pipe("t2v")
@@ -666,7 +728,7 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
-                        lora_paths=effective_loras,
+                        lora_paths=resolved_loras,
                     )
             except BaseException:
                 self._salvage_mp4_to_spill(tmpdir, out_path, req.job_id, req.prompt, "ENCODE_FAIL")
@@ -696,6 +758,12 @@ class LocalVideoGenerator:
                         pass
             for tmp in tmp_video_conditioning_cleanup:
                 if tmp and os.path.isfile(tmp) and "fvserver_vcond_" in tmp:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+            for tmp in tmp_lora_cleanup:
+                if tmp and os.path.isfile(tmp) and "fvserver_lora_" in tmp:
                     try:
                         os.unlink(tmp)
                     except OSError:
