@@ -402,6 +402,7 @@ class LocalVideoGenerator:
         self._model_path: str | None = None
         self._pipe_classes: dict[str, Any] = {}
         self._pipes: dict[str, Any] = {}
+        self._resolved_default_loras: list[tuple[str, float]] | None = None
 
     def _resolve_model_dir(self) -> str:
         raw = (self.model or "").strip()
@@ -477,6 +478,34 @@ class LocalVideoGenerator:
         self._pipes[key] = pipe
         log.info("MLX pipeline ready ✓ (%s)", key)
         return pipe
+
+    def _resolve_lora_specs(self, specs: list[tuple[str, float]]) -> tuple[list[tuple[str, float]], list[str]]:
+        resolved: list[tuple[str, float]] = []
+        temps: list[str] = []
+        for lora_spec, lora_scale in specs:
+            lora_path, cleanup = _resolve_lora_path(str(lora_spec))
+            resolved.append((lora_path, float(lora_scale)))
+            if cleanup:
+                temps.append(cleanup)
+        return resolved, temps
+
+    def ensure_default_loras_ready(self) -> None:
+        """
+        Resolve/download default LoRAs at startup when LoRA mode is enabled.
+        """
+        self.load()
+        if not self.default_lora_specs:
+            self._resolved_default_loras = []
+            return
+        resolved, temps = self._resolve_lora_specs(self.default_lora_specs)
+        for tmp in temps:
+            if tmp and os.path.isfile(tmp) and "fvserver_lora_" in tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        self._resolved_default_loras = resolved
+        log.info("Resolved %d default LoRA(s) for global use", len(resolved))
 
     def model_progress_for_ws(self) -> dict[str, Any] | None:
         return None
@@ -584,7 +613,10 @@ class LocalVideoGenerator:
         mode = (req.mode or "generate").strip().lower()
         steps = max(1, int(req.num_steps or self.inference_steps))
         effective_loras: list[tuple[str, float]] = []
-        effective_loras.extend(self.default_lora_specs)
+        if self._resolved_default_loras is not None:
+            effective_loras.extend(self._resolved_default_loras)
+        else:
+            effective_loras.extend(self.default_lora_specs)
         effective_loras.extend(req.lora_specs or [])
         resolved_loras: list[tuple[str, float]] = []
 
@@ -623,11 +655,14 @@ class LocalVideoGenerator:
                 default_suffix=".mp4",
             )
             tmp_video_conditioning_cleanup = vc_cleanup
-            for lora_spec, lora_scale in effective_loras:
-                lora_path, lora_cleanup = _resolve_lora_path(str(lora_spec))
-                resolved_loras.append((lora_path, float(lora_scale)))
-                if lora_cleanup:
-                    tmp_lora_cleanup.append(lora_cleanup)
+            if self._resolved_default_loras is not None and not req.lora_specs:
+                resolved_loras = list(self._resolved_default_loras)
+            else:
+                for lora_spec, lora_scale in effective_loras:
+                    lora_path, lora_cleanup = _resolve_lora_path(str(lora_spec))
+                    resolved_loras.append((lora_path, float(lora_scale)))
+                    if lora_cleanup:
+                        tmp_lora_cleanup.append(lora_cleanup)
 
             try:
                 if mode == "a2v":

@@ -230,6 +230,7 @@ When enabled, LoRA defaults can be configured in `server.py` constants and overr
 
 LoRA artifacts are resolved from local path, URL, or Hugging Face repo id. Downloaded LoRAs are cached under `./loras/` by default; override with:
 - `VIDEOFENTANYL_LORA_DIR`
+When LoRA is enabled, server startup now pre-resolves/downloads global LoRAs (fail-fast), matching the main model preflight behavior.
 
 ---
 

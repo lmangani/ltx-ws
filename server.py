@@ -1064,6 +1064,9 @@ def main() -> None:
     )
     log.info("Loading weights before accepting connections …")
     generator.load()
+    if default_loras:
+        log.info("Resolving global LoRA(s) before accepting connections …")
+        generator.ensure_default_loras_ready()
     log.info("Server ready — model path resolved; first used pipeline loads on demand.")
 
     # ── Start server ──────────────────────────────────────────────────────────
