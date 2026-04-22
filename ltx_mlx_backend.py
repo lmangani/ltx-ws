@@ -528,6 +528,13 @@ def _callable_signature(fn: Any) -> inspect.Signature:
     return inspect.signature(target)
 
 
+def _lora_fp_for_cache(resolved: list[tuple[str, float]] | None) -> tuple[tuple[str, float], ...]:
+    """Stable, hashable fingerprint for caching pipeline instances per LoRA stack."""
+    if not resolved:
+        return ()
+    return tuple((str(p), float(s)) for p, s in resolved)
+
+
 def _log_generate_and_save_kwargs(
     kind: str,
     pipe: Any,
@@ -577,6 +584,12 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     call_kwargs = dict(kwargs)
     if "num_steps" in call_kwargs and "num_steps" not in accepted and "steps" in accepted:
         call_kwargs["steps"] = call_kwargs.pop("num_steps")
+    if (
+        "num_steps" in call_kwargs
+        and "num_steps" not in accepted
+        and "stage1_steps" in accepted
+    ):
+        call_kwargs["stage1_steps"] = call_kwargs.pop("num_steps")
 
     if not has_varkw:
         call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepted}
@@ -657,7 +670,8 @@ class LocalVideoGenerator:
         self.upscale_cfg_scale = float(upscale_cfg_scale)
         self._model_path: str | None = None
         self._pipe_classes: dict[str, Any] = {}
-        self._pipes: dict[str, Any] = {}
+        # Cache key: (pipeline_key, lora_fingerprint); see _get_pipe / _lora_fp_for_cache.
+        self._pipes: dict[tuple[str, tuple[tuple[str, float], ...]], Any] = {}
         self._resolved_default_loras: list[tuple[str, float]] | None = None
 
     def _resolve_model_dir(self) -> str:
@@ -691,20 +705,46 @@ class LocalVideoGenerator:
             self._pipe_classes["ic_lora"] = ic_cls
         log.info("MLX model path resolved ✓ %s", path)
 
-    def _get_pipe(self, key: str) -> Any:
-        if key in self._pipes:
-            return self._pipes[key]
+    def _get_pipe(
+        self,
+        key: str,
+        resolved_loras: list[tuple[str, float]] | None = None,
+    ) -> Any:
+        """
+        Return a cached MLX pipeline for ``key``, optionally fusing LoRAs at **load** time.
+
+        ltx-2-mlx one-stage APIs do not take ``lora_paths`` on ``generate_and_save``; extra
+        LoRAs are applied via ``_pending_loras`` before ``load()`` (see TextToVideoPipeline).
+        """
+        fp = _lora_fp_for_cache(resolved_loras)
+        cache_key = (key, fp)
+        if cache_key in self._pipes:
+            return self._pipes[cache_key]
         self.load()
         if self._model_path is None:
             raise RuntimeError("MLX model path not initialized")
         cls = self._pipe_classes.get(key)
         if cls is None:
             raise RuntimeError(f"Unsupported pipeline key: {key}")
-        log.info("Loading MLX pipeline %s from %s …", key, self._model_path)
-        pipe = cls(model_dir=self._model_path, low_memory=self.low_memory)
+        log.info(
+            "Loading MLX pipeline %s from %s (lora_fp=%d paths) …",
+            key,
+            self._model_path,
+            len(fp),
+        )
+        if key == "ic_lora":
+            pipe = cls(
+                model_dir=self._model_path,
+                lora_paths=list(fp) if fp else None,
+                low_memory=self.low_memory,
+            )
+        else:
+            pipe = cls(model_dir=self._model_path, low_memory=self.low_memory)
+            if fp:
+                setattr(pipe, "_pending_loras", list(fp))
         pipe.load()
-        self._pipes[key] = pipe
-        log.info("MLX pipeline ready ✓ (%s)", key)
+        self._pipes[cache_key] = pipe
+        log.info("MLX pipeline ready ✓ (%s, %d LoRA(s) fused at load)", key, len(fp))
         return pipe
 
     def _get_two_stage_upscale_pipe(self) -> Any:
@@ -714,9 +754,9 @@ class LocalVideoGenerator:
         Kept separate from one-stage ``t2v``/``i2v`` pipes so ``--upscale`` off does not
         load extra weights or change default behaviour.
         """
-        key = "two_stage_upscale"
-        if key in self._pipes:
-            return self._pipes[key]
+        cache_key: tuple[str, tuple[tuple[str, float], ...]] = ("two_stage_upscale", ())
+        if cache_key in self._pipes:
+            return self._pipes[cache_key]
         self.load()
         if self._model_path is None:
             raise RuntimeError("MLX model path not initialized")
@@ -736,7 +776,7 @@ class LocalVideoGenerator:
         log.info("Loading MLX two-stage spatial-upscale pipeline from %s …", self._model_path)
         pipe = cls(model_dir=self._model_path, low_memory=self.low_memory)
         pipe.load()
-        self._pipes[key] = pipe
+        self._pipes[cache_key] = pipe
         log.info("MLX two-stage upscale pipeline ready ✓")
         return pipe
 
@@ -882,7 +922,8 @@ class LocalVideoGenerator:
         else:
             steps = max(1, int(self.inference_steps))
         log.info(
-            "MLX preflight job=%s mode=%r frames=%s size=%s×%s (aligned %s×%s) "
+            "MLX preflight job=%s mode=%r frames=%s "
+            "requested_H×W=%s×%s aligned_H×W=%s×%s (height×width) "
             "num_steps: client=%r server_default=%s → effective=%s "
             "upscale_flag=%s upscale_cli_stage1=%r stage2=%r",
             (req.job_id[:8] if req.job_id else "—"),
@@ -965,25 +1006,18 @@ class LocalVideoGenerator:
                 and not tmp_audio
                 and not tmp_video
                 and not vc_items
-                and not resolved_loras
             )
-            if (
-                bool(getattr(self, "upscale", False))
-                and mode == "generate"
-                and not tmp_audio
-                and not tmp_video
-                and not vc_items
-                and resolved_loras
-            ):
+            if use_two_stage_upscale and resolved_loras:
                 log.warning(
-                    "Spatial upscale (--upscale): two-stage path skipped while %d LoRA(s) "
-                    "are active (TwoStagePipeline has no extra LoRA fusion); using one-stage.",
+                    "Spatial upscale (--upscale): %d extra LoRA(s) are not fused inside "
+                    "TwoStagePipeline (stage 2 uses the model's distilled LoRA only). "
+                    "Two-stage still runs; use one-stage without --upscale if you need those LoRAs.",
                     len(resolved_loras),
                 )
 
             try:
                 if mode == "a2v":
-                    pipe = self._get_pipe("a2v")
+                    pipe = self._get_pipe("a2v", resolved_loras)
                     _invoke_generate_and_save(
                         pipe,
                         prompt=req.prompt,
@@ -995,14 +1029,13 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
-                        lora_paths=resolved_loras,
                     )
                 elif mode == "retake":
                     if not tmp_video:
                         raise RuntimeError("retake mode requires source video input")
                     start_frame = int(req.retake_start if req.retake_start is not None else 1)
                     end_frame = int(req.retake_end if req.retake_end is not None else start_frame)
-                    pipe = self._get_pipe("retake")
+                    pipe = self._get_pipe("retake", resolved_loras)
                     _invoke_generate_and_save(
                         pipe,
                         prompt=req.prompt,
@@ -1015,14 +1048,13 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
-                        lora_paths=resolved_loras,
                     )
                 elif mode == "extend":
                     if not tmp_video:
                         raise RuntimeError("extend mode requires source video input")
                     ext_frames = int(req.extend_frames if req.extend_frames is not None else 2)
                     direction = (req.extend_direction or "after").strip().lower()
-                    pipe = self._get_pipe("extend")
+                    pipe = self._get_pipe("extend", resolved_loras)
                     _invoke_generate_and_save(
                         pipe,
                         prompt=req.prompt,
@@ -1035,19 +1067,17 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
-                        lora_paths=resolved_loras,
                     )
                 elif mode == "ic_lora":
                     if not resolved_loras:
                         raise RuntimeError("ic_lora mode requires at least one LoRA spec")
                     if not vc_items:
                         raise RuntimeError("ic_lora mode requires video_conditioning entries")
-                    pipe = self._get_pipe("ic_lora")
+                    pipe = self._get_pipe("ic_lora", resolved_loras)
                     _invoke_generate_and_save(
                         pipe,
                         prompt=req.prompt,
                         output_path=out_path,
-                        lora_paths=[(str(p), float(s)) for p, s in resolved_loras],
                         video_conditioning=[(str(p), float(s)) for p, s in vc_items],
                         height=height,
                         width=width,
@@ -1105,7 +1135,7 @@ class LocalVideoGenerator:
                         image=tmp_image,
                     )
                 elif tmp_image:
-                    pipe = self._get_pipe("i2v")
+                    pipe = self._get_pipe("i2v", resolved_loras)
                     _invoke_generate_and_save(
                         pipe,
                         prompt=req.prompt,
@@ -1116,10 +1146,9 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
-                        lora_paths=resolved_loras,
                     )
                 else:
-                    pipe = self._get_pipe("t2v")
+                    pipe = self._get_pipe("t2v", resolved_loras)
                     _invoke_generate_and_save(
                         pipe,
                         prompt=req.prompt,
@@ -1129,7 +1158,6 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
-                        lora_paths=resolved_loras,
                     )
             except BaseException:
                 self._salvage_mp4_to_spill(tmpdir, out_path, req.job_id, req.prompt, "ENCODE_FAIL")

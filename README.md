@@ -301,7 +301,7 @@ The client implements this flow for `--mode ltx` when `--server` is set.
 | `--fps` | `24` | Nominal rate (mux behaviour follows pipeline). |
 | `--infer-steps` | `8` | One-stage distilled step count (minimum 1). |
 | `--mlx-low-memory` | off | `low_memory=True` in ltx-2-mlx (slower, less RAM). |
-| `--upscale` | off | Optional **spatial 2× two-stage** path for `mode=generate` only. **Final** H×W are the client-requested size (same as one-stage), snapped to multiples of **64** so half-res stays on the 32-px grid; `TwoStagePipeline` runs stage-1 at **½** that size, then `spatial_upscaler_x2_v1_1`, then distilled stage-2 back at the final size. Lazy-loaded; **skipped** if any LoRAs are active or for a2v/retake/extend/ic_lora. Needs model assets (`transformer-dev`, upscaler, distilled LoRA). |
+| `--upscale` | off | Optional **spatial 2× two-stage** path for `mode=generate` only (not a2v/retake/extend/ic_lora). **Final** H×W = client size, snapped to multiples of **64**; stage-1 runs at **½** H×W in pixels, then `spatial_upscaler_x2_v1_1`, then distilled stage-2. **Extra Comfy/global LoRAs** are fused for **one-stage** jobs at pipeline load (`_pending_loras` in ltx-2-mlx); they are **not** fused into `TwoStagePipeline`'s dev transformer (upstream), so upscale still runs but those LoRAs are not applied inside two-stage—see server warning log. Needs `transformer-dev`, upscaler weights, distilled LoRA in the model tree. |
 | `--upscale-stage1-steps` | *(off)* | When set with `--upscale`, fixes stage-1 step count (ignores per-job `num_steps` for stage 1). When omitted, stage-1 uses the same step count as one-stage: per-request `num_steps` if present, else `--infer-steps` (default **8**). |
 | `--upscale-stage2-steps` | *(off)* | Same pattern for stage-2 distilled cap; when omitted, matches that same effective step count. |
 | `--upscale-cfg-scale` | `3.0` | Stage-1 CFG scale when `--upscale`. |
@@ -363,7 +363,7 @@ Saved files look like: **`{prefix}_{NNN}_{slug}_{timestamp}.mp4`**. After a succ
 | **Player won’t open MP4** | Fragments are progressive / fMP4-style; remux: `ffmpeg -i in.mp4 -c copy out.mp4`. |
 | **`Missing ltx_pipelines_mlx`** | Install the two `uv pip install …ltx-2-mlx.git#subdirectory=…` lines from `requirements.txt`. |
 | **`huggingface_hub` errors** | Install deps; check `HF_TOKEN` for gated models; ensure enough free disk. |
-| **OOM / slow** | Use `--model dgrauet/ltx-2.3-mlx-q8` or `-q4`, lower `--num-frames` / resolution, or `--mlx-low-memory`. For **1080p-class** outputs without extra LoRAs, try `--upscale` (two-stage half-res → 2× spatial → distilled refine; see CLI table). |
+| **OOM / slow** | Use `--model dgrauet/ltx-2.3-mlx-q8` or `-q4`, lower `--num-frames` / resolution, or `--mlx-low-memory`. For **1080p-class** outputs, try `--upscale` (two-stage; see CLI table). With `--enable-lora`, one-stage i2v/t2v fuses LoRAs at load; two-stage upscale uses the model's distilled LoRA in stage 2 only. |
 | **Port already in use** | `--port` on server and matching URL on client. |
 | **`autoconcat` failed** | Install `ffmpeg` on the client host; fragments are kept if merge fails. |
 

@@ -1050,9 +1050,10 @@ examples:
         action="store_true",
         help=(
             "for mode=generate only: use ltx TwoStagePipeline (half-res dev+CFG → "
-            "spatial_upscaler_x2_v1_1 → distilled stage-2). Lazy-loaded; ignored when "
-            "LoRAs are active, or for a2v/retake/extend/ic_lora. Requires model assets "
-            "(transformer-dev, spatial_upscaler_x2_v1_1, distilled LoRA)."
+            "spatial_upscaler_x2_v1_1 → distilled stage-2). Lazy-loaded; not used for "
+            "a2v/retake/extend/ic_lora. Extra Comfy/global LoRAs are not fused into the "
+            "two-stage dev transformer (see logs); one-stage paths fuse them at load. "
+            "Requires model assets (transformer-dev, spatial_upscaler_x2_v1_1, distilled LoRA)."
         ),
     )
     perf.add_argument(
