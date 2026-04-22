@@ -504,6 +504,7 @@ class RequestHandler:
         self.spill_dir   = spill_dir
         self._session:  dict = {}
         self._t0        = time.time()
+        self._bg_disconnect_task: asyncio.Task | None = None
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -537,6 +538,34 @@ class RequestHandler:
             )
         except OSError as exc:
             log.error("  ✗ spill copy failed: %s", exc)
+
+    async def _drain_disconnected_job(
+        self,
+        gen_task: asyncio.Task,
+        generation_id: str,
+        prompt: str,
+    ) -> None:
+        """After the client leaves mid-flight, wait for MLX then spill (runs in background)."""
+        try:
+            video_path = await gen_task
+        except asyncio.CancelledError:
+            log.warning(
+                "  ◆ MLX wait for job %s cancelled (server shutting down?); "
+                "worker thread may still be finishing",
+                generation_id[:8],
+            )
+            raise
+        except Exception as gen_exc:
+            log.error(
+                "  ✗ background generation %s after client disconnect: %s",
+                generation_id[:8],
+                gen_exc,
+            )
+            return
+        try:
+            self._spill_copy(video_path, generation_id, prompt)
+        finally:
+            _cleanup_temp_video(video_path)
 
     async def _handle_client_msg_while_generating(
         self,
@@ -642,9 +671,17 @@ class RequestHandler:
 
         async with self.scheduler.generation_slot(_notify_queue) as generation_id:
             t_start = time.time()
+            upscale_tail = ""
+            if self.generator.spatial_upscale:
+                upscale_tail = (
+                    f"  [upscale: stage1 @ {gen_width // 2}×{gen_height // 2}px "
+                    f"(½ res) → output {gen_width}×{gen_height}px; "
+                    f"server stage1_steps={self.generator.stage1_steps} "
+                    f"(client num_steps={gen_num_steps} is one-stage only)]"
+                )
             log.info(
                 "  ▶ generation %s  mode=%s  prompt=%r  image=%s  audio=%s  video=%s "
-                "loras=%s (req=%s default=%s) vcond=%s seed=%s  %s×%s  frames=%s  steps=%s",
+                "loras=%s (req=%s default=%s) vcond=%s seed=%s  %s×%s  frames=%s  steps=%s%s",
                 generation_id,
                 mode,
                 prompt[:72],
@@ -660,6 +697,7 @@ class RequestHandler:
                 gen_width,
                 gen_num_frames,
                 gen_num_steps,
+                upscale_tail,
             )
 
             # ── gpu_assigned ──────────────────────────────────────────────────
@@ -745,21 +783,15 @@ class RequestHandler:
                         except websockets.exceptions.ConnectionClosed:
                             log.warning(
                                 "  ⚠ client disconnected during generation %s — "
-                                "waiting for encode then spill-saving MP4",
+                                "releasing queue slot; MLX continues in-process (cannot preempt "
+                                "mid-step); spill-save runs when the job finishes",
                                 generation_id[:8],
                             )
-                            try:
-                                video_path = await gen_task
-                                self._spill_copy(video_path, generation_id, prompt)
-                            except Exception as gen_exc:
-                                log.error(
-                                    "  ✗ generation after client disconnect failed "
-                                    "(check %s for spill-salvaged *_ENCODE_FAIL*.mp4): %s",
-                                    self.spill_dir,
-                                    gen_exc,
+                            self._bg_disconnect_task = asyncio.create_task(
+                                self._drain_disconnected_job(
+                                    gen_task, generation_id, prompt
                                 )
-                            else:
-                                _cleanup_temp_video(video_path)
+                            )
                             return
                         await self._handle_client_msg_while_generating(
                             frame, generation_id, t_start,
@@ -1244,6 +1276,9 @@ def main() -> None:
         asyncio.run(server.serve())
     except KeyboardInterrupt:
         print("\n\nServer stopped.")
+    finally:
+        log.info("Joining MLX worker thread (wait for any in-flight denoise to finish)…")
+        generator.shutdown_mlx_executor(wait=True)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import functools
 import inspect
 import logging
@@ -596,6 +597,23 @@ class LocalVideoGenerator:
         self._pipe_classes: dict[str, Any] = {}
         self._pipes: dict[str, Any] = {}
         self._resolved_default_loras: list[tuple[str, float]] | None = None
+        # Single MLX worker thread: serializes all jobs even when the asyncio scheduler
+        # releases early (e.g. client disconnect + background drain task).
+        self._mlx_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="fv_mlx",
+        )
+
+    def shutdown_mlx_executor(self, *, wait: bool = True) -> None:
+        """Stop accepting new MLX work and join the worker thread (call from ``main()`` on exit)."""
+        ex = getattr(self, "_mlx_executor", None)
+        if ex is None:
+            return
+        self._mlx_executor = None
+        try:
+            ex.shutdown(wait=wait, cancel_futures=True)
+        except TypeError:
+            ex.shutdown(wait=wait)
 
     def _resolve_model_dir(self) -> str:
         return resolve_mlx_weights_directory(self.model, self.model_dir)
@@ -718,9 +736,12 @@ class LocalVideoGenerator:
         *,
         job_id: str | None = None,
     ) -> str:
-        loop = asyncio.get_event_loop()
+        ex = self._mlx_executor
+        if ex is None:
+            raise RuntimeError("LocalVideoGenerator executor is shut down")
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None,
+            ex,
             functools.partial(
                 self._generate_sync,
                 GenerationRequest(
@@ -934,6 +955,20 @@ class LocalVideoGenerator:
                     )
                 elif mode == "generate" and self.spatial_upscale:
                     pipe = self._get_pipe("two_stage")
+                    s1_w, s1_h = width // 2, height // 2
+                    log.info(
+                        "Two-stage upscale: stage-1 DiT+VAE at %s×%s px (exactly ½ of "
+                        "%s×%s output), then native 2× latent upsample + stage-2 refine "
+                        "(stage1_steps=%s stage2=%s)",
+                        s1_w,
+                        s1_h,
+                        width,
+                        height,
+                        self.stage1_steps,
+                        self.stage2_steps
+                        if self.stage2_steps is not None
+                        else "pipeline-default",
+                    )
                     if resolved_loras:
                         log.warning(
                             "Native spatial upscale (TwoStagePipeline) does not apply "
