@@ -285,6 +285,22 @@ The client implements this flow for `--mode ltx` when `--server` is set.
 
 ---
 
+## Native spatial upscale (optional)
+
+By default the server uses **single-stage** distilled T2V/I2V (no latent upsampler). For high output resolutions you can enable **ltx-2-mlx’s built-in two-stage path** (same idea as Lightricks’ spatial upscaler: denoise at half size, apply the **MLX `LatentUpsampler` (2×)**, then refine at the requested resolution):
+
+```bash
+python server.py --upscale --model dgrauet/ltx-2.3-mlx-q8 --height 1088 --width 1920
+```
+
+**Requirements:** the model directory must contain **`transformer-dev.safetensors`**, **`spatial_upscaler_x2_v1_1.safetensors`**, and **`ltx-2.3-22b-distilled-lora-384.safetensors`** (standard files in the official MLX q8 bundle). This maps to [ltx-2-mlx `TwoStagePipeline`](https://github.com/dgrauet/ltx-2-mlx) — not Diffusers / PyTorch, and **not** a Lanczos or ffmpeg resize; muxing still uses whatever `ltx-2-mlx` already uses inside `decode_and_stream`.
+
+**LoRAs:** extra `--lora` / request LoRAs are **not** fused on the two-stage path (the pipeline already fuses the bundled distilled LoRA for stage 2); the server logs a warning and skips them for that job.
+
+Tune stage-1 CFG / steps if needed: `--stage1-steps`, `--stage2-steps`, `--two-stage-cfg-scale`, `--two-stage-stg-scale`.
+
+---
+
 ## `server.py` CLI reference
 
 | Option | Default | Description |
@@ -300,6 +316,11 @@ The client implements this flow for `--mode ltx` when `--server` is set.
 | `--width` | `704` | Snapped to multiple of **32**. |
 | `--fps` | `24` | Nominal rate (mux behaviour follows pipeline). |
 | `--infer-steps` | `8` | One-stage distilled step count (minimum 1). |
+| `--upscale` | off | **Generate / I2V only:** native 2× latent upscale via `TwoStagePipeline` (half-res → upsampler → refine); see [Native spatial upscale](#native-spatial-upscale-optional). |
+| `--stage1-steps` | `30` | Two-stage stage-1 steps (dev + CFG at half resolution). |
+| `--stage2-steps` | *(pipeline default)* | Two-stage stage-2 steps (optional). |
+| `--two-stage-cfg-scale` | `3.0` | Stage-1 video CFG scale. |
+| `--two-stage-stg-scale` | `0.0` | Stage-1 STG scale. |
 | `--mlx-low-memory` | off | `low_memory=True` in ltx-2-mlx (slower, less RAM). |
 | `--chunk-size` | `65536` | Max bytes per WebSocket binary frame. |
 | `--spill-dir` | `fvserver_completed` | Salvage directory on client disconnect. |

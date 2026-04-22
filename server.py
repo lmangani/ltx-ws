@@ -1044,6 +1044,55 @@ examples:
         help="pass low_memory=True to ltx-2-mlx (staged loads; slower, less RAM)",
     )
 
+    up = p.add_argument_group(
+        "native spatial upscale (ltx-2-mlx TwoStagePipeline)",
+    )
+    up.add_argument(
+        "--upscale",
+        action="store_true",
+        help=(
+            "For mode=generate (T2V and I2V): run ltx-2-mlx two-stage inference — "
+            "stage 1 at half the requested H×W with the dev transformer + CFG, then "
+            "native 2× latent upsampling (spatial_upscaler_x2_v1_1), then stage-2 "
+            "refine at full resolution with the bundled distilled LoRA. "
+            "Requires transformer-dev, spatial upscaler, and distilled LoRA files in "
+            "the model directory (e.g. dgrauet/ltx-2.3-mlx-q8). "
+            "Per-request LoRAs are ignored on this path. Does not use pixel scalers."
+        ),
+    )
+    up.add_argument(
+        "--stage1-steps",
+        type=int,
+        default=30,
+        dest="stage1_steps",
+        metavar="N",
+        help="two-stage stage-1 denoise steps (dev + CFG at half res; default: 30).",
+    )
+    up.add_argument(
+        "--stage2-steps",
+        type=int,
+        default=None,
+        dest="stage2_steps",
+        metavar="N",
+        help=(
+            "two-stage stage-2 denoise steps (omit for ltx-2-mlx default STAGE_2_SIGMAS)."
+        ),
+    )
+    up.add_argument(
+        "--two-stage-cfg-scale",
+        type=float,
+        default=3.0,
+        dest="two_stage_cfg_scale",
+        help="CFG scale for two-stage stage 1 (video branch; default: 3.0).",
+    )
+    up.add_argument(
+        "--two-stage-stg-scale",
+        type=float,
+        default=0.0,
+        dest="two_stage_stg_scale",
+        help="STG scale for two-stage stage 1 (default: 0.0).",
+    )
+
     misc = p.add_argument_group("misc")
     misc.add_argument(
         "--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, dest="chunk_size",
@@ -1079,6 +1128,9 @@ def main() -> None:
 
     if args.infer_steps < 1:
         parser.error("--infer-steps must be >= 1")
+    if args.upscale and args.stage1_steps < 1:
+        parser.error("--stage1-steps must be >= 1 when --upscale is set")
+    stage2_arg: int | None = args.stage2_steps if args.upscale else None
     default_loras: list[tuple[str, float]] = []
     if args.enable_lora:
         default_loras = _default_loras_from_env()
@@ -1140,6 +1192,14 @@ def main() -> None:
     else:
         print("  LoRA     : disabled (use --enable-lora)")
     print(f"  low_mem  : {args.mlx_low_memory}")
+    if args.upscale:
+        s2 = "default" if stage2_arg is None else str(stage2_arg)
+        print(
+            f"  upscale  : native 2× (TwoStage)  stage1={args.stage1_steps}  "
+            f"stage2={s2}  cfg={args.two_stage_cfg_scale}  stg={args.two_stage_stg_scale}"
+        )
+    else:
+        print("  upscale  : off (single-stage distilled unless client uses other modes)")
     print(f"{'═' * 60}\n")
 
     spill_dir = Path(args.spill_dir).expanduser().resolve()
@@ -1158,6 +1218,11 @@ def main() -> None:
         default_lora_specs  = default_loras,
         spill_dir           = spill_dir,
         low_memory          = args.mlx_low_memory,
+        spatial_upscale     = args.upscale,
+        stage1_steps        = args.stage1_steps,
+        stage2_steps        = stage2_arg,
+        two_stage_cfg_scale = args.two_stage_cfg_scale,
+        two_stage_stg_scale = args.two_stage_stg_scale,
     )
     log.info("Loading weights before accepting connections …")
     generator.load()

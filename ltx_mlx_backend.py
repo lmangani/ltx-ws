@@ -27,6 +27,11 @@ log = logging.getLogger("fvserver")
 
 LTX2_SPATIAL_ALIGN = 32
 
+# ltx-2-mlx ``TwoStagePipeline`` defaults (native half-res → LatentUpsampler 2x → refine).
+TWO_STAGE_DEV_TRANSFORMER = "transformer-dev.safetensors"
+TWO_STAGE_DISTILLED_LORA = "ltx-2.3-22b-distilled-lora-384.safetensors"
+TWO_STAGE_SPATIAL_UPSCALER_WEIGHTS = "spatial_upscaler_x2_v1_1.safetensors"
+
 # Hugging Face repo id: ``org/name`` (used with huggingface_hub.snapshot_download,
 # same file set as ``huggingface-cli download org/name``).
 _HF_REPO_ID_RE = re.compile(
@@ -502,6 +507,23 @@ def _decode_weighted_media_inputs(
     return decoded, temps
 
 
+def _validate_native_spatial_upscale_weights(model_dir: Path) -> None:
+    """Ensure the weight bundle supports ``TwoStagePipeline`` (MLX latent 2× upsampler)."""
+    need = [
+        (model_dir / TWO_STAGE_DEV_TRANSFORMER, "dev transformer (stage-1 CFG)"),
+        (model_dir / TWO_STAGE_DISTILLED_LORA, "distilled LoRA (stage-2 refine)"),
+        (model_dir / TWO_STAGE_SPATIAL_UPSCALER_WEIGHTS, "spatial 2× latent upsampler"),
+    ]
+    missing = [f"{p.name} ({desc})" for p, desc in need if not p.is_file()]
+    if missing:
+        raise RuntimeError(
+            "Native spatial upscale requires full two-stage assets next to the base weights:\n  "
+            + "\n  ".join(f"- {m}" for m in missing)
+            + "\nOfficial MLX bundles (e.g. dgrauet/ltx-2.3-mlx-q8) include these files. "
+            "This path uses only ltx-2-mlx ``TwoStagePipeline`` + ``LatentUpsampler`` — no pixel upscalers."
+        )
+
+
 def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     """
     Call ``pipe.generate_and_save`` while tolerating API drift between ltx-2-mlx versions.
@@ -530,8 +552,10 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
 
 class LocalVideoGenerator:
     """
-    ``ImageToVideoPipeline`` from ``ltx-2-mlx``: text-to-video when no image,
-    image-to-video otherwise. Weights loaded once at ``load()``.
+    ltx-2-mlx pipelines: one-stage T2V/I2V by default, or ``TwoStagePipeline`` when
+    ``spatial_upscale`` is enabled (half-resolution denoise → native ``LatentUpsampler``
+    2× → refine at the requested size). Other modes (a2v, retake, extend, ic_lora)
+    stay on their dedicated pipelines.
     """
 
     def __init__(
@@ -546,6 +570,12 @@ class LocalVideoGenerator:
         default_lora_specs: list[tuple[str, float]] | None = None,
         spill_dir: Path | None = None,
         low_memory: bool = False,
+        *,
+        spatial_upscale: bool = False,
+        stage1_steps: int = 30,
+        stage2_steps: int | None = None,
+        two_stage_cfg_scale: float = 3.0,
+        two_stage_stg_scale: float = 0.0,
     ) -> None:
         self.model = model
         self.num_frames = int(num_frames)
@@ -557,6 +587,11 @@ class LocalVideoGenerator:
         self.default_lora_specs = list(default_lora_specs or [])
         self.spill_dir = spill_dir
         self.low_memory = bool(low_memory)
+        self.spatial_upscale = bool(spatial_upscale)
+        self.stage1_steps = max(1, int(stage1_steps))
+        self.stage2_steps = stage2_steps
+        self.two_stage_cfg_scale = float(two_stage_cfg_scale)
+        self.two_stage_stg_scale = float(two_stage_stg_scale)
         self._model_path: str | None = None
         self._pipe_classes: dict[str, Any] = {}
         self._pipes: dict[str, Any] = {}
@@ -582,8 +617,6 @@ class LocalVideoGenerator:
         path = self._resolve_model_dir()
         self._model_path = path
         self._pipe_classes = {
-            "t2v": lpm.TextToVideoPipeline,
-            "i2v": lpm.ImageToVideoPipeline,
             "a2v": lpm.AudioToVideoPipeline,
             "retake": lpm.RetakePipeline,
             "extend": lpm.ExtendPipeline,
@@ -591,6 +624,24 @@ class LocalVideoGenerator:
         ic_cls = getattr(lpm, "ICLoraPipeline", None)
         if ic_cls is not None:
             self._pipe_classes["ic_lora"] = ic_cls
+
+        if self.spatial_upscale:
+            ts_cls = getattr(lpm, "TwoStagePipeline", None)
+            if ts_cls is None:
+                raise RuntimeError(
+                    "Native spatial upscale needs ltx_pipelines_mlx.TwoStagePipeline "
+                    "(upgrade ltx-2-mlx; see README two-stage / --upscale)."
+                )
+            _validate_native_spatial_upscale_weights(Path(path))
+            self._pipe_classes["two_stage"] = ts_cls
+            log.info(
+                "Native spatial upscale enabled (half-res → %s → refine); "
+                "generate/i2v use TwoStagePipeline only.",
+                TWO_STAGE_SPATIAL_UPSCALER_WEIGHTS,
+            )
+        else:
+            self._pipe_classes["t2v"] = lpm.TextToVideoPipeline
+            self._pipe_classes["i2v"] = lpm.ImageToVideoPipeline
         log.info("MLX model path resolved ✓ %s", path)
 
     def _get_pipe(self, key: str) -> Any:
@@ -880,6 +931,28 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
+                    )
+                elif mode == "generate" and self.spatial_upscale:
+                    pipe = self._get_pipe("two_stage")
+                    if resolved_loras:
+                        log.warning(
+                            "Native spatial upscale (TwoStagePipeline) does not apply "
+                            "per-request LoRAs; ignoring %d spec(s) for this job.",
+                            len(resolved_loras),
+                        )
+                    _invoke_generate_and_save(
+                        pipe,
+                        prompt=req.prompt,
+                        output_path=out_path,
+                        height=height,
+                        width=width,
+                        num_frames=nf,
+                        seed=int(req.seed),
+                        stage1_steps=self.stage1_steps,
+                        stage2_steps=self.stage2_steps,
+                        cfg_scale=self.two_stage_cfg_scale,
+                        stg_scale=self.two_stage_stg_scale,
+                        image=tmp_image,
                     )
                 elif tmp_image:
                     pipe = self._get_pipe("i2v")
