@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import concurrent.futures
 import functools
 import inspect
 import logging
@@ -27,11 +26,6 @@ from urllib.request import url2pathname, urlopen
 log = logging.getLogger("fvserver")
 
 LTX2_SPATIAL_ALIGN = 32
-
-# ltx-2-mlx ``TwoStagePipeline`` defaults (native half-res → LatentUpsampler 2x → refine).
-TWO_STAGE_DEV_TRANSFORMER = "transformer-dev.safetensors"
-TWO_STAGE_DISTILLED_LORA = "ltx-2.3-22b-distilled-lora-384.safetensors"
-TWO_STAGE_SPATIAL_UPSCALER_WEIGHTS = "spatial_upscaler_x2_v1_1.safetensors"
 
 # Hugging Face repo id: ``org/name`` (used with huggingface_hub.snapshot_download,
 # same file set as ``huggingface-cli download org/name``).
@@ -265,6 +259,22 @@ def _align_ltx2_spatial(n: int, align: int = LTX2_SPATIAL_ALIGN) -> int:
     lower = (n // align) * align
     upper = lower + align
     return lower if (n - lower) <= (upper - n) else upper
+
+
+def _align_dimensions_for_spatial_upscale(height: int, width: int, align: int = LTX2_SPATIAL_ALIGN) -> tuple[int, int]:
+    """Snap **final** output H×W so ``height//2`` and ``width//2`` stay on the ``align`` px grid.
+
+    ``TwoStagePipeline`` is called with this full size; it generates at half resolution
+    internally, then spatial-2× upscales back to these dimensions.
+    """
+    h = _align_ltx2_spatial(int(height), align)
+    w = _align_ltx2_spatial(int(width), align)
+    double = align * 2
+    if h % double != 0:
+        h = ((h + double - 1) // double) * double
+    if w % double != 0:
+        w = ((w + double - 1) // double) * double
+    return h, w
 
 
 def _nearest_valid_frames(n: int) -> int:
@@ -508,23 +518,6 @@ def _decode_weighted_media_inputs(
     return decoded, temps
 
 
-def _validate_native_spatial_upscale_weights(model_dir: Path) -> None:
-    """Ensure the weight bundle supports ``TwoStagePipeline`` (MLX latent 2× upsampler)."""
-    need = [
-        (model_dir / TWO_STAGE_DEV_TRANSFORMER, "dev transformer (stage-1 CFG)"),
-        (model_dir / TWO_STAGE_DISTILLED_LORA, "distilled LoRA (stage-2 refine)"),
-        (model_dir / TWO_STAGE_SPATIAL_UPSCALER_WEIGHTS, "spatial 2× latent upsampler"),
-    ]
-    missing = [f"{p.name} ({desc})" for p, desc in need if not p.is_file()]
-    if missing:
-        raise RuntimeError(
-            "Native spatial upscale requires full two-stage assets next to the base weights:\n  "
-            + "\n  ".join(f"- {m}" for m in missing)
-            + "\nOfficial MLX bundles (e.g. dgrauet/ltx-2.3-mlx-q8) include these files. "
-            "This path uses only ltx-2-mlx ``TwoStagePipeline`` + ``LatentUpsampler`` — no pixel upscalers."
-        )
-
-
 def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     """
     Call ``pipe.generate_and_save`` while tolerating API drift between ltx-2-mlx versions.
@@ -551,12 +544,28 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     fn(**call_kwargs)
 
 
+def _invoke_two_stage_generate_and_save(pipe: Any, **kwargs: Any) -> None:
+    """Call ``TwoStagePipeline.generate_and_save`` with kwargs filtered to the signature."""
+    fn = getattr(pipe, "generate_and_save", None)
+    if fn is None:
+        raise RuntimeError(f"{type(pipe).__name__} has no generate_and_save()")
+
+    sig = inspect.signature(fn)
+    params = sig.parameters
+    accepted = set(params.keys())
+    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+    call_kwargs = dict(kwargs)
+    if not has_varkw:
+        call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepted}
+
+    fn(**call_kwargs)
+
+
 class LocalVideoGenerator:
     """
-    ltx-2-mlx pipelines: one-stage T2V/I2V by default, or ``TwoStagePipeline`` when
-    ``spatial_upscale`` is enabled (half-resolution denoise → native ``LatentUpsampler``
-    2× → refine at the requested size). Other modes (a2v, retake, extend, ic_lora)
-    stay on their dedicated pipelines.
+    ``ImageToVideoPipeline`` from ``ltx-2-mlx``: text-to-video when no image,
+    image-to-video otherwise. Weights loaded once at ``load()``.
     """
 
     def __init__(
@@ -572,11 +581,10 @@ class LocalVideoGenerator:
         spill_dir: Path | None = None,
         low_memory: bool = False,
         *,
-        spatial_upscale: bool = False,
-        stage1_steps: int = 8,
-        stage2_steps: int | None = None,
-        two_stage_cfg_scale: float = 3.0,
-        two_stage_stg_scale: float = 0.0,
+        upscale: bool = False,
+        upscale_stage1_steps: int | None = None,
+        upscale_stage2_steps: int | None = None,
+        upscale_cfg_scale: float = 3.0,
     ) -> None:
         self.model = model
         self.num_frames = int(num_frames)
@@ -588,32 +596,18 @@ class LocalVideoGenerator:
         self.default_lora_specs = list(default_lora_specs or [])
         self.spill_dir = spill_dir
         self.low_memory = bool(low_memory)
-        self.spatial_upscale = bool(spatial_upscale)
-        self.stage1_steps = max(1, int(stage1_steps))
-        self.stage2_steps = stage2_steps
-        self.two_stage_cfg_scale = float(two_stage_cfg_scale)
-        self.two_stage_stg_scale = float(two_stage_stg_scale)
+        self.upscale = bool(upscale)
+        self.upscale_stage1_steps = (
+            None if upscale_stage1_steps is None else max(1, int(upscale_stage1_steps))
+        )
+        self.upscale_stage2_steps = (
+            None if upscale_stage2_steps is None else max(1, int(upscale_stage2_steps))
+        )
+        self.upscale_cfg_scale = float(upscale_cfg_scale)
         self._model_path: str | None = None
         self._pipe_classes: dict[str, Any] = {}
         self._pipes: dict[str, Any] = {}
         self._resolved_default_loras: list[tuple[str, float]] | None = None
-        # Single MLX worker thread: serializes all jobs even when the asyncio scheduler
-        # releases early (e.g. client disconnect + background drain task).
-        self._mlx_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="fv_mlx",
-        )
-
-    def shutdown_mlx_executor(self, *, wait: bool = True) -> None:
-        """Stop accepting new MLX work and join the worker thread (call from ``main()`` on exit)."""
-        ex = getattr(self, "_mlx_executor", None)
-        if ex is None:
-            return
-        self._mlx_executor = None
-        try:
-            ex.shutdown(wait=wait, cancel_futures=True)
-        except TypeError:
-            ex.shutdown(wait=wait)
 
     def _resolve_model_dir(self) -> str:
         return resolve_mlx_weights_directory(self.model, self.model_dir)
@@ -635,6 +629,8 @@ class LocalVideoGenerator:
         path = self._resolve_model_dir()
         self._model_path = path
         self._pipe_classes = {
+            "t2v": lpm.TextToVideoPipeline,
+            "i2v": lpm.ImageToVideoPipeline,
             "a2v": lpm.AudioToVideoPipeline,
             "retake": lpm.RetakePipeline,
             "extend": lpm.ExtendPipeline,
@@ -642,24 +638,6 @@ class LocalVideoGenerator:
         ic_cls = getattr(lpm, "ICLoraPipeline", None)
         if ic_cls is not None:
             self._pipe_classes["ic_lora"] = ic_cls
-
-        if self.spatial_upscale:
-            ts_cls = getattr(lpm, "TwoStagePipeline", None)
-            if ts_cls is None:
-                raise RuntimeError(
-                    "Native spatial upscale needs ltx_pipelines_mlx.TwoStagePipeline "
-                    "(upgrade ltx-2-mlx; see README two-stage / --upscale)."
-                )
-            _validate_native_spatial_upscale_weights(Path(path))
-            self._pipe_classes["two_stage"] = ts_cls
-            log.info(
-                "Native spatial upscale enabled (half-res → %s → refine); "
-                "generate/i2v use TwoStagePipeline only.",
-                TWO_STAGE_SPATIAL_UPSCALER_WEIGHTS,
-            )
-        else:
-            self._pipe_classes["t2v"] = lpm.TextToVideoPipeline
-            self._pipe_classes["i2v"] = lpm.ImageToVideoPipeline
         log.info("MLX model path resolved ✓ %s", path)
 
     def _get_pipe(self, key: str) -> Any:
@@ -676,6 +654,39 @@ class LocalVideoGenerator:
         pipe.load()
         self._pipes[key] = pipe
         log.info("MLX pipeline ready ✓ (%s)", key)
+        return pipe
+
+    def _get_two_stage_upscale_pipe(self) -> Any:
+        """
+        Lazy-load ``TwoStagePipeline`` (half-res dev + CFG → spatial 2× → distilled stage-2).
+
+        Kept separate from one-stage ``t2v``/``i2v`` pipes so ``--upscale`` off does not
+        load extra weights or change default behaviour.
+        """
+        key = "two_stage_upscale"
+        if key in self._pipes:
+            return self._pipes[key]
+        self.load()
+        if self._model_path is None:
+            raise RuntimeError("MLX model path not initialized")
+        try:
+            import ltx_pipelines_mlx as lpm
+        except ImportError as e:
+            raise RuntimeError(
+                "Missing ltx_pipelines_mlx for spatial upscale (install ltx-2-mlx packages)."
+            ) from e
+        cls = getattr(lpm, "TwoStagePipeline", None)
+        if cls is None:
+            raise RuntimeError(
+                "This ltx-pipelines-mlx build has no TwoStagePipeline. "
+                "Upgrade ltx-2-mlx (spatial upscale uses transformer-dev + "
+                "spatial_upscaler_x2_v1_1 + distilled LoRA in the model directory)."
+            )
+        log.info("Loading MLX two-stage spatial-upscale pipeline from %s …", self._model_path)
+        pipe = cls(model_dir=self._model_path, low_memory=self.low_memory)
+        pipe.load()
+        self._pipes[key] = pipe
+        log.info("MLX two-stage upscale pipeline ready ✓")
         return pipe
 
     def _resolve_lora_specs(self, specs: list[tuple[str, float]]) -> tuple[list[tuple[str, float]], list[str]]:
@@ -736,12 +747,9 @@ class LocalVideoGenerator:
         *,
         job_id: str | None = None,
     ) -> str:
-        ex = self._mlx_executor
-        if ex is None:
-            raise RuntimeError("LocalVideoGenerator executor is shut down")
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
-            ex,
+            None,
             functools.partial(
                 self._generate_sync,
                 GenerationRequest(
@@ -879,6 +887,28 @@ class LocalVideoGenerator:
                     self.default_lora_count(),
                 )
 
+            use_two_stage_upscale = (
+                bool(getattr(self, "upscale", False))
+                and mode == "generate"
+                and not tmp_audio
+                and not tmp_video
+                and not vc_items
+                and not resolved_loras
+            )
+            if (
+                bool(getattr(self, "upscale", False))
+                and mode == "generate"
+                and not tmp_audio
+                and not tmp_video
+                and not vc_items
+                and resolved_loras
+            ):
+                log.warning(
+                    "Spatial upscale (--upscale): two-stage path skipped while %d LoRA(s) "
+                    "are active (TwoStagePipeline has no extra LoRA fusion); using one-stage.",
+                    len(resolved_loras),
+                )
+
             try:
                 if mode == "a2v":
                     pipe = self._get_pipe("a2v")
@@ -953,50 +983,49 @@ class LocalVideoGenerator:
                         seed=int(req.seed),
                         num_steps=steps,
                     )
-                elif mode == "generate" and self.spatial_upscale:
-                    pipe = self._get_pipe("two_stage")
-                    s1_w, s1_h = width // 2, height // 2
-                    # Stage-1 uses dev transformer + CFG (much heavier per step than
-                    # one-stage distilled). Step count matches one-stage ``steps`` by
-                    # default; ``self.stage1_steps`` is a server floor when CLI raises it.
-                    stage1_count = max(steps, self.stage1_steps)
-                    log.info(
-                        "Two-stage upscale: stage-1 DiT+VAE at %s×%s px (½ of %s×%s out), "
-                        "dev+CFG denoise steps=%s (req=%s, floor=%s), then 2× latent upsample "
-                        "+ stage-2 refine (stage2=%s)",
-                        s1_w,
-                        s1_h,
-                        width,
-                        height,
-                        stage1_count,
-                        steps,
-                        self.stage1_steps,
-                        self.stage2_steps
-                        if self.stage2_steps is not None
-                        else "pipeline-default",
-                    )
-                    if resolved_loras:
+                elif use_two_stage_upscale:
+                    # Client H×W are the *final* output size (after 32-px align above).
+                    # TwoStagePipeline runs stage-1 denoise at height//2 × width//2 in
+                    # pixel space, applies spatial_upscaler_x2, then distilled stage-2 at
+                    # this full size. We snap the final to multiples of 64 so half-res
+                    # stays on the 32-px grid.
+                    nh, nw = _align_dimensions_for_spatial_upscale(height, width)
+                    if (nh, nw) != (height, width):
                         log.warning(
-                            "TwoStagePipeline (ltx-2-mlx) has no lora_paths / _pending_loras "
-                            "hook: stage-1 loads transformer-dev.safetensors as-is, stage-2 "
-                            "fuses only the bundled distilled LoRA. Per-request LoRAs cannot "
-                            "be merged safely without upstream support — ignoring %d spec(s). "
-                            "Use one-stage (omit --upscale) for Kijai-style LoRA, or run "
-                            "without --enable-lora for upscale.",
-                            len(resolved_loras),
+                            "Spatial upscale: adjusted final output so half-res stays "
+                            "on the %s-px grid (%s×%s → %s×%s)",
+                            LTX2_SPATIAL_ALIGN,
+                            height,
+                            width,
+                            nh,
+                            nw,
                         )
-                    _invoke_generate_and_save(
+                    u_h, u_w = nh, nw
+                    st1 = self.upscale_stage1_steps if self.upscale_stage1_steps is not None else steps
+                    st2 = self.upscale_stage2_steps if self.upscale_stage2_steps is not None else steps
+                    pipe = self._get_two_stage_upscale_pipe()
+                    log.info(
+                        "Two-stage spatial upscale: final output %s×%s px (stage-1 at "
+                        "%s×%s) → 2× spatial → distilled refine; steps stage1=%s stage2=%s",
+                        u_w,
+                        u_h,
+                        u_w // 2,
+                        u_h // 2,
+                        st1,
+                        st2,
+                    )
+                    _invoke_two_stage_generate_and_save(
                         pipe,
                         prompt=req.prompt,
                         output_path=out_path,
-                        height=height,
-                        width=width,
+                        height=u_h,
+                        width=u_w,
                         num_frames=nf,
                         seed=int(req.seed),
-                        stage1_steps=stage1_count,
-                        stage2_steps=self.stage2_steps,
-                        cfg_scale=self.two_stage_cfg_scale,
-                        stg_scale=self.two_stage_stg_scale,
+                        stage1_steps=st1,
+                        stage2_steps=st2,
+                        cfg_scale=self.upscale_cfg_scale,
+                        stg_scale=0.0,
                         image=tmp_image,
                     )
                 elif tmp_image:

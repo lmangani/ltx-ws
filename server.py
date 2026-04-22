@@ -504,7 +504,6 @@ class RequestHandler:
         self.spill_dir   = spill_dir
         self._session:  dict = {}
         self._t0        = time.time()
-        self._bg_disconnect_task: asyncio.Task | None = None
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -538,34 +537,6 @@ class RequestHandler:
             )
         except OSError as exc:
             log.error("  ✗ spill copy failed: %s", exc)
-
-    async def _drain_disconnected_job(
-        self,
-        gen_task: asyncio.Task,
-        generation_id: str,
-        prompt: str,
-    ) -> None:
-        """After the client leaves mid-flight, wait for MLX then spill (runs in background)."""
-        try:
-            video_path = await gen_task
-        except asyncio.CancelledError:
-            log.warning(
-                "  ◆ MLX wait for job %s cancelled (server shutting down?); "
-                "worker thread may still be finishing",
-                generation_id[:8],
-            )
-            raise
-        except Exception as gen_exc:
-            log.error(
-                "  ✗ background generation %s after client disconnect: %s",
-                generation_id[:8],
-                gen_exc,
-            )
-            return
-        try:
-            self._spill_copy(video_path, generation_id, prompt)
-        finally:
-            _cleanup_temp_video(video_path)
 
     async def _handle_client_msg_while_generating(
         self,
@@ -671,17 +642,10 @@ class RequestHandler:
 
         async with self.scheduler.generation_slot(_notify_queue) as generation_id:
             t_start = time.time()
-            upscale_tail = ""
-            if self.generator.spatial_upscale:
-                upscale_tail = (
-                    f"  [upscale: stage1 @ {gen_width // 2}×{gen_height // 2}px "
-                    f"(½ res) → output {gen_width}×{gen_height}px; "
-                    f"server stage1_floor={self.generator.stage1_steps} "
-                    f"(client num_steps={gen_num_steps} is one-stage only)]"
-                )
             log.info(
                 "  ▶ generation %s  mode=%s  prompt=%r  image=%s  audio=%s  video=%s "
-                "loras=%s (req=%s default=%s) vcond=%s seed=%s  %s×%s  frames=%s  steps=%s%s",
+                "loras=%s (req=%s default=%s) vcond=%s seed=%s  %s×%s  frames=%s  steps=%s "
+                "upscale=%s",
                 generation_id,
                 mode,
                 prompt[:72],
@@ -697,7 +661,7 @@ class RequestHandler:
                 gen_width,
                 gen_num_frames,
                 gen_num_steps,
-                upscale_tail,
+                getattr(self.generator, "upscale", False),
             )
 
             # ── gpu_assigned ──────────────────────────────────────────────────
@@ -783,15 +747,21 @@ class RequestHandler:
                         except websockets.exceptions.ConnectionClosed:
                             log.warning(
                                 "  ⚠ client disconnected during generation %s — "
-                                "releasing queue slot; MLX continues in-process (cannot preempt "
-                                "mid-step); spill-save runs when the job finishes",
+                                "waiting for encode then spill-saving MP4",
                                 generation_id[:8],
                             )
-                            self._bg_disconnect_task = asyncio.create_task(
-                                self._drain_disconnected_job(
-                                    gen_task, generation_id, prompt
+                            try:
+                                video_path = await gen_task
+                                self._spill_copy(video_path, generation_id, prompt)
+                            except Exception as gen_exc:
+                                log.error(
+                                    "  ✗ generation after client disconnect failed "
+                                    "(check %s for spill-salvaged *_ENCODE_FAIL*.mp4): %s",
+                                    self.spill_dir,
+                                    gen_exc,
                                 )
-                            )
+                            else:
+                                _cleanup_temp_video(video_path)
                             return
                         await self._handle_client_msg_while_generating(
                             frame, generation_id, t_start,
@@ -1075,58 +1045,45 @@ examples:
         dest="mlx_low_memory",
         help="pass low_memory=True to ltx-2-mlx (staged loads; slower, less RAM)",
     )
-
-    up = p.add_argument_group(
-        "native spatial upscale (ltx-2-mlx TwoStagePipeline)",
-    )
-    up.add_argument(
+    perf.add_argument(
         "--upscale",
         action="store_true",
         help=(
-            "For mode=generate (T2V and I2V): run ltx-2-mlx two-stage inference — "
-            "stage 1 at half the requested H×W with the dev transformer + CFG, then "
-            "native 2× latent upsampling (spatial_upscaler_x2_v1_1), then stage-2 "
-            "refine at full resolution with the bundled distilled LoRA. "
-            "Requires transformer-dev, spatial upscaler, and distilled LoRA files in "
-            "the model directory (e.g. dgrauet/ltx-2.3-mlx-q8). "
-            "Per-request LoRAs are ignored on this path. Does not use pixel scalers."
+            "for mode=generate only: use ltx TwoStagePipeline (half-res dev+CFG → "
+            "spatial_upscaler_x2_v1_1 → distilled stage-2). Lazy-loaded; ignored when "
+            "LoRAs are active, or for a2v/retake/extend/ic_lora. Requires model assets "
+            "(transformer-dev, spatial_upscaler_x2_v1_1, distilled LoRA)."
         ),
     )
-    up.add_argument(
-        "--stage1-steps",
+    perf.add_argument(
+        "--upscale-stage1-steps",
         type=int,
         default=None,
-        dest="stage1_steps",
+        dest="upscale_stage1_steps",
         metavar="N",
         help=(
-            "minimum two-stage stage-1 denoise steps (dev + CFG at half res); "
-            "defaults to --infer-steps. Per-job num_steps is max(client, this floor). "
-            "ltx-2-mlx often uses ~30 for best stage-1 quality — expect slower wall time."
+            "when --upscale: override stage-1 step count (default: same as --infer-steps "
+            "and per-request num_steps)"
         ),
     )
-    up.add_argument(
-        "--stage2-steps",
+    perf.add_argument(
+        "--upscale-stage2-steps",
         type=int,
         default=None,
-        dest="stage2_steps",
+        dest="upscale_stage2_steps",
         metavar="N",
         help=(
-            "two-stage stage-2 denoise steps (omit for ltx-2-mlx default STAGE_2_SIGMAS)."
+            "when --upscale: override stage-2 distilled refine step cap (default: same as "
+            "--infer-steps / per-request num_steps)"
         ),
     )
-    up.add_argument(
-        "--two-stage-cfg-scale",
+    perf.add_argument(
+        "--upscale-cfg-scale",
         type=float,
         default=3.0,
-        dest="two_stage_cfg_scale",
-        help="CFG scale for two-stage stage 1 (video branch; default: 3.0).",
-    )
-    up.add_argument(
-        "--two-stage-stg-scale",
-        type=float,
-        default=0.0,
-        dest="two_stage_stg_scale",
-        help="STG scale for two-stage stage 1 (default: 0.0).",
+        dest="upscale_cfg_scale",
+        metavar="X",
+        help="when --upscale: stage-1 CFG scale for TwoStagePipeline (default: 3.0)",
     )
 
     misc = p.add_argument_group("misc")
@@ -1164,15 +1121,13 @@ def main() -> None:
 
     if args.infer_steps < 1:
         parser.error("--infer-steps must be >= 1")
-    stage1_floor = (
-        args.stage1_steps if args.stage1_steps is not None else args.infer_steps
-    )
-    if args.upscale and stage1_floor < 1:
-        parser.error(
-            "when --upscale is set, stage-1 floor (--stage1-steps or --infer-steps) "
-            "must be >= 1",
-        )
-    stage2_arg: int | None = args.stage2_steps if args.upscale else None
+    if args.upscale:
+        if args.upscale_stage1_steps is not None and args.upscale_stage1_steps < 1:
+            parser.error("--upscale-stage1-steps must be >= 1 when set")
+        if args.upscale_stage2_steps is not None and args.upscale_stage2_steps < 1:
+            parser.error("--upscale-stage2-steps must be >= 1 when set")
+        if args.upscale_cfg_scale <= 0:
+            parser.error("--upscale-cfg-scale must be > 0")
     default_loras: list[tuple[str, float]] = []
     if args.enable_lora:
         default_loras = _default_loras_from_env()
@@ -1235,14 +1190,15 @@ def main() -> None:
         print("  LoRA     : disabled (use --enable-lora)")
     print(f"  low_mem  : {args.mlx_low_memory}")
     if args.upscale:
-        s2 = "default" if stage2_arg is None else str(stage2_arg)
+        _s1d = args.upscale_stage1_steps if args.upscale_stage1_steps is not None else args.infer_steps
+        _s2d = args.upscale_stage2_steps if args.upscale_stage2_steps is not None else args.infer_steps
         print(
-            f"  upscale  : native 2× (TwoStage)  stage1_floor={stage1_floor}  "
-            f"(per-job max(client num_steps, floor); dev+CFG is slower per step than distilled)  "
-            f"stage2={s2}  cfg={args.two_stage_cfg_scale}  stg={args.two_stage_stg_scale}"
+            f"  upscale  : on  (final = client size, 64-px snapped; stage-1 at ½ res; "
+            f"default steps stage1/stage2 = {_s1d}/{_s2d} from --infer-steps; "
+            f"cfg={args.upscale_cfg_scale})"
         )
     else:
-        print("  upscale  : off (single-stage distilled unless client uses other modes)")
+        print("  upscale  : off  (--upscale for spatial 2× two-stage on generate-only jobs)")
     print(f"{'═' * 60}\n")
 
     spill_dir = Path(args.spill_dir).expanduser().resolve()
@@ -1261,11 +1217,10 @@ def main() -> None:
         default_lora_specs  = default_loras,
         spill_dir           = spill_dir,
         low_memory          = args.mlx_low_memory,
-        spatial_upscale     = args.upscale,
-        stage1_steps        = stage1_floor,
-        stage2_steps        = stage2_arg,
-        two_stage_cfg_scale = args.two_stage_cfg_scale,
-        two_stage_stg_scale = args.two_stage_stg_scale,
+        upscale             = args.upscale,
+        upscale_stage1_steps=args.upscale_stage1_steps,
+        upscale_stage2_steps=args.upscale_stage2_steps,
+        upscale_cfg_scale   = args.upscale_cfg_scale,
     )
     log.info("Loading weights before accepting connections …")
     generator.load()
@@ -1287,9 +1242,6 @@ def main() -> None:
         asyncio.run(server.serve())
     except KeyboardInterrupt:
         print("\n\nServer stopped.")
-    finally:
-        log.info("Joining MLX worker thread (wait for any in-flight denoise to finish)…")
-        generator.shutdown_mlx_executor(wait=True)
 
 
 if __name__ == "__main__":
