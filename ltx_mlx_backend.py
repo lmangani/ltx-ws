@@ -518,6 +518,45 @@ def _decode_weighted_media_inputs(
     return decoded, temps
 
 
+def _callable_signature(fn: Any) -> inspect.Signature:
+    """Signature of the real implementation (unwraps decorators; fixes method MRO drift)."""
+    target = fn.__func__ if inspect.ismethod(fn) else fn
+    try:
+        target = inspect.unwrap(target)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return inspect.signature(target)
+
+
+def _log_generate_and_save_kwargs(
+    kind: str,
+    pipe: Any,
+    kwargs_in: dict[str, Any],
+    call_kwargs: dict[str, Any],
+) -> None:
+    """Log kwargs actually passed into ``generate_and_save`` (prompt truncated)."""
+    safe: dict[str, Any] = {}
+    for k, v in call_kwargs.items():
+        if k == "prompt" and isinstance(v, str):
+            safe[k] = v[:80] + ("…" if len(v) > 80 else "")
+        else:
+            safe[k] = v
+    dropped = sorted(set(kwargs_in) - set(call_kwargs))
+    if dropped:
+        log.warning(
+            "%s %s.generate_and_save dropped kwargs (not in resolved signature): %s",
+            kind,
+            type(pipe).__name__,
+            dropped,
+        )
+    log.info(
+        "%s %s.generate_and_save effective kwargs: %s",
+        kind,
+        type(pipe).__name__,
+        safe,
+    )
+
+
 def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     """
     Call ``pipe.generate_and_save`` while tolerating API drift between ltx-2-mlx versions.
@@ -529,11 +568,12 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     if fn is None:
         raise RuntimeError(f"{type(pipe).__name__} has no generate_and_save()")
 
-    sig = inspect.signature(fn)
+    sig = _callable_signature(fn)
     params = sig.parameters
     accepted = set(params.keys())
     has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
+    kwargs_in = dict(kwargs)
     call_kwargs = dict(kwargs)
     if "num_steps" in call_kwargs and "num_steps" not in accepted and "steps" in accepted:
         call_kwargs["steps"] = call_kwargs.pop("num_steps")
@@ -541,6 +581,7 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     if not has_varkw:
         call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepted}
 
+    _log_generate_and_save_kwargs("one-stage", pipe, kwargs_in, call_kwargs)
     fn(**call_kwargs)
 
 
@@ -550,15 +591,25 @@ def _invoke_two_stage_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     if fn is None:
         raise RuntimeError(f"{type(pipe).__name__} has no generate_and_save()")
 
-    sig = inspect.signature(fn)
+    sig = _callable_signature(fn)
     params = sig.parameters
     accepted = set(params.keys())
     has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
+    kwargs_in = dict(kwargs)
     call_kwargs = dict(kwargs)
     if not has_varkw:
         call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepted}
 
+    if "stage1_steps" in kwargs_in and "stage1_steps" not in call_kwargs:
+        log.error(
+            "two-stage: stage1_steps=%r was dropped — resolved signature is %s; "
+            "ltx-2-mlx may be resolving TextToVideoPipeline.generate_and_save. "
+            "Upgrade ltx-pipelines-mlx or expect library default (often 30) for stage 1.",
+            kwargs_in.get("stage1_steps"),
+            list(accepted),
+        )
+    _log_generate_and_save_kwargs("two-stage", pipe, kwargs_in, call_kwargs)
     fn(**call_kwargs)
 
 
@@ -826,7 +877,28 @@ class LocalVideoGenerator:
 
         nf = _nearest_valid_frames(int(req.num_frames or self.num_frames))
         mode = (req.mode or "generate").strip().lower()
-        steps = max(1, int(req.num_steps or self.inference_steps))
+        if req.num_steps is not None:
+            steps = max(1, int(req.num_steps))
+        else:
+            steps = max(1, int(self.inference_steps))
+        log.info(
+            "MLX preflight job=%s mode=%r frames=%s size=%s×%s (aligned %s×%s) "
+            "num_steps: client=%r server_default=%s → effective=%s "
+            "upscale_flag=%s upscale_cli_stage1=%r stage2=%r",
+            (req.job_id[:8] if req.job_id else "—"),
+            mode,
+            nf,
+            int(req.height or self.height),
+            int(req.width or self.width),
+            height,
+            width,
+            req.num_steps,
+            self.inference_steps,
+            steps,
+            bool(getattr(self, "upscale", False)),
+            getattr(self, "upscale_stage1_steps", None),
+            getattr(self, "upscale_stage2_steps", None),
+        )
         effective_loras: list[tuple[str, float]] = []
         if self._resolved_default_loras is not None:
             effective_loras.extend(self._resolved_default_loras)
@@ -1005,14 +1077,18 @@ class LocalVideoGenerator:
                     st2 = self.upscale_stage2_steps if self.upscale_stage2_steps is not None else steps
                     pipe = self._get_two_stage_upscale_pipe()
                     log.info(
-                        "Two-stage spatial upscale: final output %s×%s px (stage-1 at "
-                        "%s×%s) → 2× spatial → distilled refine; steps stage1=%s stage2=%s",
-                        u_w,
+                        "MLX two-stage path job=%s final_H×W=%s×%s stage1_H×W=%s×%s "
+                        "stage1_steps=%s stage2_steps=%s cfg_scale=%s "
+                        "(st* from effective=%s unless upscale_cli override)",
+                        (req.job_id[:8] if req.job_id else "—"),
                         u_h,
-                        u_w // 2,
+                        u_w,
                         u_h // 2,
+                        u_w // 2,
                         st1,
                         st2,
+                        self.upscale_cfg_scale,
+                        steps,
                     )
                     _invoke_two_stage_generate_and_save(
                         pipe,
