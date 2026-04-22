@@ -573,7 +573,7 @@ class LocalVideoGenerator:
         low_memory: bool = False,
         *,
         spatial_upscale: bool = False,
-        stage1_steps: int = 30,
+        stage1_steps: int = 8,
         stage2_steps: int | None = None,
         two_stage_cfg_scale: float = 3.0,
         two_stage_stg_scale: float = 0.0,
@@ -956,14 +956,20 @@ class LocalVideoGenerator:
                 elif mode == "generate" and self.spatial_upscale:
                     pipe = self._get_pipe("two_stage")
                     s1_w, s1_h = width // 2, height // 2
+                    # Stage-1 uses dev transformer + CFG (much heavier per step than
+                    # one-stage distilled). Step count matches one-stage ``steps`` by
+                    # default; ``self.stage1_steps`` is a server floor when CLI raises it.
+                    stage1_count = max(steps, self.stage1_steps)
                     log.info(
-                        "Two-stage upscale: stage-1 DiT+VAE at %s×%s px (exactly ½ of "
-                        "%s×%s output), then native 2× latent upsample + stage-2 refine "
-                        "(stage1_steps=%s stage2=%s)",
+                        "Two-stage upscale: stage-1 DiT+VAE at %s×%s px (½ of %s×%s out), "
+                        "dev+CFG denoise steps=%s (req=%s, floor=%s), then 2× latent upsample "
+                        "+ stage-2 refine (stage2=%s)",
                         s1_w,
                         s1_h,
                         width,
                         height,
+                        stage1_count,
+                        steps,
                         self.stage1_steps,
                         self.stage2_steps
                         if self.stage2_steps is not None
@@ -971,8 +977,12 @@ class LocalVideoGenerator:
                     )
                     if resolved_loras:
                         log.warning(
-                            "Native spatial upscale (TwoStagePipeline) does not apply "
-                            "per-request LoRAs; ignoring %d spec(s) for this job.",
+                            "TwoStagePipeline (ltx-2-mlx) has no lora_paths / _pending_loras "
+                            "hook: stage-1 loads transformer-dev.safetensors as-is, stage-2 "
+                            "fuses only the bundled distilled LoRA. Per-request LoRAs cannot "
+                            "be merged safely without upstream support — ignoring %d spec(s). "
+                            "Use one-stage (omit --upscale) for Kijai-style LoRA, or run "
+                            "without --enable-lora for upscale.",
                             len(resolved_loras),
                         )
                     _invoke_generate_and_save(
@@ -983,7 +993,7 @@ class LocalVideoGenerator:
                         width=width,
                         num_frames=nf,
                         seed=int(req.seed),
-                        stage1_steps=self.stage1_steps,
+                        stage1_steps=stage1_count,
                         stage2_steps=self.stage2_steps,
                         cfg_scale=self.two_stage_cfg_scale,
                         stg_scale=self.two_stage_stg_scale,

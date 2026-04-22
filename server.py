@@ -676,7 +676,7 @@ class RequestHandler:
                 upscale_tail = (
                     f"  [upscale: stage1 @ {gen_width // 2}×{gen_height // 2}px "
                     f"(½ res) → output {gen_width}×{gen_height}px; "
-                    f"server stage1_steps={self.generator.stage1_steps} "
+                    f"server stage1_floor={self.generator.stage1_steps} "
                     f"(client num_steps={gen_num_steps} is one-stage only)]"
                 )
             log.info(
@@ -1095,10 +1095,14 @@ examples:
     up.add_argument(
         "--stage1-steps",
         type=int,
-        default=30,
+        default=None,
         dest="stage1_steps",
         metavar="N",
-        help="two-stage stage-1 denoise steps (dev + CFG at half res; default: 30).",
+        help=(
+            "minimum two-stage stage-1 denoise steps (dev + CFG at half res); "
+            "defaults to --infer-steps. Per-job num_steps is max(client, this floor). "
+            "ltx-2-mlx often uses ~30 for best stage-1 quality — expect slower wall time."
+        ),
     )
     up.add_argument(
         "--stage2-steps",
@@ -1160,8 +1164,14 @@ def main() -> None:
 
     if args.infer_steps < 1:
         parser.error("--infer-steps must be >= 1")
-    if args.upscale and args.stage1_steps < 1:
-        parser.error("--stage1-steps must be >= 1 when --upscale is set")
+    stage1_floor = (
+        args.stage1_steps if args.stage1_steps is not None else args.infer_steps
+    )
+    if args.upscale and stage1_floor < 1:
+        parser.error(
+            "when --upscale is set, stage-1 floor (--stage1-steps or --infer-steps) "
+            "must be >= 1",
+        )
     stage2_arg: int | None = args.stage2_steps if args.upscale else None
     default_loras: list[tuple[str, float]] = []
     if args.enable_lora:
@@ -1227,7 +1237,8 @@ def main() -> None:
     if args.upscale:
         s2 = "default" if stage2_arg is None else str(stage2_arg)
         print(
-            f"  upscale  : native 2× (TwoStage)  stage1={args.stage1_steps}  "
+            f"  upscale  : native 2× (TwoStage)  stage1_floor={stage1_floor}  "
+            f"(per-job max(client num_steps, floor); dev+CFG is slower per step than distilled)  "
             f"stage2={s2}  cfg={args.two_stage_cfg_scale}  stg={args.two_stage_stg_scale}"
         )
     else:
@@ -1251,7 +1262,7 @@ def main() -> None:
         spill_dir           = spill_dir,
         low_memory          = args.mlx_low_memory,
         spatial_upscale     = args.upscale,
-        stage1_steps        = args.stage1_steps,
+        stage1_steps        = stage1_floor,
         stage2_steps        = stage2_arg,
         two_stage_cfg_scale = args.two_stage_cfg_scale,
         two_stage_stg_scale = args.two_stage_stg_scale,

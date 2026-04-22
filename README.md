@@ -295,9 +295,9 @@ python server.py --upscale --model dgrauet/ltx-2.3-mlx-q8 --height 1088 --width 
 
 **Requirements:** the model directory must contain **`transformer-dev.safetensors`**, **`spatial_upscaler_x2_v1_1.safetensors`**, and **`ltx-2.3-22b-distilled-lora-384.safetensors`** (standard files in the official MLX q8 bundle). This maps to [ltx-2-mlx `TwoStagePipeline`](https://github.com/dgrauet/ltx-2-mlx) — not Diffusers / PyTorch, and **not** a Lanczos or ffmpeg resize; muxing still uses whatever `ltx-2-mlx` already uses inside `decode_and_stream`.
 
-**LoRAs:** extra `--lora` / request LoRAs are **not** fused on the two-stage path (the pipeline already fuses the bundled distilled LoRA for stage 2); the server logs a warning and skips them for that job.
+**LoRAs and `--upscale`:** [ltx-2-mlx `TwoStagePipeline`](https://github.com/dgrauet/ltx-2-mlx) does **not** implement the same `lora_paths` fusion as one-stage `TextToVideoPipeline` / `ImageToVideoPipeline`. Stage 1 uses plain **dev** weights; stage 2 fuses only the **packaged distilled LoRA** built into that workflow. The server therefore **skips** global/request LoRA specs on upscale jobs (with a log line). For Kijai (or other) LoRAs, run **without** `--upscale`, or extend `ltx-2-mlx` to fuse extra LoRAs into the dev checkpoint before stage 1 / alongside stage 2.
 
-Tune stage-1 CFG / steps if needed: `--stage1-steps`, `--stage2-steps`, `--two-stage-cfg-scale`, `--two-stage-stg-scale`.
+**Stage-1 steps (why it can feel “slow”):** stage 1 uses the **dev** transformer with **CFG** (roughly twice the forward work per step vs a single distilled pass). The step count is **`max(client num_steps, server floor)`**, where the floor defaults to **`--infer-steps`** (same as one-stage). The old default of **30** stage-1 steps vs **8** distilled one-stage steps made wall time look “impossible” at half resolution — use a higher floor only when you want ltx-2-mlx–style quality (`--stage1-steps 30`). Tune CFG with `--two-stage-cfg-scale` / `--two-stage-stg-scale`, and stage 2 with `--stage2-steps`.
 
 ---
 
@@ -317,7 +317,7 @@ Tune stage-1 CFG / steps if needed: `--stage1-steps`, `--stage2-steps`, `--two-s
 | `--fps` | `24` | Nominal rate (mux behaviour follows pipeline). |
 | `--infer-steps` | `8` | One-stage distilled step count (minimum 1). |
 | `--upscale` | off | **Generate / I2V only:** native 2× latent upscale via `TwoStagePipeline` (half-res → upsampler → refine); see [Native spatial upscale](#native-spatial-upscale-optional). |
-| `--stage1-steps` | `30` | Two-stage stage-1 steps (dev + CFG at half resolution). |
+| `--stage1-steps` | *(same as `--infer-steps`)* | Floor for two-stage stage-1 steps; each job uses `max(num_steps, floor)`. Dev+CFG is costlier per step than distilled. |
 | `--stage2-steps` | *(pipeline default)* | Two-stage stage-2 steps (optional). |
 | `--two-stage-cfg-scale` | `3.0` | Stage-1 video CFG scale. |
 | `--two-stage-stg-scale` | `0.0` | Stage-1 STG scale. |
