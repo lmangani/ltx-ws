@@ -1097,6 +1097,14 @@ class LocalVideoGenerator:
                         low_w,
                         steps,
                     )
+                    # Some ltx-2-mlx builds mis-handle explicit seed kwargs on generate*;
+                    # seed globally and let generate()/generate_from_image() use defaults.
+                    try:
+                        import mlx.core as mx
+
+                        mx.random.seed(int(req.seed))
+                    except Exception:
+                        log.exception("Failed to set MLX RNG seed for upscale path")
                     if tmp_image and getattr(pipe, "generate_from_image", None) is not None:
                         video_latent, audio_latent = pipe.generate_from_image(
                             prompt=req.prompt,
@@ -1104,7 +1112,6 @@ class LocalVideoGenerator:
                             height=low_h,
                             width=low_w,
                             num_frames=nf,
-                            seed=int(req.seed),
                             num_steps=steps,
                         )
                     else:
@@ -1113,7 +1120,6 @@ class LocalVideoGenerator:
                             height=low_h,
                             width=low_w,
                             num_frames=nf,
-                            seed=int(req.seed),
                             num_steps=steps,
                         )
                     video_latent = self._spatial_upscale_video_latent_x2(pipe, video_latent)
