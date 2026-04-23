@@ -598,6 +598,43 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     fn(**call_kwargs)
 
 
+def _invoke_generate_for_upscale(pipe: Any, **kwargs: Any) -> tuple[Any, Any]:
+    """
+    Call ``pipe.generate`` (preferred) with signature filtering for upscale latent path.
+
+    This keeps prompt conditioning closer to normal one-stage generation than calling
+    pipeline-specific helper entrypoints first.
+    """
+    fn = getattr(pipe, "generate", None)
+    if fn is None:
+        raise RuntimeError(f"{type(pipe).__name__} has no generate()")
+
+    sig = _callable_signature(fn)
+    params = sig.parameters
+    accepted = set(params.keys())
+    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+    kwargs_in = dict(kwargs)
+    call_kwargs = dict(kwargs)
+    if "num_steps" in call_kwargs and "num_steps" not in accepted and "steps" in accepted:
+        call_kwargs["steps"] = call_kwargs.pop("num_steps")
+    if not has_varkw:
+        call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepted}
+
+    dropped = sorted(set(kwargs_in) - set(call_kwargs))
+    if dropped:
+        log.warning(
+            "upscale %s.generate dropped kwargs (not in resolved signature): %s",
+            type(pipe).__name__,
+            dropped,
+        )
+    log.info("upscale %s.generate effective kwargs: %s", type(pipe).__name__, call_kwargs)
+    result = fn(**call_kwargs)
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise RuntimeError(f"{type(pipe).__name__}.generate() did not return (video_latent, audio_latent)")
+    return result
+
+
 class LocalVideoGenerator:
     """
     ``ImageToVideoPipeline`` from ``ltx-2-mlx``: text-to-video when no image,
@@ -1111,23 +1148,15 @@ class LocalVideoGenerator:
                                 "--upscale path; continuing without explicit seed call."
                             )
                             self._seed_warned_for_upscale_path = True
-                    if tmp_image and getattr(pipe, "generate_from_image", None) is not None:
-                        video_latent, audio_latent = pipe.generate_from_image(
-                            prompt=req.prompt,
-                            image=tmp_image,
-                            height=low_h,
-                            width=low_w,
-                            num_frames=nf,
-                            num_steps=steps,
-                        )
-                    else:
-                        video_latent, audio_latent = pipe.generate(
-                            prompt=req.prompt,
-                            height=low_h,
-                            width=low_w,
-                            num_frames=nf,
-                            num_steps=steps,
-                        )
+                    video_latent, audio_latent = _invoke_generate_for_upscale(
+                        pipe,
+                        prompt=req.prompt,
+                        image=tmp_image,
+                        height=low_h,
+                        width=low_w,
+                        num_frames=nf,
+                        num_steps=steps,
+                    )
                     video_latent = self._spatial_upscale_video_latent_x2(pipe, video_latent)
                     decode_fn = getattr(pipe, "_decode_and_save_video", None)
                     if decode_fn is None:
