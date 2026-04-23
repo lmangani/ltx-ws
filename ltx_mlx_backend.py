@@ -509,6 +509,7 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
 
     - Drops unsupported kwargs.
     - Maps ``num_steps`` -> ``steps`` when needed.
+    - Maps ``fps`` -> ``frame_rate`` when upstream uses that name (Lightricks examples use ``frame_rate``).
     """
     fn = getattr(pipe, "generate_and_save", None)
     if fn is None:
@@ -522,6 +523,10 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     call_kwargs = dict(kwargs)
     if "num_steps" in call_kwargs and "num_steps" not in accepted and "steps" in accepted:
         call_kwargs["steps"] = call_kwargs.pop("num_steps")
+    if "fps" in call_kwargs and "fps" not in accepted and "frame_rate" in accepted:
+        call_kwargs["frame_rate"] = float(call_kwargs.pop("fps"))
+    elif "fps" in call_kwargs and "fps" not in accepted and "frame_rate" not in accepted:
+        call_kwargs.pop("fps", None)
 
     if not has_varkw:
         call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepted}
@@ -822,8 +827,8 @@ class LocalVideoGenerator:
                     if lora_cleanup:
                         tmp_lora_cleanup.append(lora_cleanup)
             log.info(
-                "Generation effective params: mode=%s seed=%s (requested=%s) size=%sx%s frames=%s steps=%s "
-                "(requested size=%sx%s frames=%s steps=%s) image=%s audio=%s video=%s "
+                "Generation effective params: mode=%s seed=%s (requested=%s) size=%sx%s frames=%s "
+                "steps=%s fps=%s (requested size=%sx%s frames=%s steps=%s) image=%s audio=%s video=%s "
                 "retake=%s-%s extend=%s/%s vcond=%s loras=%s model_path=%s",
                 mode,
                 seed,
@@ -832,6 +837,7 @@ class LocalVideoGenerator:
                 width,
                 nf,
                 steps,
+                float(self.fps),
                 requested_height,
                 requested_width,
                 requested_num_frames,
@@ -868,6 +874,7 @@ class LocalVideoGenerator:
                         height=height,
                         width=width,
                         num_frames=nf,
+                        fps=float(self.fps),
                         seed=seed,
                         num_steps=steps,
                         lora_paths=resolved_loras,
@@ -888,6 +895,7 @@ class LocalVideoGenerator:
                         height=height,
                         width=width,
                         num_frames=nf,
+                        fps=float(self.fps),
                         seed=seed,
                         num_steps=steps,
                         lora_paths=resolved_loras,
@@ -908,6 +916,7 @@ class LocalVideoGenerator:
                         height=height,
                         width=width,
                         num_frames=nf,
+                        fps=float(self.fps),
                         seed=seed,
                         num_steps=steps,
                         lora_paths=resolved_loras,
@@ -927,6 +936,7 @@ class LocalVideoGenerator:
                         height=height,
                         width=width,
                         num_frames=nf,
+                        fps=float(self.fps),
                         seed=seed,
                         num_steps=steps,
                     )
@@ -940,6 +950,7 @@ class LocalVideoGenerator:
                         height=height,
                         width=width,
                         num_frames=nf,
+                        fps=float(self.fps),
                         seed=seed,
                         num_steps=steps,
                         lora_paths=resolved_loras,
@@ -953,6 +964,7 @@ class LocalVideoGenerator:
                         height=height,
                         width=width,
                         num_frames=nf,
+                        fps=float(self.fps),
                         seed=seed,
                         num_steps=steps,
                         lora_paths=resolved_loras,
