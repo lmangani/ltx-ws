@@ -301,7 +301,6 @@ The client implements this flow for `--mode ltx` when `--server` is set.
 | `--fps` | `24` | Nominal rate (mux behaviour follows pipeline). |
 | `--infer-steps` | `8` | One-stage distilled step count (minimum 1). |
 | `--mlx-low-memory` | off | `low_memory=True` in ltx-2-mlx (slower, less RAM). |
-| `--upscale` | off | Optional **normal+spatial 2×** path for `mode=generate` only (not a2v/retake/extend/ic_lora): run the normal one-stage pipeline (including standard LoRA support) at **½** requested H×W, then apply `spatial_upscaler_x2_v1_1` to return to final client size. Final output H×W is snapped to multiples of **64** so half-res stays on LTX's 32-px grid. |
 | `--chunk-size` | `65536` | Max bytes per WebSocket binary frame. |
 | `--spill-dir` | `fvserver_completed` | Salvage directory on client disconnect. |
 | `--verbose` | off | Extra per-connection logs. |
@@ -360,7 +359,8 @@ Saved files look like: **`{prefix}_{NNN}_{slug}_{timestamp}.mp4`**. After a succ
 | **Player won’t open MP4** | Fragments are progressive / fMP4-style; remux: `ffmpeg -i in.mp4 -c copy out.mp4`. |
 | **`Missing ltx_pipelines_mlx`** | Install the two `uv pip install …ltx-2-mlx.git#subdirectory=…` lines from `requirements.txt`. |
 | **`huggingface_hub` errors** | Install deps; check `HF_TOKEN` for gated models; ensure enough free disk. |
-| **OOM / slow** | Use `--model dgrauet/ltx-2.3-mlx-q8` or `-q4`, lower `--num-frames` / resolution, or `--mlx-low-memory`. For **1080p-class** outputs, try `--upscale` (normal one-stage at half-res + LTX spatial x2; see CLI table). |
+| **OOM / slow** | Use `--model dgrauet/ltx-2.3-mlx-q8` or `-q4`, lower `--num-frames` / resolution, or `--mlx-low-memory`. |
+| **Need exact runtime params for debugging** | Check server logs for `Generation effective params:` — it prints mode, seed, final `size/frames/steps`, original requested values, input types, retake/extend args, LoRA/video-conditioning counts, and resolved model path. |
 | **Port already in use** | `--port` on server and matching URL on client. |
 | **`autoconcat` failed** | Install `ffmpeg` on the client host; fragments are kept if merge fails. |
 

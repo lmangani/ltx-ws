@@ -261,22 +261,6 @@ def _align_ltx2_spatial(n: int, align: int = LTX2_SPATIAL_ALIGN) -> int:
     return lower if (n - lower) <= (upper - n) else upper
 
 
-def _align_dimensions_for_spatial_upscale(height: int, width: int, align: int = LTX2_SPATIAL_ALIGN) -> tuple[int, int]:
-    """Snap **final** output H×W so ``height//2`` and ``width//2`` stay on the ``align`` px grid.
-
-    ``--upscale`` mode uses one-stage generation at half resolution, then applies
-    ``spatial_upscaler_x2_v1_1`` to return to this final size.
-    """
-    h = _align_ltx2_spatial(int(height), align)
-    w = _align_ltx2_spatial(int(width), align)
-    double = align * 2
-    if h % double != 0:
-        h = ((h + double - 1) // double) * double
-    if w % double != 0:
-        w = ((w + double - 1) // double) * double
-    return h, w
-
-
 def _nearest_valid_frames(n: int) -> int:
     if n < 9:
         return 9
@@ -518,52 +502,6 @@ def _decode_weighted_media_inputs(
     return decoded, temps
 
 
-def _callable_signature(fn: Any) -> inspect.Signature:
-    """Signature of the real implementation (unwraps decorators; fixes method MRO drift)."""
-    target = fn.__func__ if inspect.ismethod(fn) else fn
-    try:
-        target = inspect.unwrap(target)
-    except (TypeError, ValueError, AttributeError):
-        pass
-    return inspect.signature(target)
-
-
-def _lora_fp_for_cache(resolved: list[tuple[str, float]] | None) -> tuple[tuple[str, float], ...]:
-    """Stable, hashable fingerprint for caching pipeline instances per LoRA stack."""
-    if not resolved:
-        return ()
-    return tuple((str(p), float(s)) for p, s in resolved)
-
-
-def _log_generate_and_save_kwargs(
-    kind: str,
-    pipe: Any,
-    kwargs_in: dict[str, Any],
-    call_kwargs: dict[str, Any],
-) -> None:
-    """Log kwargs actually passed into ``generate_and_save`` (prompt truncated)."""
-    safe: dict[str, Any] = {}
-    for k, v in call_kwargs.items():
-        if k == "prompt" and isinstance(v, str):
-            safe[k] = v[:80] + ("…" if len(v) > 80 else "")
-        else:
-            safe[k] = v
-    dropped = sorted(set(kwargs_in) - set(call_kwargs))
-    if dropped:
-        log.warning(
-            "%s %s.generate_and_save dropped kwargs (not in resolved signature): %s",
-            kind,
-            type(pipe).__name__,
-            dropped,
-        )
-    log.info(
-        "%s %s.generate_and_save effective kwargs: %s",
-        kind,
-        type(pipe).__name__,
-        safe,
-    )
-
-
 def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     """
     Call ``pipe.generate_and_save`` while tolerating API drift between ltx-2-mlx versions.
@@ -575,107 +513,19 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     if fn is None:
         raise RuntimeError(f"{type(pipe).__name__} has no generate_and_save()")
 
-    sig = _callable_signature(fn)
+    sig = inspect.signature(fn)
     params = sig.parameters
     accepted = set(params.keys())
     has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
-    kwargs_in = dict(kwargs)
     call_kwargs = dict(kwargs)
     if "num_steps" in call_kwargs and "num_steps" not in accepted and "steps" in accepted:
         call_kwargs["steps"] = call_kwargs.pop("num_steps")
-    if (
-        "num_steps" in call_kwargs
-        and "num_steps" not in accepted
-        and "stage1_steps" in accepted
-    ):
-        call_kwargs["stage1_steps"] = call_kwargs.pop("num_steps")
 
     if not has_varkw:
         call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepted}
 
-    _log_generate_and_save_kwargs("one-stage", pipe, kwargs_in, call_kwargs)
     fn(**call_kwargs)
-
-
-def _invoke_generate_for_upscale(pipe: Any, **kwargs: Any) -> tuple[Any, Any]:
-    """
-    Call ``pipe.generate`` (preferred) with signature filtering for upscale latent path.
-
-    This keeps prompt conditioning closer to normal one-stage generation than calling
-    pipeline-specific helper entrypoints first.
-    """
-    fn = getattr(pipe, "generate", None)
-    if fn is None:
-        raise RuntimeError(f"{type(pipe).__name__} has no generate()")
-
-    sig = _callable_signature(fn)
-    params = sig.parameters
-    accepted = set(params.keys())
-    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-
-    kwargs_in = dict(kwargs)
-    call_kwargs = dict(kwargs)
-    if "num_steps" in call_kwargs and "num_steps" not in accepted and "steps" in accepted:
-        call_kwargs["steps"] = call_kwargs.pop("num_steps")
-    if not has_varkw:
-        call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepted}
-
-    dropped = sorted(set(kwargs_in) - set(call_kwargs))
-    if dropped:
-        log.warning(
-            "upscale %s.generate dropped kwargs (not in resolved signature): %s",
-            type(pipe).__name__,
-            dropped,
-        )
-    # If this is an i2v request and generate() cannot accept `image`, fall back
-    # to generate_from_image() so conditioning image is never silently ignored.
-    if kwargs_in.get("image") and "image" not in call_kwargs:
-        fn_i2v = getattr(pipe, "generate_from_image", None)
-        if fn_i2v is None:
-            raise RuntimeError(
-                f"{type(pipe).__name__}.generate() dropped image and no generate_from_image() exists"
-            )
-        sig_i2v = _callable_signature(fn_i2v)
-        params_i2v = sig_i2v.parameters
-        accepted_i2v = set(params_i2v.keys())
-        has_varkw_i2v = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in params_i2v.values()
-        )
-        call_kwargs_i2v = dict(kwargs_in)
-        if (
-            "num_steps" in call_kwargs_i2v
-            and "num_steps" not in accepted_i2v
-            and "steps" in accepted_i2v
-        ):
-            call_kwargs_i2v["steps"] = call_kwargs_i2v.pop("num_steps")
-        if not has_varkw_i2v:
-            call_kwargs_i2v = {k: v for k, v in call_kwargs_i2v.items() if k in accepted_i2v}
-        dropped_i2v = sorted(set(kwargs_in) - set(call_kwargs_i2v))
-        if dropped_i2v:
-            log.warning(
-                "upscale %s.generate_from_image dropped kwargs (not in resolved signature): %s",
-                type(pipe).__name__,
-                dropped_i2v,
-            )
-        log.info(
-            "upscale %s.generate_from_image effective kwargs: %s",
-            type(pipe).__name__,
-            call_kwargs_i2v,
-        )
-        result_i2v = fn_i2v(**call_kwargs_i2v)
-        if not isinstance(result_i2v, tuple) or len(result_i2v) != 2:
-            raise RuntimeError(
-                f"{type(pipe).__name__}.generate_from_image() did not return "
-                "(video_latent, audio_latent)"
-            )
-        return result_i2v
-
-    log.info("upscale %s.generate effective kwargs: %s", type(pipe).__name__, call_kwargs)
-    result = fn(**call_kwargs)
-    if not isinstance(result, tuple) or len(result) != 2:
-        raise RuntimeError(f"{type(pipe).__name__}.generate() did not return (video_latent, audio_latent)")
-    return result
 
 
 class LocalVideoGenerator:
@@ -696,8 +546,6 @@ class LocalVideoGenerator:
         default_lora_specs: list[tuple[str, float]] | None = None,
         spill_dir: Path | None = None,
         low_memory: bool = False,
-        *,
-        upscale: bool = False,
     ) -> None:
         self.model = model
         self.num_frames = int(num_frames)
@@ -709,13 +557,10 @@ class LocalVideoGenerator:
         self.default_lora_specs = list(default_lora_specs or [])
         self.spill_dir = spill_dir
         self.low_memory = bool(low_memory)
-        self.upscale = bool(upscale)
         self._model_path: str | None = None
         self._pipe_classes: dict[str, Any] = {}
-        # Cache key: (pipeline_key, lora_fingerprint); see _get_pipe / _lora_fp_for_cache.
-        self._pipes: dict[tuple[str, tuple[tuple[str, float], ...]], Any] = {}
+        self._pipes: dict[str, Any] = {}
         self._resolved_default_loras: list[tuple[str, float]] | None = None
-        self._seed_warned_for_upscale_path = False
 
     def _resolve_model_dir(self) -> str:
         return resolve_mlx_weights_directory(self.model, self.model_dir)
@@ -748,107 +593,21 @@ class LocalVideoGenerator:
             self._pipe_classes["ic_lora"] = ic_cls
         log.info("MLX model path resolved ✓ %s", path)
 
-    def _get_pipe(
-        self,
-        key: str,
-        resolved_loras: list[tuple[str, float]] | None = None,
-    ) -> Any:
-        """
-        Return a cached MLX pipeline for ``key``, optionally fusing LoRAs at **load** time.
-
-        ltx-2-mlx one-stage APIs do not take ``lora_paths`` on ``generate_and_save``; extra
-        LoRAs are applied via ``_pending_loras`` before ``load()`` (see TextToVideoPipeline).
-        """
-        fp = _lora_fp_for_cache(resolved_loras)
-        cache_key = (key, fp)
-        if cache_key in self._pipes:
-            return self._pipes[cache_key]
+    def _get_pipe(self, key: str) -> Any:
+        if key in self._pipes:
+            return self._pipes[key]
         self.load()
         if self._model_path is None:
             raise RuntimeError("MLX model path not initialized")
         cls = self._pipe_classes.get(key)
         if cls is None:
             raise RuntimeError(f"Unsupported pipeline key: {key}")
-        log.info(
-            "Loading MLX pipeline %s from %s (lora_fp=%d paths) …",
-            key,
-            self._model_path,
-            len(fp),
-        )
-        if key == "ic_lora":
-            pipe = cls(
-                model_dir=self._model_path,
-                lora_paths=list(fp) if fp else None,
-                low_memory=self.low_memory,
-            )
-        else:
-            pipe = cls(model_dir=self._model_path, low_memory=self.low_memory)
-            if fp:
-                setattr(pipe, "_pending_loras", list(fp))
+        log.info("Loading MLX pipeline %s from %s …", key, self._model_path)
+        pipe = cls(model_dir=self._model_path, low_memory=self.low_memory)
         pipe.load()
-        self._pipes[cache_key] = pipe
-        log.info("MLX pipeline ready ✓ (%s, %d LoRA(s) fused at load)", key, len(fp))
+        self._pipes[key] = pipe
+        log.info("MLX pipeline ready ✓ (%s)", key)
         return pipe
-
-    def _spatial_upscale_video_latent_x2(self, pipe: Any, video_latent: Any) -> Any:
-        """
-        Apply LTX spatial upsampler (2x) to a one-stage generated video latent.
-
-        This keeps the existing one-stage generation path intact (including LoRA support),
-        then runs only the spatial 2x pass to return to the requested output size.
-        """
-        if self._model_path is None:
-            raise RuntimeError("MLX model path not initialized")
-        try:
-            import json
-            import mlx.core as mx
-            from ltx_core_mlx.model.upsampler import LatentUpsampler
-            from ltx_core_mlx.utils.weights import load_split_safetensors
-        except ImportError as e:
-            raise RuntimeError(
-                "Missing ltx-core-mlx pieces for spatial upscaling "
-                "(LatentUpsampler/load_split_safetensors)."
-            ) from e
-
-        # ImageToVideoPipeline exposes _load_vae_encoder() and vae_encoder.
-        if getattr(pipe, "_load_vae_encoder", None) is None:
-            raise RuntimeError(
-                f"{type(pipe).__name__} has no _load_vae_encoder(); cannot run spatial upscale pass"
-            )
-        pipe._load_vae_encoder()
-        vae_encoder = getattr(pipe, "vae_encoder", None)
-        if vae_encoder is None:
-            raise RuntimeError("VAE encoder unavailable for spatial upscale pass")
-
-        model_dir = Path(self._model_path)
-        name = "spatial_upscaler_x2_v1_1"
-        config_path = model_dir / f"{name}_config.json"
-        weights_path = model_dir / f"{name}.safetensors"
-        if not weights_path.exists():
-            raise FileNotFoundError(
-                f"Spatial upscaler weights not found: {weights_path}. "
-                "Expected for --upscale second pass."
-            )
-
-        if config_path.exists():
-            config = json.loads(config_path.read_text(encoding="utf-8")).get("config", {})
-            upsampler = LatentUpsampler.from_config(config)
-        else:
-            upsampler = LatentUpsampler()
-
-        up_weights = load_split_safetensors(weights_path, prefix=f"{name}.")
-        upsampler.load_weights(list(up_weights.items()))
-
-        # one-stage latent layout: (B,C,F,H,W)
-        video_mlx = video_latent.transpose(0, 2, 3, 4, 1)
-        video_denorm = vae_encoder.denormalize_latent(video_mlx)
-        video_denorm = video_denorm.transpose(0, 4, 1, 2, 3)
-        video_upscaled = upsampler(video_denorm)
-        video_up_mlx = video_upscaled.transpose(0, 2, 3, 4, 1)
-        video_upscaled = vae_encoder.normalize_latent(video_up_mlx)
-        video_upscaled = video_upscaled.transpose(0, 4, 1, 2, 3)
-        mx.eval(video_upscaled)
-        return video_upscaled
 
     def _resolve_lora_specs(self, specs: list[tuple[str, float]]) -> tuple[list[tuple[str, float]], list[str]]:
         resolved: list[tuple[str, float]] = []
@@ -972,42 +731,34 @@ class LocalVideoGenerator:
         self.load()
 
         assert self._model_path is not None
-        ah = _align_ltx2_spatial(int(req.height or self.height))
-        aw = _align_ltx2_spatial(int(req.width or self.width))
-        if ah != int(req.height or self.height) or aw != int(req.width or self.width):
+        requested_height = int(req.height or self.height)
+        requested_width = int(req.width or self.width)
+        ah = _align_ltx2_spatial(requested_height)
+        aw = _align_ltx2_spatial(requested_width)
+        if ah != requested_height or aw != requested_width:
             log.warning(
                 "LTX requires H×W divisible by %s; adjusted %s×%s → %s×%s",
                 LTX2_SPATIAL_ALIGN,
-                req.height,
-                req.width,
+                requested_height,
+                requested_width,
                 ah,
                 aw,
             )
         height, width = ah, aw
 
-        nf = _nearest_valid_frames(int(req.num_frames or self.num_frames))
+        requested_num_frames = int(req.num_frames or self.num_frames)
+        nf = _nearest_valid_frames(requested_num_frames)
+        if nf != requested_num_frames:
+            log.warning(
+                "LTX requires (frames-1)%%8==0; adjusted frames %s → %s",
+                requested_num_frames,
+                nf,
+            )
         mode = (req.mode or "generate").strip().lower()
-        if req.num_steps is not None:
-            steps = max(1, int(req.num_steps))
-        else:
-            steps = max(1, int(self.inference_steps))
-        log.info(
-            "MLX preflight job=%s mode=%r frames=%s "
-            "requested_H×W=%s×%s aligned_H×W=%s×%s (height×width) "
-            "num_steps: client=%r server_default=%s → effective=%s "
-            "upscale_flag=%s",
-            (req.job_id[:8] if req.job_id else "—"),
-            mode,
-            nf,
-            int(req.height or self.height),
-            int(req.width or self.width),
-            height,
-            width,
-            req.num_steps,
-            self.inference_steps,
-            steps,
-            bool(getattr(self, "upscale", False)),
-        )
+        requested_steps = int(req.num_steps or self.inference_steps)
+        steps = max(1, requested_steps)
+        if steps != requested_steps:
+            log.warning("LTX steps must be >=1; adjusted steps %s → %s", requested_steps, steps)
         effective_loras: list[tuple[str, float]] = []
         if self._resolved_default_loras is not None:
             effective_loras.extend(self._resolved_default_loras)
@@ -1059,6 +810,31 @@ class LocalVideoGenerator:
                     resolved_loras.append((lora_path, float(lora_scale)))
                     if lora_cleanup:
                         tmp_lora_cleanup.append(lora_cleanup)
+            log.info(
+                "Generation effective params: mode=%s seed=%s size=%sx%s frames=%s steps=%s "
+                "(requested size=%sx%s frames=%s steps=%s) image=%s audio=%s video=%s "
+                "retake=%s-%s extend=%s/%s vcond=%s loras=%s model_path=%s",
+                mode,
+                int(req.seed),
+                height,
+                width,
+                nf,
+                steps,
+                requested_height,
+                requested_width,
+                requested_num_frames,
+                requested_steps,
+                "yes" if tmp_image else "no",
+                "yes" if tmp_audio else "no",
+                "yes" if tmp_video else "no",
+                req.retake_start if req.retake_start is not None else "-",
+                req.retake_end if req.retake_end is not None else "-",
+                req.extend_frames if req.extend_frames is not None else "-",
+                (req.extend_direction or "after").strip().lower(),
+                len(vc_items),
+                len(resolved_loras),
+                self._model_path,
+            )
             if resolved_loras:
                 log.info(
                     "Applying %d LoRA(s) for mode=%s (request=%d, defaults=%d)",
@@ -1068,22 +844,9 @@ class LocalVideoGenerator:
                     self.default_lora_count(),
                 )
 
-            use_spatial_upscale_pass = (
-                bool(getattr(self, "upscale", False))
-                and mode == "generate"
-                and not tmp_audio
-                and not tmp_video
-                and not vc_items
-            )
-            if use_spatial_upscale_pass:
-                log.info(
-                    "Spatial upscale mode: one-stage generation first (LoRA-capable), "
-                    "then LTX spatial_upscaler_x2_v1_1 pass."
-                )
-
             try:
                 if mode == "a2v":
-                    pipe = self._get_pipe("a2v", resolved_loras)
+                    pipe = self._get_pipe("a2v")
                     _invoke_generate_and_save(
                         pipe,
                         prompt=req.prompt,
@@ -1095,13 +858,14 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
+                        lora_paths=resolved_loras,
                     )
                 elif mode == "retake":
                     if not tmp_video:
                         raise RuntimeError("retake mode requires source video input")
                     start_frame = int(req.retake_start if req.retake_start is not None else 1)
                     end_frame = int(req.retake_end if req.retake_end is not None else start_frame)
-                    pipe = self._get_pipe("retake", resolved_loras)
+                    pipe = self._get_pipe("retake")
                     _invoke_generate_and_save(
                         pipe,
                         prompt=req.prompt,
@@ -1114,13 +878,14 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
+                        lora_paths=resolved_loras,
                     )
                 elif mode == "extend":
                     if not tmp_video:
                         raise RuntimeError("extend mode requires source video input")
                     ext_frames = int(req.extend_frames if req.extend_frames is not None else 2)
                     direction = (req.extend_direction or "after").strip().lower()
-                    pipe = self._get_pipe("extend", resolved_loras)
+                    pipe = self._get_pipe("extend")
                     _invoke_generate_and_save(
                         pipe,
                         prompt=req.prompt,
@@ -1133,17 +898,19 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
+                        lora_paths=resolved_loras,
                     )
                 elif mode == "ic_lora":
                     if not resolved_loras:
                         raise RuntimeError("ic_lora mode requires at least one LoRA spec")
                     if not vc_items:
                         raise RuntimeError("ic_lora mode requires video_conditioning entries")
-                    pipe = self._get_pipe("ic_lora", resolved_loras)
+                    pipe = self._get_pipe("ic_lora")
                     _invoke_generate_and_save(
                         pipe,
                         prompt=req.prompt,
                         output_path=out_path,
+                        lora_paths=[(str(p), float(s)) for p, s in resolved_loras],
                         video_conditioning=[(str(p), float(s)) for p, s in vc_items],
                         height=height,
                         width=width,
@@ -1151,62 +918,8 @@ class LocalVideoGenerator:
                         seed=int(req.seed),
                         num_steps=steps,
                     )
-                elif use_spatial_upscale_pass:
-                    # Client H×W are the final output size; upscale mode generates at half
-                    # resolution first, then applies only LTX spatial_upscaler_x2_v1_1.
-                    nh, nw = _align_dimensions_for_spatial_upscale(height, width)
-                    if (nh, nw) != (height, width):
-                        log.warning(
-                            "Spatial upscale: adjusted final output so half-res stays "
-                            "on the %s-px grid (%s×%s → %s×%s)",
-                            LTX2_SPATIAL_ALIGN,
-                            height,
-                            width,
-                            nh,
-                            nw,
-                        )
-                    u_h, u_w = nh, nw
-                    low_h, low_w = max(LTX2_SPATIAL_ALIGN, u_h // 2), max(LTX2_SPATIAL_ALIGN, u_w // 2)
-                    pipe = self._get_pipe("i2v", resolved_loras) if tmp_image else self._get_pipe("t2v", resolved_loras)
-                    log.info(
-                        "MLX upscale path job=%s final_H×W=%s×%s low_H×W=%s×%s "
-                        "steps=%s (normal pipeline at low-res, then spatial x2)",
-                        (req.job_id[:8] if req.job_id else "—"),
-                        u_h,
-                        u_w,
-                        low_h,
-                        low_w,
-                        steps,
-                    )
-                    # Some ltx-2-mlx builds mis-handle explicit seed kwargs on generate*;
-                    # seed globally and let generate()/generate_from_image() use defaults.
-                    try:
-                        import mlx.core as mx
-
-                        mx.random.seed(seed=int(req.seed))
-                    except Exception:
-                        if not self._seed_warned_for_upscale_path:
-                            log.warning(
-                                "MLX RNG seeding is unavailable on this runtime build in "
-                                "--upscale path; continuing without explicit seed call."
-                            )
-                            self._seed_warned_for_upscale_path = True
-                    video_latent, audio_latent = _invoke_generate_for_upscale(
-                        pipe,
-                        prompt=req.prompt,
-                        image=tmp_image,
-                        height=low_h,
-                        width=low_w,
-                        num_frames=nf,
-                        num_steps=steps,
-                    )
-                    video_latent = self._spatial_upscale_video_latent_x2(pipe, video_latent)
-                    decode_fn = getattr(pipe, "_decode_and_save_video", None)
-                    if decode_fn is None:
-                        raise RuntimeError(f"{type(pipe).__name__} has no _decode_and_save_video()")
-                    decode_fn(video_latent, audio_latent, out_path, fps=self.fps)
                 elif tmp_image:
-                    pipe = self._get_pipe("i2v", resolved_loras)
+                    pipe = self._get_pipe("i2v")
                     _invoke_generate_and_save(
                         pipe,
                         prompt=req.prompt,
@@ -1217,9 +930,10 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
+                        lora_paths=resolved_loras,
                     )
                 else:
-                    pipe = self._get_pipe("t2v", resolved_loras)
+                    pipe = self._get_pipe("t2v")
                     _invoke_generate_and_save(
                         pipe,
                         prompt=req.prompt,
@@ -1229,6 +943,7 @@ class LocalVideoGenerator:
                         num_frames=nf,
                         seed=int(req.seed),
                         num_steps=steps,
+                        lora_paths=resolved_loras,
                     )
             except BaseException:
                 self._salvage_mp4_to_spill(tmpdir, out_path, req.job_id, req.prompt, "ENCODE_FAIL")
