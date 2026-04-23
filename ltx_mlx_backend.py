@@ -264,8 +264,8 @@ def _align_ltx2_spatial(n: int, align: int = LTX2_SPATIAL_ALIGN) -> int:
 def _align_dimensions_for_spatial_upscale(height: int, width: int, align: int = LTX2_SPATIAL_ALIGN) -> tuple[int, int]:
     """Snap **final** output H×W so ``height//2`` and ``width//2`` stay on the ``align`` px grid.
 
-    ``TwoStagePipeline`` is called with this full size; it generates at half resolution
-    internally, then spatial-2× upscales back to these dimensions.
+    ``--upscale`` mode uses one-stage generation at half resolution, then applies
+    ``spatial_upscaler_x2_v1_1`` to return to this final size.
     """
     h = _align_ltx2_spatial(int(height), align)
     w = _align_ltx2_spatial(int(width), align)
@@ -598,34 +598,6 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     fn(**call_kwargs)
 
 
-def _invoke_two_stage_generate_and_save(pipe: Any, **kwargs: Any) -> None:
-    """Call ``TwoStagePipeline.generate_and_save`` with kwargs filtered to the signature."""
-    fn = getattr(pipe, "generate_and_save", None)
-    if fn is None:
-        raise RuntimeError(f"{type(pipe).__name__} has no generate_and_save()")
-
-    sig = _callable_signature(fn)
-    params = sig.parameters
-    accepted = set(params.keys())
-    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-
-    kwargs_in = dict(kwargs)
-    call_kwargs = dict(kwargs)
-    if not has_varkw:
-        call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepted}
-
-    if "stage1_steps" in kwargs_in and "stage1_steps" not in call_kwargs:
-        log.error(
-            "two-stage: stage1_steps=%r was dropped — resolved signature is %s; "
-            "ltx-2-mlx may be resolving TextToVideoPipeline.generate_and_save. "
-            "Upgrade ltx-pipelines-mlx or expect library default (often 30) for stage 1.",
-            kwargs_in.get("stage1_steps"),
-            list(accepted),
-        )
-    _log_generate_and_save_kwargs("two-stage", pipe, kwargs_in, call_kwargs)
-    fn(**call_kwargs)
-
-
 class LocalVideoGenerator:
     """
     ``ImageToVideoPipeline`` from ``ltx-2-mlx``: text-to-video when no image,
@@ -646,9 +618,6 @@ class LocalVideoGenerator:
         low_memory: bool = False,
         *,
         upscale: bool = False,
-        upscale_stage1_steps: int | None = None,
-        upscale_stage2_steps: int | None = None,
-        upscale_cfg_scale: float = 3.0,
     ) -> None:
         self.model = model
         self.num_frames = int(num_frames)
@@ -661,13 +630,6 @@ class LocalVideoGenerator:
         self.spill_dir = spill_dir
         self.low_memory = bool(low_memory)
         self.upscale = bool(upscale)
-        self.upscale_stage1_steps = (
-            None if upscale_stage1_steps is None else max(1, int(upscale_stage1_steps))
-        )
-        self.upscale_stage2_steps = (
-            None if upscale_stage2_steps is None else max(1, int(upscale_stage2_steps))
-        )
-        self.upscale_cfg_scale = float(upscale_cfg_scale)
         self._model_path: str | None = None
         self._pipe_classes: dict[str, Any] = {}
         # Cache key: (pipeline_key, lora_fingerprint); see _get_pipe / _lora_fp_for_cache.
@@ -747,38 +709,65 @@ class LocalVideoGenerator:
         log.info("MLX pipeline ready ✓ (%s, %d LoRA(s) fused at load)", key, len(fp))
         return pipe
 
-    def _get_two_stage_upscale_pipe(self) -> Any:
+    def _spatial_upscale_video_latent_x2(self, pipe: Any, video_latent: Any) -> Any:
         """
-        Lazy-load ``TwoStagePipeline`` (half-res dev + CFG → spatial 2× → distilled stage-2).
+        Apply LTX spatial upsampler (2x) to a one-stage generated video latent.
 
-        Kept separate from one-stage ``t2v``/``i2v`` pipes so ``--upscale`` off does not
-        load extra weights or change default behaviour.
+        This keeps the existing one-stage generation path intact (including LoRA support),
+        then runs only the spatial 2x pass to return to the requested output size.
         """
-        cache_key: tuple[str, tuple[tuple[str, float], ...]] = ("two_stage_upscale", ())
-        if cache_key in self._pipes:
-            return self._pipes[cache_key]
-        self.load()
         if self._model_path is None:
             raise RuntimeError("MLX model path not initialized")
         try:
-            import ltx_pipelines_mlx as lpm
+            import json
+            import mlx.core as mx
+            from ltx_core_mlx.model.upsampler import LatentUpsampler
+            from ltx_core_mlx.utils.weights import load_split_safetensors
         except ImportError as e:
             raise RuntimeError(
-                "Missing ltx_pipelines_mlx for spatial upscale (install ltx-2-mlx packages)."
+                "Missing ltx-core-mlx pieces for spatial upscaling "
+                "(LatentUpsampler/load_split_safetensors)."
             ) from e
-        cls = getattr(lpm, "TwoStagePipeline", None)
-        if cls is None:
+
+        # ImageToVideoPipeline exposes _load_vae_encoder() and vae_encoder.
+        if getattr(pipe, "_load_vae_encoder", None) is None:
             raise RuntimeError(
-                "This ltx-pipelines-mlx build has no TwoStagePipeline. "
-                "Upgrade ltx-2-mlx (spatial upscale uses transformer-dev + "
-                "spatial_upscaler_x2_v1_1 + distilled LoRA in the model directory)."
+                f"{type(pipe).__name__} has no _load_vae_encoder(); cannot run spatial upscale pass"
             )
-        log.info("Loading MLX two-stage spatial-upscale pipeline from %s …", self._model_path)
-        pipe = cls(model_dir=self._model_path, low_memory=self.low_memory)
-        pipe.load()
-        self._pipes[cache_key] = pipe
-        log.info("MLX two-stage upscale pipeline ready ✓")
-        return pipe
+        pipe._load_vae_encoder()
+        vae_encoder = getattr(pipe, "vae_encoder", None)
+        if vae_encoder is None:
+            raise RuntimeError("VAE encoder unavailable for spatial upscale pass")
+
+        model_dir = Path(self._model_path)
+        name = "spatial_upscaler_x2_v1_1"
+        config_path = model_dir / f"{name}_config.json"
+        weights_path = model_dir / f"{name}.safetensors"
+        if not weights_path.exists():
+            raise FileNotFoundError(
+                f"Spatial upscaler weights not found: {weights_path}. "
+                "Expected for --upscale second pass."
+            )
+
+        if config_path.exists():
+            config = json.loads(config_path.read_text(encoding="utf-8")).get("config", {})
+            upsampler = LatentUpsampler.from_config(config)
+        else:
+            upsampler = LatentUpsampler()
+
+        up_weights = load_split_safetensors(weights_path, prefix=f"{name}.")
+        upsampler.load_weights(list(up_weights.items()))
+
+        # one-stage latent layout: (B,C,F,H,W)
+        video_mlx = video_latent.transpose(0, 2, 3, 4, 1)
+        video_denorm = vae_encoder.denormalize_latent(video_mlx)
+        video_denorm = video_denorm.transpose(0, 4, 1, 2, 3)
+        video_upscaled = upsampler(video_denorm)
+        video_up_mlx = video_upscaled.transpose(0, 2, 3, 4, 1)
+        video_upscaled = vae_encoder.normalize_latent(video_up_mlx)
+        video_upscaled = video_upscaled.transpose(0, 4, 1, 2, 3)
+        mx.eval(video_upscaled)
+        return video_upscaled
 
     def _resolve_lora_specs(self, specs: list[tuple[str, float]]) -> tuple[list[tuple[str, float]], list[str]]:
         resolved: list[tuple[str, float]] = []
@@ -925,7 +914,7 @@ class LocalVideoGenerator:
             "MLX preflight job=%s mode=%r frames=%s "
             "requested_H×W=%s×%s aligned_H×W=%s×%s (height×width) "
             "num_steps: client=%r server_default=%s → effective=%s "
-            "upscale_flag=%s upscale_cli_stage1=%r stage2=%r",
+            "upscale_flag=%s",
             (req.job_id[:8] if req.job_id else "—"),
             mode,
             nf,
@@ -937,8 +926,6 @@ class LocalVideoGenerator:
             self.inference_steps,
             steps,
             bool(getattr(self, "upscale", False)),
-            getattr(self, "upscale_stage1_steps", None),
-            getattr(self, "upscale_stage2_steps", None),
         )
         effective_loras: list[tuple[str, float]] = []
         if self._resolved_default_loras is not None:
@@ -1000,19 +987,17 @@ class LocalVideoGenerator:
                     self.default_lora_count(),
                 )
 
-            use_two_stage_upscale = (
+            use_spatial_upscale_pass = (
                 bool(getattr(self, "upscale", False))
                 and mode == "generate"
                 and not tmp_audio
                 and not tmp_video
                 and not vc_items
             )
-            if use_two_stage_upscale and resolved_loras:
-                log.warning(
-                    "Spatial upscale (--upscale): %d extra LoRA(s) are not fused inside "
-                    "TwoStagePipeline (stage 2 uses the model's distilled LoRA only). "
-                    "Two-stage still runs; use one-stage without --upscale if you need those LoRAs.",
-                    len(resolved_loras),
+            if use_spatial_upscale_pass:
+                log.info(
+                    "Spatial upscale mode: one-stage generation first (LoRA-capable), "
+                    "then LTX spatial_upscaler_x2_v1_1 pass."
                 )
 
             try:
@@ -1085,12 +1070,9 @@ class LocalVideoGenerator:
                         seed=int(req.seed),
                         num_steps=steps,
                     )
-                elif use_two_stage_upscale:
-                    # Client H×W are the *final* output size (after 32-px align above).
-                    # TwoStagePipeline runs stage-1 denoise at height//2 × width//2 in
-                    # pixel space, applies spatial_upscaler_x2, then distilled stage-2 at
-                    # this full size. We snap the final to multiples of 64 so half-res
-                    # stays on the 32-px grid.
+                elif use_spatial_upscale_pass:
+                    # Client H×W are the final output size; upscale mode generates at half
+                    # resolution first, then applies only LTX spatial_upscaler_x2_v1_1.
                     nh, nw = _align_dimensions_for_spatial_upscale(height, width)
                     if (nh, nw) != (height, width):
                         log.warning(
@@ -1103,37 +1085,42 @@ class LocalVideoGenerator:
                             nw,
                         )
                     u_h, u_w = nh, nw
-                    st1 = self.upscale_stage1_steps if self.upscale_stage1_steps is not None else steps
-                    st2 = self.upscale_stage2_steps if self.upscale_stage2_steps is not None else steps
-                    pipe = self._get_two_stage_upscale_pipe()
+                    low_h, low_w = max(LTX2_SPATIAL_ALIGN, u_h // 2), max(LTX2_SPATIAL_ALIGN, u_w // 2)
+                    pipe = self._get_pipe("i2v", resolved_loras) if tmp_image else self._get_pipe("t2v", resolved_loras)
                     log.info(
-                        "MLX two-stage path job=%s final_H×W=%s×%s stage1_H×W=%s×%s "
-                        "stage1_steps=%s stage2_steps=%s cfg_scale=%s "
-                        "(st* from effective=%s unless upscale_cli override)",
+                        "MLX upscale path job=%s final_H×W=%s×%s low_H×W=%s×%s "
+                        "steps=%s (normal pipeline at low-res, then spatial x2)",
                         (req.job_id[:8] if req.job_id else "—"),
                         u_h,
                         u_w,
-                        u_h // 2,
-                        u_w // 2,
-                        st1,
-                        st2,
-                        self.upscale_cfg_scale,
+                        low_h,
+                        low_w,
                         steps,
                     )
-                    _invoke_two_stage_generate_and_save(
-                        pipe,
-                        prompt=req.prompt,
-                        output_path=out_path,
-                        height=u_h,
-                        width=u_w,
-                        num_frames=nf,
-                        seed=int(req.seed),
-                        stage1_steps=st1,
-                        stage2_steps=st2,
-                        cfg_scale=self.upscale_cfg_scale,
-                        stg_scale=0.0,
-                        image=tmp_image,
-                    )
+                    if tmp_image and getattr(pipe, "generate_from_image", None) is not None:
+                        video_latent, audio_latent = pipe.generate_from_image(
+                            prompt=req.prompt,
+                            image=tmp_image,
+                            height=low_h,
+                            width=low_w,
+                            num_frames=nf,
+                            seed=int(req.seed),
+                            num_steps=steps,
+                        )
+                    else:
+                        video_latent, audio_latent = pipe.generate(
+                            prompt=req.prompt,
+                            height=low_h,
+                            width=low_w,
+                            num_frames=nf,
+                            seed=int(req.seed),
+                            num_steps=steps,
+                        )
+                    video_latent = self._spatial_upscale_video_latent_x2(pipe, video_latent)
+                    decode_fn = getattr(pipe, "_decode_and_save_video", None)
+                    if decode_fn is None:
+                        raise RuntimeError(f"{type(pipe).__name__} has no _decode_and_save_video()")
+                    decode_fn(video_latent, audio_latent, out_path, fps=self.fps)
                 elif tmp_image:
                     pipe = self._get_pipe("i2v", resolved_loras)
                     _invoke_generate_and_save(

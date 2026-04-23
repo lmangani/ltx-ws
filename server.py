@@ -1049,42 +1049,11 @@ examples:
         "--upscale",
         action="store_true",
         help=(
-            "for mode=generate only: use ltx TwoStagePipeline (half-res dev+CFG → "
-            "spatial_upscaler_x2_v1_1 → distilled stage-2). Lazy-loaded; not used for "
-            "a2v/retake/extend/ic_lora. Extra Comfy/global LoRAs are not fused into the "
-            "two-stage dev transformer (see logs); one-stage paths fuse them at load. "
-            "Requires model assets (transformer-dev, spatial_upscaler_x2_v1_1, distilled LoRA)."
+            "for mode=generate only: run the normal one-stage pipeline (with standard LoRA "
+            "support) at 1/2 requested resolution, then apply LTX spatial_upscaler_x2_v1_1 "
+            "to restore final output to client size (snapped to a valid 64-px grid). "
+            "Not used for a2v/retake/extend/ic_lora."
         ),
-    )
-    perf.add_argument(
-        "--upscale-stage1-steps",
-        type=int,
-        default=None,
-        dest="upscale_stage1_steps",
-        metavar="N",
-        help=(
-            "when --upscale: override stage-1 step count (default: same as --infer-steps "
-            "and per-request num_steps)"
-        ),
-    )
-    perf.add_argument(
-        "--upscale-stage2-steps",
-        type=int,
-        default=None,
-        dest="upscale_stage2_steps",
-        metavar="N",
-        help=(
-            "when --upscale: override stage-2 distilled refine step cap (default: same as "
-            "--infer-steps / per-request num_steps)"
-        ),
-    )
-    perf.add_argument(
-        "--upscale-cfg-scale",
-        type=float,
-        default=3.0,
-        dest="upscale_cfg_scale",
-        metavar="X",
-        help="when --upscale: stage-1 CFG scale for TwoStagePipeline (default: 3.0)",
     )
 
     misc = p.add_argument_group("misc")
@@ -1122,13 +1091,6 @@ def main() -> None:
 
     if args.infer_steps < 1:
         parser.error("--infer-steps must be >= 1")
-    if args.upscale:
-        if args.upscale_stage1_steps is not None and args.upscale_stage1_steps < 1:
-            parser.error("--upscale-stage1-steps must be >= 1 when set")
-        if args.upscale_stage2_steps is not None and args.upscale_stage2_steps < 1:
-            parser.error("--upscale-stage2-steps must be >= 1 when set")
-        if args.upscale_cfg_scale <= 0:
-            parser.error("--upscale-cfg-scale must be > 0")
     default_loras: list[tuple[str, float]] = []
     if args.enable_lora:
         default_loras = _default_loras_from_env()
@@ -1191,15 +1153,12 @@ def main() -> None:
         print("  LoRA     : disabled (use --enable-lora)")
     print(f"  low_mem  : {args.mlx_low_memory}")
     if args.upscale:
-        _s1d = args.upscale_stage1_steps if args.upscale_stage1_steps is not None else args.infer_steps
-        _s2d = args.upscale_stage2_steps if args.upscale_stage2_steps is not None else args.infer_steps
         print(
-            f"  upscale  : on  (final = client size, 64-px snapped; stage-1 at ½ res; "
-            f"default steps stage1/stage2 = {_s1d}/{_s2d} from --infer-steps; "
-            f"cfg={args.upscale_cfg_scale})"
+            "  upscale  : on  (normal pipeline at ½ client resolution + "
+            "spatial_upscaler_x2_v1_1 to final 64-px-snapped size)"
         )
     else:
-        print("  upscale  : off  (--upscale for spatial 2× two-stage on generate-only jobs)")
+        print("  upscale  : off  (--upscale for normal@half-res + spatial 2× pass on generate jobs)")
     print(f"{'═' * 60}\n")
 
     spill_dir = Path(args.spill_dir).expanduser().resolve()
@@ -1219,9 +1178,6 @@ def main() -> None:
         spill_dir           = spill_dir,
         low_memory          = args.mlx_low_memory,
         upscale             = args.upscale,
-        upscale_stage1_steps=args.upscale_stage1_steps,
-        upscale_stage2_steps=args.upscale_stage2_steps,
-        upscale_cfg_scale   = args.upscale_cfg_scale,
     )
     log.info("Loading weights before accepting connections …")
     generator.load()
