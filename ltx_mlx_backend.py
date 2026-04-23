@@ -635,6 +635,7 @@ class LocalVideoGenerator:
         # Cache key: (pipeline_key, lora_fingerprint); see _get_pipe / _lora_fp_for_cache.
         self._pipes: dict[tuple[str, tuple[tuple[str, float], ...]], Any] = {}
         self._resolved_default_loras: list[tuple[str, float]] | None = None
+        self._seed_warned_for_upscale_path = False
 
     def _resolve_model_dir(self) -> str:
         return resolve_mlx_weights_directory(self.model, self.model_dir)
@@ -1102,9 +1103,14 @@ class LocalVideoGenerator:
                     try:
                         import mlx.core as mx
 
-                        mx.random.seed(int(req.seed))
+                        mx.random.seed(seed=int(req.seed))
                     except Exception:
-                        log.exception("Failed to set MLX RNG seed for upscale path")
+                        if not self._seed_warned_for_upscale_path:
+                            log.warning(
+                                "MLX RNG seeding is unavailable on this runtime build in "
+                                "--upscale path; continuing without explicit seed call."
+                            )
+                            self._seed_warned_for_upscale_path = True
                     if tmp_image and getattr(pipe, "generate_from_image", None) is not None:
                         video_latent, audio_latent = pipe.generate_from_image(
                             prompt=req.prompt,
