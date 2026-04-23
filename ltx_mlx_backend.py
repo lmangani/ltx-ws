@@ -628,6 +628,49 @@ def _invoke_generate_for_upscale(pipe: Any, **kwargs: Any) -> tuple[Any, Any]:
             type(pipe).__name__,
             dropped,
         )
+    # If this is an i2v request and generate() cannot accept `image`, fall back
+    # to generate_from_image() so conditioning image is never silently ignored.
+    if kwargs_in.get("image") and "image" not in call_kwargs:
+        fn_i2v = getattr(pipe, "generate_from_image", None)
+        if fn_i2v is None:
+            raise RuntimeError(
+                f"{type(pipe).__name__}.generate() dropped image and no generate_from_image() exists"
+            )
+        sig_i2v = _callable_signature(fn_i2v)
+        params_i2v = sig_i2v.parameters
+        accepted_i2v = set(params_i2v.keys())
+        has_varkw_i2v = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params_i2v.values()
+        )
+        call_kwargs_i2v = dict(kwargs_in)
+        if (
+            "num_steps" in call_kwargs_i2v
+            and "num_steps" not in accepted_i2v
+            and "steps" in accepted_i2v
+        ):
+            call_kwargs_i2v["steps"] = call_kwargs_i2v.pop("num_steps")
+        if not has_varkw_i2v:
+            call_kwargs_i2v = {k: v for k, v in call_kwargs_i2v.items() if k in accepted_i2v}
+        dropped_i2v = sorted(set(kwargs_in) - set(call_kwargs_i2v))
+        if dropped_i2v:
+            log.warning(
+                "upscale %s.generate_from_image dropped kwargs (not in resolved signature): %s",
+                type(pipe).__name__,
+                dropped_i2v,
+            )
+        log.info(
+            "upscale %s.generate_from_image effective kwargs: %s",
+            type(pipe).__name__,
+            call_kwargs_i2v,
+        )
+        result_i2v = fn_i2v(**call_kwargs_i2v)
+        if not isinstance(result_i2v, tuple) or len(result_i2v) != 2:
+            raise RuntimeError(
+                f"{type(pipe).__name__}.generate_from_image() did not return "
+                "(video_latent, audio_latent)"
+            )
+        return result_i2v
+
     log.info("upscale %s.generate effective kwargs: %s", type(pipe).__name__, call_kwargs)
     result = fn(**call_kwargs)
     if not isinstance(result, tuple) or len(result) != 2:
