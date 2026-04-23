@@ -546,6 +546,8 @@ class LocalVideoGenerator:
         default_lora_specs: list[tuple[str, float]] | None = None,
         spill_dir: Path | None = None,
         low_memory: bool = False,
+        *,
+        upscale: bool = False,
     ) -> None:
         self.model = model
         self.num_frames = int(num_frames)
@@ -557,6 +559,8 @@ class LocalVideoGenerator:
         self.default_lora_specs = list(default_lora_specs or [])
         self.spill_dir = spill_dir
         self.low_memory = bool(low_memory)
+        # Backward-compatible ctor arg used by server.py CLI.
+        self.upscale = bool(upscale)
         self._model_path: str | None = None
         self._pipe_classes: dict[str, Any] = {}
         self._pipes: dict[str, Any] = {}
