@@ -14,6 +14,7 @@ import inspect
 import logging
 import mimetypes
 import os
+import random
 import re
 import shutil
 import tempfile
@@ -763,6 +764,12 @@ class LocalVideoGenerator:
         steps = max(1, requested_steps)
         if steps != requested_steps:
             log.warning("LTX steps must be >=1; adjusted steps %s → %s", requested_steps, steps)
+        requested_seed = int(req.seed)
+        seed = requested_seed
+        if seed < 0:
+            # videofentanyl commonly sends -1 for "auto/random seed".
+            seed = random.randint(0, 2**31 - 1)
+            log.info("LTX random seed requested (%s); using generated seed %s", requested_seed, seed)
         effective_loras: list[tuple[str, float]] = []
         if self._resolved_default_loras is not None:
             effective_loras.extend(self._resolved_default_loras)
@@ -815,11 +822,12 @@ class LocalVideoGenerator:
                     if lora_cleanup:
                         tmp_lora_cleanup.append(lora_cleanup)
             log.info(
-                "Generation effective params: mode=%s seed=%s size=%sx%s frames=%s steps=%s "
+                "Generation effective params: mode=%s seed=%s (requested=%s) size=%sx%s frames=%s steps=%s "
                 "(requested size=%sx%s frames=%s steps=%s) image=%s audio=%s video=%s "
                 "retake=%s-%s extend=%s/%s vcond=%s loras=%s model_path=%s",
                 mode,
-                int(req.seed),
+                seed,
+                requested_seed,
                 height,
                 width,
                 nf,
@@ -860,7 +868,7 @@ class LocalVideoGenerator:
                         height=height,
                         width=width,
                         num_frames=nf,
-                        seed=int(req.seed),
+                        seed=seed,
                         num_steps=steps,
                         lora_paths=resolved_loras,
                     )
@@ -880,7 +888,7 @@ class LocalVideoGenerator:
                         height=height,
                         width=width,
                         num_frames=nf,
-                        seed=int(req.seed),
+                        seed=seed,
                         num_steps=steps,
                         lora_paths=resolved_loras,
                     )
@@ -900,7 +908,7 @@ class LocalVideoGenerator:
                         height=height,
                         width=width,
                         num_frames=nf,
-                        seed=int(req.seed),
+                        seed=seed,
                         num_steps=steps,
                         lora_paths=resolved_loras,
                     )
@@ -919,7 +927,7 @@ class LocalVideoGenerator:
                         height=height,
                         width=width,
                         num_frames=nf,
-                        seed=int(req.seed),
+                        seed=seed,
                         num_steps=steps,
                     )
                 elif tmp_image:
@@ -932,7 +940,7 @@ class LocalVideoGenerator:
                         height=height,
                         width=width,
                         num_frames=nf,
-                        seed=int(req.seed),
+                        seed=seed,
                         num_steps=steps,
                         lora_paths=resolved_loras,
                     )
@@ -945,7 +953,7 @@ class LocalVideoGenerator:
                         height=height,
                         width=width,
                         num_frames=nf,
-                        seed=int(req.seed),
+                        seed=seed,
                         num_steps=steps,
                         lora_paths=resolved_loras,
                     )
