@@ -649,6 +649,129 @@ def _patch_a2v_short_audio_pad() -> None:
     A2VidPipelineTwoStage._ltx_ws_short_audio_padded = True
 
 
+def _mlx_strided_scatter_add_broken() -> bool | None:
+    """Return True if Metal ``.at[strided].add()`` mis-indexes (mlx 0.31.2 bug).
+
+    ``None`` if mlx is unavailable. See ltx-2-mlx#34 / ml-explore/mlx#3477.
+    """
+    try:
+        import mlx.core as mx
+        import numpy as np
+    except ImportError:
+        return None
+    try:
+        b, t, c = 2, 64, 8
+        x = (mx.arange(b * t * c, dtype=mx.float32).reshape(b, t, c) % 7 - 3) / 3.0
+        y = mx.zeros((b, t * 2, c)).at[:, ::2, :].add(x)
+        mx.eval(y)
+        expected = np.zeros((b, t * 2, c), dtype=np.float32)
+        expected[:, ::2, :] = np.array(x)
+        return bool((np.array(y) != expected).any())
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug("mlx scatter canary failed: %s", exc)
+        return None
+
+
+def _source_uses_strided_at_add(fn: Any) -> bool:
+    try:
+        src = inspect.getsource(fn)
+    except (OSError, TypeError):
+        return False
+    return ".at[" in src and ".add(" in src
+
+
+def _patch_mlx_audio_upsample_scatter() -> None:
+    """Work around mlx 0.31.2 Metal vocoder collapse (hiss / near-silent audio).
+
+    On broken mlx, ``UpSample1d`` / ``HannSincResampler`` zero-insert via
+    ``.at[::k].add()`` corrupts the waveform (~−50 dB hiss). Destination rows
+    are freshly zeroed, so strided assignment is equivalent and correct on all
+    Metal GPUs (M3/M4/M5). Idempotent when ltx-core-mlx ≥ 0.14.19 already fixed.
+    """
+    try:
+        from ltx_core_mlx.model.audio_vae.vocoder import UpSample1d
+        from ltx_core_mlx.model.audio_vae.bwe import HannSincResampler
+        import mlx.core as mx
+    except ImportError:
+        return
+    if getattr(UpSample1d, "_ltx_ws_scatter_patched", False):
+        return
+
+    scatter_broken = _mlx_strided_scatter_add_broken()
+    need_up = _source_uses_strided_at_add(UpSample1d.__call__)
+    need_bwe = _source_uses_strided_at_add(HannSincResampler.__call__)
+
+    if scatter_broken and (need_up or need_bwe):
+        log.warning(
+            "MLX Metal strided .at[].add() is broken on this GPU/driver "
+            "(known mlx 0.31.2 bug → vocoder hiss). "
+            "ltx-ws will force the slice-assignment workaround."
+        )
+    elif scatter_broken:
+        log.info(
+            "MLX Metal strided .at[].add() is broken (mlx 0.31.2), "
+            "but audio vocoder already uses the safe slice-assign workaround"
+        )
+    elif scatter_broken is False:
+        log.info("MLX strided-scatter canary OK")
+
+    if not need_up and not need_bwe:
+        log.info(
+            "Audio vocoder upsample already uses safe slice assign "
+            "(ltx-core-mlx ≥ 0.14.19 or previously patched)"
+        )
+        UpSample1d._ltx_ws_scatter_patched = True
+        return
+
+    if need_up:
+        def _upsample1d_call(self: Any, x: Any) -> Any:
+            b, t, c = x.shape
+            x_up = mx.zeros((b, t * 2, c))
+            # Safe on mlx 0.31.2 Metal (dest is zeros ⇒ assign ≡ add).
+            x_up[:, ::2, :] = x
+            x_up = x_up.transpose(0, 2, 1).reshape(b * c, t * 2, 1)
+            k = self.filter.shape[1]
+            pad = k // 2
+            left_edge = mx.repeat(x_up[:, :1, :], pad, axis=1)
+            right_edge = mx.repeat(x_up[:, -1:, :], pad - 1, axis=1)
+            x_up = mx.concatenate([left_edge, x_up, right_edge], axis=1)
+            x_up = mx.conv1d(x_up, self.filter)
+            t_out = x_up.shape[1]
+            return x_up.reshape(b, c, t_out).transpose(0, 2, 1) * 2.0
+
+        UpSample1d.__call__ = _upsample1d_call  # type: ignore[method-assign]
+        log.info("Patched UpSample1d zero-insert to slice assign (mlx#3477 / ltx-2-mlx#34)")
+
+    if need_bwe:
+        def _hann_sinc_call(self: Any, x: Any) -> Any:
+            b, t = x.shape
+            ratio = self.upsample_factor
+            first = mx.repeat(x[:, :1], self._pad, axis=1)
+            last = mx.repeat(x[:, -1:], self._pad, axis=1)
+            x_padded = mx.concatenate([first, x, last], axis=1)
+            t_padded = x_padded.shape[1]
+            zi_len = (t_padded - 1) * ratio + 1
+            upsampled = mx.zeros((b, zi_len))
+            upsampled[:, ::ratio] = x_padded
+            upsampled = upsampled[:, :, None]
+            k = self.kernel.shape[0]
+            upsampled = mx.pad(upsampled, [(0, 0), (k - 1, k - 1), (0, 0)])
+            filt = self.kernel[None, :, :]
+            result = mx.conv1d(upsampled, filt, padding=0)
+            result = result.squeeze(-1)
+            result = result * ratio
+            result = result[:, self._pad_left : -self._pad_right]
+            return result[:, : t * ratio]
+
+        HannSincResampler.__call__ = _hann_sinc_call  # type: ignore[method-assign]
+        log.info(
+            "Patched HannSincResampler zero-insert to slice assign "
+            "(mlx#3477 / ltx-2-mlx#34)"
+        )
+
+    UpSample1d._ltx_ws_scatter_patched = True
+
+
 def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
     """Apply all ltx-ws runtime patches (PyAV-only media, pipeline compat)."""
     _patch_media_io_pyav_only()
@@ -659,6 +782,7 @@ def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
     _patch_pruna_vae_decoder_loader()
     _patch_iclora_stage2_x0_model()
     _patch_a2v_short_audio_pad()
+    _patch_mlx_audio_upsample_scatter()
 
 
 def looks_like_hf_repo_id(model: str) -> bool:

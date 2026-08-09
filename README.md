@@ -206,6 +206,7 @@ Default catalog includes the OmniNFT RL LoRA; choose **None** in the UI to disab
 | Out of memory | `--model dgrauet/ltx-2.3-mlx-q4`, lower resolution or `--num-frames`, or `--mlx-low-memory` |
 | `autoconcat` failed | `pip install av` (PyAV); fragment files are kept if merge fails |
 | Player won't open MP4 | Re-mux with PyAV or any standard MP4 tool |
+| Generated audio is hiss / near-silent (T2V/I2V); A2V OK | Known **mlx 0.31.2** Metal vocoder bug. Use `ltx-core-mlx` **≥ v0.14.19** (README pin). Latest `ltx-ws` also applies a runtime workaround. Diagnose: `python scripts/diagnose_audio_mlx.py`. Rebuild any packaged `.app` still on `0.14.9`. |
 
 ---
 
