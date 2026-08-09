@@ -120,7 +120,11 @@ async function fetchFrames(): Promise<LibraryFrame[]> {
   return (data.frames ?? []) as LibraryFrame[];
 }
 
-const IMAGE_INPUT_MODES = new Set(["generate", "i2v", "a2v", "keyframe"]);
+const IMAGE_INPUT_MODES = new Set(["generate", "i2v", "a2v", "keyframe", "id_lora"]);
+const ID_LORA_PROMPT_PLACEHOLDER =
+  "[VISUAL]: A close-up of a person speaking to camera. " +
+  "[SPEECH]: Hello, nice to meet you. " +
+  "[SOUNDS]: Clear speech, quiet room.";
 
 /** Merge server clip lists into local state (by id); used when refreshing one chain. */
 function mergeClips(prev: Clip[], incoming: Clip[]): Clip[] {
@@ -425,6 +429,11 @@ export default function App() {
 
   const faceSwapPresetId = config?.face_swap_preset_id ?? "face_swap_head";
   const lipDubPresetId = config?.lipdub_preset_id ?? "lipdub_ic_lora";
+  const idLoraPresetId = config?.id_lora_preset_id ?? "id_lora_celebvhq";
+  const idLoraCelebPresetId = config?.id_lora_celebvhq_preset_id ?? "id_lora_celebvhq";
+  const idLoraTalkvidPresetId = config?.id_lora_talkvid_preset_id ?? "id_lora_talkvid";
+  const idLoraPromptPlaceholder =
+    config?.id_lora_prompt_placeholder ?? ID_LORA_PROMPT_PLACEHOLDER;
 
   const chainParts = useMemo(() => {
     if (!chainId || !selectedClipId) return [];
@@ -686,6 +695,25 @@ export default function App() {
     void ensureLoraPresets([lipDubPresetId], config?.lora_presets, { interactive: true });
   }, [mode, lipDubPresetId, config?.lora_presets, ensureLoraPresets]);
 
+  useEffect(() => {
+    if (mode !== "id_lora" || !idLoraPresetId) return;
+    const allowed = new Set([idLoraCelebPresetId, idLoraTalkvidPresetId]);
+    setLoraPresetIds((prev) => {
+      const current = prev[0];
+      const next = current && allowed.has(current) ? current : idLoraPresetId;
+      void ensureLoraPresets([next], config?.lora_presets, { interactive: true });
+      return [next];
+    });
+    setNumSteps((prev) => (prev < 20 ? 30 : prev));
+  }, [
+    mode,
+    idLoraPresetId,
+    idLoraCelebPresetId,
+    idLoraTalkvidPresetId,
+    config?.lora_presets,
+    ensureLoraPresets,
+  ]);
+
   const persistLoraSelection = useCallback(async (ids: string[]) => {
     try {
       localStorage.setItem(LORA_SEL_KEY, JSON.stringify(ids));
@@ -728,12 +756,22 @@ export default function App() {
         if (mode === "lipdub" && checked) {
           next = [presetId];
         }
+        if (mode === "id_lora" && checked) {
+          next = [presetId];
+        }
         void persistLoraSelection(next);
         void ensureLoraPresets(next, undefined, { interactive: true });
         return next;
       });
     },
-    [config?.ic_lora_motion_preset_id, config?.ic_lora_preset_id, ensureLoraPresets, loraBusy, mode, persistLoraSelection],
+    [
+      config?.ic_lora_motion_preset_id,
+      config?.ic_lora_preset_id,
+      ensureLoraPresets,
+      loraBusy,
+      mode,
+      persistLoraSelection,
+    ],
   );
 
   const updateLoraPresetScale = useCallback(
@@ -1112,7 +1150,11 @@ export default function App() {
   }
 
   function clearMediaForMode(nextMode: string) {
-    if (!["i2v", "generate", "a2v", "keyframe", "ic_lora", "v2v", "lipdub", "face_swap"].includes(nextMode)) {
+    if (
+      !["i2v", "generate", "a2v", "keyframe", "ic_lora", "v2v", "lipdub", "face_swap", "id_lora"].includes(
+        nextMode,
+      )
+    ) {
       setImagePath(null);
       setImageName(null);
       if (imageRef.current) imageRef.current.value = "";
@@ -1122,7 +1164,7 @@ export default function App() {
       setEndImageName(null);
       if (endImageRef.current) endImageRef.current.value = "";
     }
-    if (nextMode !== "a2v" && nextMode !== "lipdub") {
+    if (nextMode !== "a2v" && nextMode !== "lipdub" && nextMode !== "id_lora") {
       resetAudioSelection();
       setAudiocontinue(false);
     }
@@ -1143,7 +1185,13 @@ export default function App() {
     if (nextMode === "a2v") {
       setChainMethod("autocontinue");
     }
-    if (nextMode === "ic_lora" || nextMode === "v2v" || nextMode === "face_swap" || nextMode === "lipdub") {
+    if (
+      nextMode === "ic_lora" ||
+      nextMode === "v2v" ||
+      nextMode === "face_swap" ||
+      nextMode === "lipdub" ||
+      nextMode === "id_lora"
+    ) {
       setClipMultiplier(1);
       setAutocontinue(false);
       setAutoconcat(false);
@@ -1184,6 +1232,7 @@ export default function App() {
   const isIcLora = mode === "ic_lora";
   const isFaceSwap = mode === "face_swap";
   const isLipDub = mode === "lipdub";
+  const isIdLora = mode === "id_lora";
   const pyavAvailable =
     config?.pyav_available ?? config?.audio_trim_available ?? false;
   const audioTrimAvailable = pyavAvailable;
@@ -1567,7 +1616,15 @@ export default function App() {
       body.extend_direction = extendDirection;
     }
     if (
-      (mode === "i2v" || mode === "generate" || mode === "a2v" || mode === "keyframe" || mode === "ic_lora" || mode === "v2v" || mode === "lipdub" || mode === "face_swap") &&
+      (mode === "i2v" ||
+        mode === "generate" ||
+        mode === "a2v" ||
+        mode === "keyframe" ||
+        mode === "ic_lora" ||
+        mode === "v2v" ||
+        mode === "lipdub" ||
+        mode === "face_swap" ||
+        mode === "id_lora") &&
       imagePath
     ) {
       body.image_path = imagePath;
@@ -1576,7 +1633,7 @@ export default function App() {
       body.end_image_path = endImagePath;
     }
     let resolvedAudioPath = audioPath;
-    if ((mode === "a2v" || mode === "lipdub") && !resolvedAudioPath && audioFile) {
+    if ((mode === "a2v" || mode === "lipdub" || mode === "id_lora") && !resolvedAudioPath && audioFile) {
       resolvedAudioPath = await uploadFile(audioFile, "audio");
       setAudioPath(resolvedAudioPath);
     }
@@ -1589,7 +1646,7 @@ export default function App() {
         }
       }
     }
-    if (mode === "lipdub" && resolvedAudioPath) {
+    if ((mode === "lipdub" || mode === "id_lora") && resolvedAudioPath) {
       body.audio_path = resolvedAudioPath;
     }
     if (mode === "ic_lora" || mode === "v2v" || mode === "lipdub") {
@@ -1629,6 +1686,24 @@ export default function App() {
     }
     if (mode === "face_swap" && selectedLoras.length !== 1) {
       setError("Face swap requires exactly one LoRA — use the head-swap preset.");
+      setBusy(false);
+      setProgress(null);
+      return;
+    }
+    if (mode === "id_lora" && selectedLoras.length !== 1) {
+      setError("ID-LoRA requires exactly one adapter — use CelebV-HQ or TalkVid.");
+      setBusy(false);
+      setProgress(null);
+      return;
+    }
+    if (mode === "id_lora" && !imagePath) {
+      setError("ID-LoRA requires a first-frame reference image.");
+      setBusy(false);
+      setProgress(null);
+      return;
+    }
+    if (mode === "id_lora" && !resolvedAudioPath) {
+      setError("ID-LoRA requires reference audio (~5s identity sample).");
       setBusy(false);
       setProgress(null);
       return;
@@ -1692,6 +1767,10 @@ export default function App() {
     if (mode === "lipdub" && loraBusy) return false;
     if (mode === "face_swap" && loraBusy) return false;
     if (mode === "face_swap" && loraPresetIds.length !== 1) return false;
+    if (mode === "id_lora" && loraBusy) return false;
+    if (mode === "id_lora" && loraPresetIds.length !== 1) return false;
+    if (mode === "id_lora" && !imagePath) return false;
+    if (mode === "id_lora" && !audioPath && !audioFile) return false;
     const continuing = willContinueChain;
     if (mode === "i2v" && !imagePath && !continuing) return false;
     if (mode === "face_swap" && !imagePath) return false;
@@ -1910,9 +1989,11 @@ export default function App() {
                 className="prompt-input"
                 rows={1}
                 placeholder={
-                  willContinueChain
-                    ? "What do you want to edit?"
-                    : "What video do you want to create?"
+                  isIdLora
+                    ? idLoraPromptPlaceholder
+                    : willContinueChain
+                      ? "What do you want to edit?"
+                      : "What video do you want to create?"
                 }
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
@@ -2073,7 +2154,7 @@ export default function App() {
                   Clips
                   <select
                     value={clipMultiplier}
-                    disabled={isV2v || isIcLora || isFaceSwap || isLipDub}
+                    disabled={isV2v || isIcLora || isFaceSwap || isLipDub || isIdLora}
                     onChange={(e) => setClipMultiplier(Number(e.target.value))}
                   >
                     {Array.from(
@@ -2140,7 +2221,7 @@ export default function App() {
                   <LoraMultiSelect
                     presets={(config.lora_presets ?? []).filter((p) => p.id !== "none")}
                     selectedIds={loraPresetIds}
-                    disabled={loraBusy || addingCustomLora || isFaceSwap || isLipDub}
+                    disabled={loraBusy || addingCustomLora || isFaceSwap || isLipDub || isIdLora}
                     onToggle={(id, checked) => toggleLoraPreset(id, checked)}
                     onRemovePreset={(preset) => void removeLoraPreset(preset)}
                   />
@@ -2230,7 +2311,7 @@ export default function App() {
                   />
                   Enhance prompt
                 </label>
-                {!isMultiClip && !audiocontinue && !isV2v && !isIcLora && !isFaceSwap && !isLipDub && (
+                {!isMultiClip && !audiocontinue && !isV2v && !isIcLora && !isFaceSwap && !isLipDub && !isIdLora && (
                   <label className="check">
                     <input
                       type="checkbox"
@@ -2245,7 +2326,9 @@ export default function App() {
                     type="checkbox"
                     checked={autoconcat}
                     onChange={(e) => setAutoconcat(e.target.checked)}
-                    disabled={isMultiClip || audiocontinue || isV2v || isIcLora || isFaceSwap || isLipDub}
+                    disabled={
+                      isMultiClip || audiocontinue || isV2v || isIcLora || isFaceSwap || isLipDub || isIdLora
+                    }
                   />
                   Autoconcat
                 </label>
@@ -2295,8 +2378,77 @@ export default function App() {
                 </div>
               )}
 
-              {(isA2v || isV2v || isIcLora || isFaceSwap || isLipDub || needsImageUpload || needsVideoUpload || needsEndImageUpload) && (
+              {(isA2v || isV2v || isIcLora || isFaceSwap || isLipDub || isIdLora || needsImageUpload || needsVideoUpload || needsEndImageUpload) && (
                 <div className="media-panel">
+                  {isIdLora && (
+                    <>
+                      <span className="media-panel-title">ID-LoRA inputs</span>
+                      <p className="hint hint-inline">
+                        First-frame face image + ~5s reference audio for <strong>identity</strong> only.
+                        The model generates new speech from your{" "}
+                        <code>[VISUAL] / [SPEECH] / [SOUNDS]</code> prompt — reference audio is not
+                        remuxed as the soundtrack. Requires dev MLX weights. Defaults to CelebV-HQ
+                        ID-LoRA (TalkVid available in the LoRA list).
+                      </p>
+                      <label className="media-upload">
+                        <span className="media-upload-label">First-frame image (required)</span>
+                        <input
+                          ref={imageRef}
+                          type="file"
+                          accept="image/*"
+                          onChange={async (e) => {
+                            const f = e.target.files?.[0];
+                            if (f) {
+                              setImagePath(await uploadFile(f, "image"));
+                              setImageName(f.name);
+                            }
+                          }}
+                        />
+                        <span className="media-upload-hint">
+                          {imageName ?? "Choose face / first frame…"}
+                        </span>
+                      </label>
+                      <label className="media-upload">
+                        <span className="media-upload-label">
+                          Reference audio (required, identity ~5s)
+                        </span>
+                        <input
+                          ref={audioRef}
+                          type="file"
+                          accept="audio/*,.wav,.mp3,.m4a,.aac,.flac,.ogg"
+                          onChange={(e) => {
+                            const f = e.target.files?.[0];
+                            if (f) handleAudioFileSelected(f);
+                          }}
+                        />
+                        <span className="media-upload-hint">
+                          {audioName ?? (audioPath ? "✓ audio selected" : "Choose reference WAV/MP3…")}
+                        </span>
+                      </label>
+                      {(config?.lora_presets ?? [])
+                        .filter((p) => loraPresetIds.includes(p.id) && p.spec)
+                        .map((p) => (
+                          <label key={p.id} className="v2v-lora-strength-row">
+                            <span className="v2v-lora-strength-label" title={p.label}>
+                              ID-LoRA strength
+                            </span>
+                            <input
+                              type="number"
+                              min={0}
+                              max={2}
+                              step={0.01}
+                              value={p.scale}
+                              disabled={busy || loraBusy}
+                              title="ID-LoRA adapter strength"
+                              aria-label={`LoRA strength for ${p.label}`}
+                              onChange={(e) =>
+                                updateLoraPresetScale(p.id, Number(e.target.value))
+                              }
+                            />
+                          </label>
+                        ))}
+                    </>
+                  )}
                   {isLipDub && (
                     <>
                       <span className="media-panel-title">LipDub inputs</span>

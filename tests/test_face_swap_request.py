@@ -57,7 +57,7 @@ def test_face_swap_ui_payload_fields_are_mapped():
     assert "body.image_path = imagePath" in app
     assert "body.video_path = videoPath" in app
     assert "body.source_clip_id = sourceClipId" in app
-    assert "disabled={loraBusy || addingCustomLora || isFaceSwap || isLipDub}" in app
+    assert "disabled={loraBusy || addingCustomLora || isFaceSwap || isLipDub || isIdLora}" in app
 
 
 def test_face_swap_mode_uses_bfs_face_swap_pipeline():

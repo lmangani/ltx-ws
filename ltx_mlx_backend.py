@@ -92,7 +92,7 @@ class GenerationRequest:
     height: int | None = None
     width: int | None = None
     negative_prompt: str = ""
-    mode: str = "generate"  # generate|a2v|retake|extend
+    mode: str = "generate"  # generate|a2v|retake|extend|ic_lora|keyframe|lipdub|face_swap|id_lora
     num_steps: int | None = None
     retake_start: int | None = None
     retake_end: int | None = None
@@ -2519,6 +2519,19 @@ def _run_ic_lora_generation(
 
 
 # Comfy V3 Face Swap LoRA stack (see docs/FACESWAP_COMFY_GRAPH.md).
+ID_LORA_CELEBVHQ_SPEC = (
+    "https://huggingface.co/AviadDahan/LTX-2.3-ID-LoRA-CelebVHQ-3K/"
+    "resolve/main/lora_weights.safetensors"
+)
+ID_LORA_TALKVID_SPEC = (
+    "https://huggingface.co/AviadDahan/LTX-2.3-ID-LoRA-TalkVid-3K/"
+    "resolve/main/lora_weights.safetensors"
+)
+ID_LORA_DEFAULT_SPEC = ID_LORA_CELEBVHQ_SPEC
+ID_LORA_DEFAULT_SCALE = 1.0
+DEFAULT_ID_LORA_STAGE1_STEPS = 30
+
+
 FACE_SWAP_DISTILLED_DYNAMIC_SPEC = (
     "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/"
     "loras/ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors"
@@ -2601,6 +2614,115 @@ def _build_face_swap_lora_stack(
 
     stack.extend((str(p), float(s)) for p, s in head_swap_loras)
     return stack
+
+
+def _resolve_id_lora_stage1_size(
+    image_path: str,
+    *,
+    requested_height: int | None = None,
+    requested_width: int | None = None,
+) -> tuple[int, int]:
+    """Stage-1 HxW from first-frame aspect (long side ≤512), matching upstream ID-LoRA."""
+    from ltx_id_lora_pipeline import compute_id_lora_stage1_resolution, snap_to_divisor
+
+    if requested_height and requested_width:
+        long_side = max(int(requested_height), int(requested_width))
+        if long_side <= 512:
+            return snap_to_divisor(int(requested_height)), snap_to_divisor(int(requested_width))
+
+    try:
+        from PIL import Image as PILImage
+
+        with PILImage.open(image_path) as im:
+            src_w, src_h = im.size
+    except Exception as exc:
+        raise RuntimeError(f"id_lora could not read reference image: {image_path}") from exc
+    return compute_id_lora_stage1_resolution(src_h, src_w)
+
+
+def _run_id_lora_generation(
+    gen: "LocalVideoGenerator",
+    *,
+    req: GenerationRequest,
+    prompt: str,
+    resolved_loras: list[tuple[str, float]],
+    image_path: str,
+    audio_path: str,
+    out_path: str,
+    nf: int,
+    seed: int,
+    steps: int,
+    requested_height: int,
+    requested_width: int,
+) -> Any:
+    """Two-stage ID-LoRA: identity audio IC + first-frame I2V → distilled refine."""
+    if not image_path:
+        raise RuntimeError("id_lora mode requires a first-frame reference image")
+    if not audio_path:
+        raise RuntimeError("id_lora mode requires reference audio")
+    if len(resolved_loras) != 1:
+        raise RuntimeError("id_lora requires exactly one ID-LoRA adapter")
+
+    stage1_h, stage1_w = _resolve_id_lora_stage1_size(
+        image_path,
+        requested_height=requested_height,
+        requested_width=requested_width,
+    )
+    stage2_h, stage2_w = stage1_h * 2, stage1_w * 2
+    stage1_steps = int(steps)
+    if req.num_steps is None:
+        stage1_steps = DEFAULT_ID_LORA_STAGE1_STEPS
+
+    log.info(
+        "ID-LoRA invoke: stage1=%dx%d → output=%dx%d frames=%d steps=%d lora=%s "
+        "(ref audio = identity context; generated speech from prompt)",
+        stage1_h,
+        stage1_w,
+        stage2_h,
+        stage2_w,
+        nf,
+        stage1_steps,
+        Path(resolved_loras[0][0]).name,
+    )
+    pipe = gen._get_pipe(
+        "id_lora",
+        pipe_kwargs={"lora_paths": [(str(p), float(s)) for p, s in resolved_loras]},
+    )
+    from ltx_id_lora_pipeline import (
+        DEFAULT_AUDIO_CFG,
+        DEFAULT_IDENTITY_GUIDANCE_SCALE,
+        DEFAULT_VIDEO_CFG,
+        IDLoraTwoStagesPipeline,
+    )
+
+    if not isinstance(pipe, IDLoraTwoStagesPipeline):
+        raise RuntimeError(
+            f"id_lora expected IDLoraTwoStagesPipeline, got {type(pipe).__name__}"
+        )
+
+    id_kwargs: dict[str, Any] = {
+        "prompt": prompt,
+        "output_path": out_path,
+        "image": image_path,
+        "audio_path": audio_path,
+        "height": stage1_h,
+        "width": stage1_w,
+        "num_frames": nf,
+        "frame_rate": float(gen.fps),
+        "seed": seed,
+        "stage1_steps": stage1_steps,
+        "cfg_scale": float(DEFAULT_VIDEO_CFG),
+        "audio_cfg_scale": float(DEFAULT_AUDIO_CFG),
+        "identity_guidance_scale": float(DEFAULT_IDENTITY_GUIDANCE_SCALE),
+    }
+    if req.cfg_scale is not None:
+        id_kwargs["cfg_scale"] = float(req.cfg_scale)
+    if req.stg_scale is not None:
+        id_kwargs["stg_scale"] = float(req.stg_scale)
+    if req.stage2_steps is not None:
+        id_kwargs["stage2_steps"] = int(req.stage2_steps)
+    _invoke_generate_and_save(pipe, **id_kwargs)
+    return pipe
 
 
 def _run_face_swap_generation(
@@ -2931,6 +3053,14 @@ class LocalVideoGenerator:
             log.info("Registered MLX pipeline face_swap (FaceSwapPipeline)")
         except ImportError as exc:
             log.warning("FaceSwapPipeline unavailable: %s", exc)
+
+        try:
+            from ltx_id_lora_pipeline import IDLoraTwoStagesPipeline
+
+            self._pipe_classes["id_lora"] = IDLoraTwoStagesPipeline
+            log.info("Registered MLX pipeline id_lora (IDLoraTwoStagesPipeline)")
+        except ImportError as exc:
+            log.warning("IDLoraTwoStagesPipeline unavailable: %s", exc)
 
         # Legacy standalone spatial upscaler classes (pre-v0.14 monolith pipelines).
         for cls_name in (
@@ -3425,11 +3555,24 @@ class LocalVideoGenerator:
                     media_cleanups.append(cleanup)
                 elif path and marker in path:
                     media_cleanups.append(path)
-            if mode in ("face_swap", "face-swap", "lipdub", "lip_dub", "ic_lora", "keyframe"):
+            if mode in (
+                "face_swap",
+                "face-swap",
+                "lipdub",
+                "lip_dub",
+                "ic_lora",
+                "keyframe",
+                "id_lora",
+                "id-lora",
+            ):
                 # Exclusive adapter modes: never stack global OmniNFT defaults.
                 # V2V maps to ic_lora — empty request = pure reference conditioning.
-                # CrossView / HDR / Union / keyframe come only from the request.
-                for lora_spec, lora_scale in (req.lora_specs or []):
+                # CrossView / HDR / Union / keyframe / ID-LoRA come only from the request.
+                mode_loras = list(req.lora_specs or [])
+                if mode in ("id_lora", "id-lora") and not mode_loras:
+                    mode_loras = [(ID_LORA_DEFAULT_SPEC, ID_LORA_DEFAULT_SCALE)]
+                    log.info("ID-LoRA: auto-injecting default CelebV-HQ adapter")
+                for lora_spec, lora_scale in mode_loras:
                     lora_path, lora_cleanup = _resolve_lora_path(str(lora_spec))
                     resolved_loras.append((lora_path, float(lora_scale)))
                     if lora_cleanup:
@@ -3453,9 +3596,11 @@ class LocalVideoGenerator:
                 "Generation effective params: mode=%s profile=%s enhance=%s seed=%s (requested=%s) "
                 "size=%sx%s frames=%s steps=%s fps=%s (requested size=%sx%s frames=%s steps=%s) "
                 "image=%s end_image=%s audio=%s video=%s retake=%s-%s extend=%s/%s vcond=%s loras=%s "
-                "vae_decoder=%s model_path=%s",
+                "id_lora=%s vae_decoder=%s model_path=%s",
                 mode,
-                profile if mode not in ("extend", "retake") else "dev+CFG",
+                profile if mode not in ("extend", "retake", "id_lora", "id-lora") else (
+                    "id_lora_two_stage" if mode in ("id_lora", "id-lora") else "dev+CFG"
+                ),
                 "yes" if req.enhance_prompt else "no",
                 seed,
                 requested_seed,
@@ -3478,6 +3623,7 @@ class LocalVideoGenerator:
                 (req.extend_direction or "after").strip().lower(),
                 len(vc_items),
                 len(resolved_loras),
+                "yes" if mode in ("id_lora", "id-lora") else "no",
                 get_vae_decoder_variant(),
                 self._model_path,
             )
@@ -3763,6 +3909,27 @@ class LocalVideoGenerator:
                             tmp_image=tmp_image,
                             num_frames=nf,
                             req=req,
+                        )
+                    elif mode in ("id_lora", "id-lora"):
+                        if not tmp_image:
+                            raise RuntimeError("id_lora mode requires a first-frame reference image")
+                        if not tmp_audio:
+                            raise RuntimeError("id_lora mode requires reference audio")
+                        if len(resolved_loras) != 1:
+                            raise RuntimeError("id_lora mode requires exactly one ID-LoRA spec")
+                        last_pipe = _run_id_lora_generation(
+                            self,
+                            req=req,
+                            prompt=effective_prompt,
+                            resolved_loras=resolved_loras,
+                            image_path=tmp_image,
+                            audio_path=tmp_audio,
+                            out_path=out_path,
+                            nf=nf,
+                            seed=seed,
+                            steps=steps,
+                            requested_height=height,
+                            requested_width=width,
                         )
                     elif mode in ("face_swap", "face-swap"):
                         if not tmp_video:

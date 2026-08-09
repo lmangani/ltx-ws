@@ -55,7 +55,17 @@ def _new_output_path(prompt: str, output_dir: Path, prefix: str) -> Path:
 
 def _normalize_mode(mode: str) -> str:
     val = (mode or "generate").strip().lower()
-    allowed = {"generate", "a2v", "retake", "extend", "ic_lora", "keyframe", "lipdub", "face_swap"}
+    allowed = {
+        "generate",
+        "a2v",
+        "retake",
+        "extend",
+        "ic_lora",
+        "keyframe",
+        "lipdub",
+        "face_swap",
+        "id_lora",
+    }
     if val not in allowed:
         raise ValueError(f"Unsupported mode {mode!r}; expected one of {sorted(allowed)}")
     return val
@@ -272,6 +282,10 @@ async def ltx_generate_video(
 
     For mode=ic_lora (HDR): video_conditioning and image are independently optional
     (T2V / V2V / I2V). Pass HDR LoRA in lora_specs. skip_stage_2 skips the upscale stage.
+
+    For mode=id_lora: requires image (first frame) + audio (~5s identity reference) and
+    a structured prompt ``[VISUAL] / [SPEECH] / [SOUNDS]``. Optional lora_specs defaults
+    to CelebV-HQ ID-LoRA. Reference audio is identity context, not the final soundtrack.
     """
     if not prompt or not prompt.strip():
         raise ValueError("prompt is required")
@@ -308,6 +322,13 @@ async def ltx_generate_video(
             raise ValueError("mode=face_swap requires image (face identity)")
         if not lora_specs or len(lora_specs) != 1:
             raise ValueError("mode=face_swap requires exactly one lora_specs entry (head swap LoRA)")
+    if mode == "id_lora":
+        if not image:
+            raise ValueError("mode=id_lora requires image (first-frame identity)")
+        if not audio:
+            raise ValueError("mode=id_lora requires audio (identity reference, ~5s)")
+        if lora_specs is not None and len(lora_specs) != 1:
+            raise ValueError("mode=id_lora accepts at most one lora_specs entry (ID-LoRA adapter)")
 
     params = _build_params(
         prompt=prompt,
@@ -433,6 +454,13 @@ async def ltx_generate_sequence(
             raise ValueError("mode=face_swap requires image (face identity)")
         if not lora_specs or len(lora_specs) != 1:
             raise ValueError("mode=face_swap requires exactly one lora_specs entry (head swap LoRA)")
+    if normalized_mode == "id_lora":
+        if not image:
+            raise ValueError("mode=id_lora requires image (first-frame identity)")
+        if not audio:
+            raise ValueError("mode=id_lora requires audio (identity reference, ~5s)")
+        if lora_specs is not None and len(lora_specs) != 1:
+            raise ValueError("mode=id_lora accepts at most one lora_specs entry (ID-LoRA adapter)")
 
     method = (chain_method or CHAIN_METHOD_AUTOCONTINUE).strip().lower()
     if method not in VALID_CHAIN_METHODS:

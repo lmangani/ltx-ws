@@ -16,6 +16,7 @@ Generate text-to-video, image-to-video, audio-to-video, retake, extend, and mult
 | **Multi-clip chains** | Build longer videos with **autocontinue** (last frame → next clip) or **native extend** (extend prior clip in-place) |
 | **Retake & extend** | Edit a segment of existing footage or append/prepend new motion |
 | **Face swap (BFS V3)** | Replace face in reference video using identity image + head-swap LoRA (Comfy-aligned MLX port) |
+| **ID-LoRA (face + voice)** | New talking clip from a face still + ~5s identity audio; structured `[VISUAL]/[SPEECH]/[SOUNDS]` prompt |
 | **Web UI** | Browser library, progress, LoRA picker, duration presets, clip multiplier |
 | **CLI client** | Scriptable batch runs, autocontinue, PyAV merge (`autoconcat`) |
 | **MCP tools** | Drive generation from Cursor, Claude, or other MCP clients |
@@ -207,6 +208,8 @@ Default catalog includes the OmniNFT RL LoRA; choose **None** in the UI to disab
 | `autoconcat` failed | `pip install av` (PyAV); fragment files are kept if merge fails |
 | Player won't open MP4 | Re-mux with PyAV or any standard MP4 tool |
 | Generated audio is hiss / near-silent (T2V/I2V); A2V OK | Known **mlx 0.31.2** Metal vocoder bug. Use `ltx-core-mlx` **≥ v0.14.19** (README pin). Latest `ltx-ws` also applies a runtime workaround. Diagnose: `python scripts/diagnose_audio_mlx.py`. Rebuild any packaged `.app` still on `0.14.9`. |
+| ID-LoRA / face swap / keyframe fails to load | Needs **dev** MLX weights (`transformer-dev.safetensors` + distilled LoRA) — use `dgrauet/ltx-2.3-mlx` or `ltx-2.3-mlx-q8`, not distilled-only. |
+| ID-LoRA voice doesn't match / ignores reference WAV as soundtrack | Expected: reference audio is **identity context** (~5s tip from upstream), not the final track. Put spoken lines in `[SPEECH]: …` of the prompt. |
 
 ---
 

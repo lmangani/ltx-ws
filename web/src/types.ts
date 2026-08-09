@@ -53,6 +53,12 @@ export interface Config {
   ic_lora_union_motion_spec?: string;
   face_swap_preset_id?: string;
   face_swap_default_spec?: string;
+  id_lora_preset_id?: string;
+  id_lora_celebvhq_preset_id?: string;
+  id_lora_talkvid_preset_id?: string;
+  id_lora_default_spec?: string;
+  id_lora_talkvid_spec?: string;
+  id_lora_prompt_placeholder?: string;
   lipdub_preset_id?: string;
   lipdub_default_spec?: string;
   lipdub_official_gated_spec?: string;

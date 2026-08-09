@@ -58,6 +58,7 @@ GENERATION_MODES = [
     {"id": "lipdub", "label": "LipDub (experimental)"},
     {"id": "ic_lora", "label": "IC-LoRA (HDR / Union Control)"},
     {"id": "face_swap", "label": "Face swap (LTX 2.3)"},
+    {"id": "id_lora", "label": "ID-LoRA (face + voice)"},
 ]
 
 CHAIN_METHODS = [
@@ -99,6 +100,23 @@ FACE_SWAP_DEFAULT_SPEC = (
     "resolve/main/ltx-2.3/head_swap_v3_rank_adaptive_fro_098.safetensors"
 )
 FACE_SWAP_DEFAULT_SCALE = 0.98
+ID_LORA_CELEBVHQ_PRESET_ID = "id_lora_celebvhq"
+ID_LORA_TALKVID_PRESET_ID = "id_lora_talkvid"
+ID_LORA_CELEBVHQ_SPEC = (
+    "https://huggingface.co/AviadDahan/LTX-2.3-ID-LoRA-CelebVHQ-3K/"
+    "resolve/main/lora_weights.safetensors"
+)
+ID_LORA_TALKVID_SPEC = (
+    "https://huggingface.co/AviadDahan/LTX-2.3-ID-LoRA-TalkVid-3K/"
+    "resolve/main/lora_weights.safetensors"
+)
+ID_LORA_DEFAULT_PRESET_ID = ID_LORA_CELEBVHQ_PRESET_ID
+ID_LORA_DEFAULT_SCALE = 1.0
+ID_LORA_PROMPT_PLACEHOLDER = (
+    "[VISUAL]: A close-up of a person speaking to camera. "
+    "[SPEECH]: Hello, nice to meet you. "
+    "[SOUNDS]: Clear speech, quiet room."
+)
 LIPDUB_PRESET_ID = "lipdub_ic_lora"
 LIPDUB_OFFICIAL_REPO = "Lightricks/LTX-2.3-22b-IC-LoRA-LipDub"
 LIPDUB_OFFICIAL_FILENAME = "ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"
@@ -376,6 +394,18 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
         "Face swap — head swap LoRA (LTX 2.3)",
         FACE_SWAP_DEFAULT_SPEC,
         FACE_SWAP_DEFAULT_SCALE,
+    )
+    _add(
+        ID_LORA_CELEBVHQ_PRESET_ID,
+        "ID-LoRA — CelebV-HQ (face + voice)",
+        ID_LORA_CELEBVHQ_SPEC,
+        ID_LORA_DEFAULT_SCALE,
+    )
+    _add(
+        ID_LORA_TALKVID_PRESET_ID,
+        "ID-LoRA — TalkVid (face + voice)",
+        ID_LORA_TALKVID_SPEC,
+        ID_LORA_DEFAULT_SCALE,
     )
     lipdub_spec = _builtin_lipdub_spec()
     _add(
@@ -1691,9 +1721,10 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
         "v2v",
         "lipdub",
         "face_swap",
+        "id_lora",
     ) else None
     end_image_path = body.get("end_image_path") if ui_mode == "keyframe" else None
-    audio_path = body.get("audio_path") if ui_mode in ("a2v", "lipdub") else None
+    audio_path = body.get("audio_path") if ui_mode in ("a2v", "lipdub", "id_lora") else None
     video_path: str | None = None
     if ui_mode in ("retake", "extend", "lipdub", "face_swap"):
         if state is not None:
@@ -3004,6 +3035,12 @@ def create_app(
             "ic_lora_union_motion_spec": IC_LORA_UNION_MOTION_SPEC,
             "face_swap_preset_id": FACE_SWAP_PRESET_ID,
             "face_swap_default_spec": FACE_SWAP_DEFAULT_SPEC,
+            "id_lora_preset_id": ID_LORA_DEFAULT_PRESET_ID,
+            "id_lora_celebvhq_preset_id": ID_LORA_CELEBVHQ_PRESET_ID,
+            "id_lora_talkvid_preset_id": ID_LORA_TALKVID_PRESET_ID,
+            "id_lora_default_spec": ID_LORA_CELEBVHQ_SPEC,
+            "id_lora_talkvid_spec": ID_LORA_TALKVID_SPEC,
+            "id_lora_prompt_placeholder": ID_LORA_PROMPT_PLACEHOLDER,
             "lipdub_preset_id": LIPDUB_PRESET_ID,
             "lipdub_default_spec": _builtin_lipdub_spec(),
             "lipdub_official_gated_spec": LIPDUB_OFFICIAL_GATED_SPEC,
@@ -3369,6 +3406,31 @@ def create_app(
                     raise HTTPException(
                         400,
                         f"Could not download face-swap LoRA weights ({spec}): {exc}",
+                    ) from exc
+        if ui_mode == "id_lora":
+            if not body.get("image_path"):
+                raise HTTPException(400, "id_lora requires a first-frame reference image")
+            if not body.get("audio_path"):
+                raise HTTPException(
+                    400,
+                    "id_lora requires reference audio (~5s identity sample; not the final soundtrack)",
+                )
+            lora_items = body.get("lora_specs") or []
+            if not lora_items:
+                body["lora_specs"] = [[ID_LORA_CELEBVHQ_SPEC, ID_LORA_DEFAULT_SCALE]]
+                lora_items = body["lora_specs"]
+            if len(lora_items) != 1:
+                raise HTTPException(400, "id_lora requires exactly one ID-LoRA preset")
+            for lora_item in lora_items:
+                if not isinstance(lora_item, (list, tuple)) or not lora_item:
+                    continue
+                spec = str(lora_item[0])
+                try:
+                    await asyncio.to_thread(_ensure_lora_downloaded, spec)
+                except Exception as exc:
+                    raise HTTPException(
+                        400,
+                        f"Could not download ID-LoRA weights ({spec}): {exc}",
                     ) from exc
 
         _validate_request_media_paths(body)

@@ -146,10 +146,10 @@ If `ok=false`, tell the user to start `python server.py` or fix `--server-url`.
 | Parameter | Type | Notes |
 |-----------|------|--------|
 | `prompt` | string | **Required.** Model-ready visual description. |
-| `mode` | string | `generate` (default), `a2v`, `retake`, `extend`, `ic_lora`, `keyframe`, `lipdub`, `face_swap` |
-| `image` | string? | Path or URL — image-to-video / keyframe start |
+| `mode` | string | `generate` (default), `a2v`, `retake`, `extend`, `ic_lora`, `keyframe`, `lipdub`, `face_swap`, `id_lora` |
+| `image` | string? | Path or URL — image-to-video / keyframe start / ID-LoRA first frame |
 | `end_image` | string? | Keyframe end frame |
-| `audio` | string? | Required for `a2v` |
+| `audio` | string? | Required for `a2v` / `id_lora` (ID-LoRA: identity reference, not soundtrack) |
 | `video` | string? | Required for `retake` / `extend` |
 | `seed` | int? | Override seed (`-1` random on server) |
 | `num_frames` | int? | Default from server (~97). Use **121** for ~5s. |
@@ -176,7 +176,7 @@ If `ok=false`, tell the user to start `python server.py` or fix `--server-url`.
 | `autocontinue` | bool | **`true`** | **Keep true** for director continuity |
 | `chain_method` | string | `autocontinue` | `autocontinue` (last frame → i2v) or **`native_extend`** (ltx-2-mlx `extend_from_video` on prior MP4 for clip 2+) |
 | `autoconcat` | bool | `false` | Set **`true`** when delivering one merged file |
-| `mode` | string | `generate` | `generate`, `a2v`, `retake`, `extend`, `ic_lora`, `keyframe`, `lipdub` |
+| `mode` | string | `generate` | `generate`, `a2v`, `retake`, `extend`, `ic_lora`, `keyframe`, `lipdub`, `face_swap`, `id_lora` |
 | `image` | string? | — | Start image for **clip 1 only** (unless you override per-clip via separate calls) |
 | `end_image` | string? | — | Keyframe mode: end frame |
 | `enhance_prompt` | bool | `false` | Gemma prompt rewrite via ltx-2-mlx |
@@ -229,6 +229,7 @@ Deliver **`merged_output_path`** to the director when `autoconcat=true`.
 | Same, but browser / non-technical user | Web UI | ×N clips, LoRA dropdown, watch library + merged output |
 | Storyboard with distinct shots (hard cuts) | `ltx_generate_sequence` | `autocontinue: false` (or separate prompts as separate projects) |
 | Music video from one track | CLI `audiocontinue` or manual a2v sequence | MCP: `mode: a2v` + sequence (advanced) |
+| Talking head from face photo + short voice sample | `ltx_generate_video` | `mode: id_lora` + `image` + `audio` (structured prompt) |
 | Fix a section of existing footage | `ltx_generate_video` | `mode: retake` + `video` |
 | Extend clip length | `ltx_generate_video` | `mode: extend` + `video` |
 | Style from reference video + LoRA | `ltx_generate_video` | `mode: ic_lora` |
@@ -302,11 +303,30 @@ Structure prompts as a **timeline**, not duplicate full scene descriptions.
 | `mode` | Purpose | Required inputs |
 |--------|---------|-----------------|
 | `generate` | Text-to-video or image-to-video (`image`) | `prompt` |
-| `a2v` | Video driven by audio track | `prompt`, `audio` |
+| `a2v` | Video driven by audio track (audio = soundtrack / timing) | `prompt`, `audio` |
 | `retake` | Replace a segment of source video | `prompt`, `video`, `retake_start`, `retake_end` |
 | `extend` | Add frames before/after source | `prompt`, `video`, `extend_frames`, `extend_direction` |
 | `ic_lora` | Reference-video conditioning + LoRA | `prompt`, `lora_specs`, `video_conditioning` |
+| `lipdub` | Lip-sync / dub with IC-LoRA + reference video audio | `prompt`, `video`, exactly one LipDub `lora_specs` |
 | `face_swap` | BFS V3 head swap (identity image + reference video) | `prompt`, `image` (face), `video`, exactly one head-swap `lora_specs` |
+| `id_lora` | Identity transfer: face still + voice sample → new talking clip | `prompt`, `image`, `audio`; optional one ID-LoRA `lora_specs` (defaults to CelebV-HQ) |
+
+**When to pick which talking-head path**
+
+| Need | Mode | Notes |
+|------|------|--------|
+| Drive video from a full audio track (lips follow that WAV) | `a2v` | Audio is the deliverable soundtrack / timing driver |
+| Swap a face onto existing performance footage | `face_swap` | Needs reference **video** + face image; keeps performance motion |
+| Re-dub / lip-sync an existing clip with IC-LoRA | `lipdub` | Needs reference **video** (+ voice audio) |
+| New clip from a face photo + short voice sample (identity), new speech from prompt | `id_lora` | Ref audio is **identity context** at negative positions — not remuxed as the soundtrack |
+
+**ID-LoRA (`mode: id_lora`)** — two-stage MLX port of [ID-LoRA 2.3](https://github.com/ID-LoRA/ID-LoRA):
+
+1. Stage 1: **dev** transformer + ID-LoRA, first-frame I2V, reference audio at negative temporal positions (`[ref ‖ target]`), video CFG≈3 / audio CFG≈7 + identity guidance.
+2. Stage 2: drop ID-LoRA, 2× spatial upsample, fuse distilled LoRA, freeze stage-1 audio, short distilled refine.
+3. Prompt structure: `[VISUAL]: … [SPEECH]: … [SOUNDS]: …`.
+4. Defaults: ~5s ref audio tip, `num_frames=121`, stage-1 steps **30**, CelebV-HQ LoRA (`AviadDahan/LTX-2.3-ID-LoRA-CelebVHQ-3K`); alt TalkVid-3K.
+5. Requires **dev** MLX weights (`dgrauet/ltx-2.3-mlx` or q8) + distilled LoRA — same class as face_swap/keyframe. Output is ~2× stage-1 resolution (stage-1 long side ≤512).
 
 **Face swap (`mode: face_swap`)** — Comfy-aligned BFS V3 on MLX (`ltx_ltxv_add_guide` + `FaceSwapPipeline`):
 
