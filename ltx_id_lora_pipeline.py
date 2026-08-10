@@ -61,12 +61,15 @@ logger = logging.getLogger(__name__)
 
 _mx_eval = getattr(mx, "eval")  # noqa: B009
 
-DEFAULT_STAGE1_STEPS = 30
+DEFAULT_STAGE1_STEPS = 20
+DEFAULT_STAGE1_STEPS_FAITHFUL = 30
 DEFAULT_VIDEO_CFG = 3.0
 DEFAULT_AUDIO_CFG = 7.0
-DEFAULT_STG_SCALE = 1.0
+DEFAULT_STG_SCALE = 0.0
+DEFAULT_STG_SCALE_FAITHFUL = 1.0
 DEFAULT_IDENTITY_GUIDANCE_SCALE = 3.0
-DEFAULT_MODALITY_SCALE = 3.0
+DEFAULT_MODALITY_SCALE = 1.0
+DEFAULT_MODALITY_SCALE_FAITHFUL = 3.0
 DEFAULT_RESCALE_SCALE = 0.7
 DEFAULT_DISTILLED_LORA_STRENGTH = 0.8
 DEFAULT_NUM_FRAMES = 121
@@ -74,6 +77,8 @@ DEFAULT_FRAME_RATE = 24.0
 MAX_STAGE1_LONG_SIDE = 512
 MAX_STAGE1_PIXELS = 576 * 1024
 RESOLUTION_DIVISOR = 32
+REF_AUDIO_MAX_DURATION_S = 6.0
+REF_AUDIO_MIN_PEAK = 1e-4
 
 
 def _resolve_dev_transformer(model_dir: Path) -> str:
@@ -87,6 +92,37 @@ def _resolve_dev_transformer(model_dir: Path) -> str:
 
 def snap_to_divisor(value: int, divisor: int = RESOLUTION_DIVISOR) -> int:
     return max(int(round(value / divisor)) * divisor, divisor)
+
+
+def count_id_lora_key_matches(model_sd: StateDict, lora_sd: StateDict) -> tuple[int, int]:
+    """Return ``(matched_A_B_pairs, total_lora_A_tensors)`` after Comfy remap."""
+    total = 0
+    matched = 0
+    for key in lora_sd.sd:
+        if not key.endswith(".lora_A.weight"):
+            continue
+        total += 1
+        prefix = key[: -len(".lora_A.weight")]
+        key_b = f"{prefix}.lora_B.weight"
+        weight_key = f"{prefix}.weight"
+        if key_b in lora_sd.sd and weight_key in model_sd.sd:
+            matched += 1
+    return matched, total
+
+
+def waveform_peak(waveform: mx.array) -> float:
+    """Peak absolute amplitude of an audio waveform tensor."""
+    return float(mx.max(mx.abs(waveform)).item())
+
+
+def validate_id_lora_ref_audio_stats(*, peak: float, token_count: int) -> None:
+    """Fail loudly when reference audio is empty or near-silent."""
+    if peak < REF_AUDIO_MIN_PEAK:
+        raise ValueError(
+            f"Reference audio appears silent (peak={peak:.2e}); pick a ~5s clear speech sample"
+        )
+    if int(token_count) <= 0:
+        raise ValueError("Reference audio encoded to 0 tokens")
 
 
 def compute_id_lora_stage1_resolution(
@@ -194,8 +230,10 @@ def id_lora_identity_guidance_denoise_loop(
         disable=not show_progress,
         mininterval=0,
     )
+    n_steps = len(steps)
+    id_delta_logged = False
 
-    for sigma, sigma_next in iterator:
+    for step_idx, (sigma, sigma_next) in enumerate(iterator):
         video_guider = video_guider_factory.build_from_sigma(sigma)
         audio_guider = audio_guider_factory.build_from_sigma(sigma)
 
@@ -315,6 +353,15 @@ def id_lora_identity_guidance_denoise_loop(
                 noref_kwargs["audio_timesteps"] = _compute_per_token_timesteps(sigma, tgt_mask)
             _, noref_a = model(**noref_kwargs)
             id_delta = identity_guidance_scale * (cond_a[:, ref_audio_len:, :] - noref_a)
+            if not id_delta_logged or step_idx == 0 or step_idx == n_steps - 1:
+                mean_abs = float(mx.mean(mx.abs(id_delta)).item())
+                logger.info(
+                    "ID-LoRA identity guidance step %d/%d mean|id_delta|=%.6f",
+                    step_idx + 1,
+                    n_steps,
+                    mean_abs,
+                )
+                id_delta_logged = True
             audio_x0 = mx.concatenate(
                 [audio_x0[:, :ref_audio_len, :], audio_x0[:, ref_audio_len:, :] + id_delta],
                 axis=1,
@@ -391,7 +438,24 @@ class IDLoraTwoStagesPipeline(TI2VidTwoStagesPipeline):
         lora_sds = []
         for lora_path, strength in self._id_lora:
             lora_sd = loader.load(lora_path, sd_ops=LTXV_LORA_COMFY_RENAMING_MAP)
-            logger.info("ID-LoRA: loaded %s (strength=%.3f)", Path(lora_path).name, strength)
+            matched, total = count_id_lora_key_matches(model_sd, lora_sd)
+            logger.info(
+                "ID-LoRA: loaded %s (strength=%.3f) key match %d/%d",
+                Path(lora_path).name,
+                strength,
+                matched,
+                total,
+            )
+            if total > 0 and matched == 0:
+                raise RuntimeError(
+                    f"ID-LoRA incompatible with loaded DiT (0/{total} keys matched): {lora_path}. "
+                    "Without a fused adapter, reference-audio identity transfer is ineffective."
+                )
+            if matched == 0:
+                logger.warning(
+                    "ID-LoRA: %s produced no A/B pairs after remap — fusion may be a no-op",
+                    Path(lora_path).name,
+                )
             lora_sds.append(LoraStateDictWithStrength(state_dict=lora_sd, strength=strength))
         fused_sd = apply_loras(model_sd=model_sd, lora_sd_and_strengths=lora_sds)
         apply_quantization(self.dit, fused_sd.sd)
@@ -401,9 +465,30 @@ class IDLoraTwoStagesPipeline(TI2VidTwoStagesPipeline):
         logger.info("ID-LoRA: fused adapter into dev transformer for stage 1")
 
     def _encode_reference_audio(self, audio_path: str) -> tuple[mx.array, mx.array]:
-        audio_data = load_audio(audio_path, target_sample_rate=16000, mono=False)
+        # Mono + ~5–6s cap matches upstream identity-sample guidance.
+        audio_data = load_audio(
+            audio_path,
+            target_sample_rate=16000,
+            mono=True,
+            max_duration=REF_AUDIO_MAX_DURATION_S,
+        )
         if audio_data is None:
             raise ValueError(f"No audio stream found in {audio_path}")
+
+        peak = waveform_peak(audio_data.waveform)
+        n_samples = int(audio_data.waveform.shape[-1])
+        duration_s = n_samples / float(audio_data.sample_rate or 16000)
+        logger.info(
+            "ID-LoRA ref audio: path=%s duration=%.2fs peak=%.5f sr=%s (identity context, not soundtrack)",
+            audio_path,
+            duration_s,
+            peak,
+            audio_data.sample_rate,
+        )
+        if peak < REF_AUDIO_MIN_PEAK:
+            raise ValueError(
+                f"Reference audio appears silent (peak={peak:.2e}); pick a ~5s clear speech sample"
+            )
 
         def _encode(encoder, processor) -> mx.array:
             latent = encode_audio(audio_data.waveform, audio_data.sample_rate, encoder, processor)
@@ -411,11 +496,25 @@ class IDLoraTwoStagesPipeline(TI2VidTwoStagesPipeline):
             return latent
 
         vae_latent = self.audio_conditioner(_encode, free_after=False)
-        return patchify_id_lora_audio_reference_latent(
+        tokens, positions = patchify_id_lora_audio_reference_latent(
             vae_latent,
             self.audio_patchifier,
             negative_positions=True,
         )
+        validate_id_lora_ref_audio_stats(peak=peak, token_count=int(tokens.shape[1]))
+        if int(tokens.shape[1]) <= 0:
+            raise ValueError(f"Reference audio encoded to 0 tokens: {audio_path}")
+        ref_max = float(mx.max(positions).item())
+        if ref_max >= 0:
+            raise RuntimeError(
+                f"ID-LoRA ref audio positions must be negative (got max={ref_max:.4f})"
+            )
+        logger.info(
+            "ID-LoRA ref audio tokens=%d position_max=%.4f",
+            int(tokens.shape[1]),
+            ref_max,
+        )
+        return tokens, positions
 
     def _reload_clean_dev_with_distilled(self) -> None:
         """Drop ID-LoRA and load clean dev + distilled LoRA for stage 2."""
@@ -457,13 +556,18 @@ class IDLoraTwoStagesPipeline(TI2VidTwoStagesPipeline):
         cfg_scale: float = DEFAULT_VIDEO_CFG,
         audio_cfg_scale: float = DEFAULT_AUDIO_CFG,
         stg_scale: float = DEFAULT_STG_SCALE,
+        modality_scale: float = DEFAULT_MODALITY_SCALE,
         identity_guidance_scale: float = DEFAULT_IDENTITY_GUIDANCE_SCALE,
+        skip_stage_2: bool = False,
+        upsample_only: bool = False,
     ) -> tuple[mx.array, mx.array]:
         """Run two-stage ID-LoRA. ``height``/``width`` are stage-1 pixel sizes."""
         if not image:
             raise ValueError("ID-LoRA requires a first-frame reference image")
         if not audio_path:
             raise ValueError("ID-LoRA requires reference audio")
+        if skip_stage_2 and upsample_only:
+            raise ValueError("skip_stage_2 and upsample_only are mutually exclusive")
 
         stage1_h = snap_to_divisor(int(height))
         stage1_w = snap_to_divisor(int(width))
@@ -481,7 +585,10 @@ class IDLoraTwoStagesPipeline(TI2VidTwoStagesPipeline):
         self.load()
         assert self.dit is not None
         assert self.vae_encoder is not None
-        assert self.upsampler is not None
+        if not skip_stage_2:
+            if self.upsampler is None:
+                self._load_upsampler()
+            assert self.upsampler is not None
 
         f_lat, h_lat, w_lat = compute_video_latent_shape(num_frames, stage1_h, stage1_w)
         video_shape = (1, f_lat * h_lat * w_lat, 128)
@@ -548,14 +655,14 @@ class IDLoraTwoStagesPipeline(TI2VidTwoStagesPipeline):
             cfg_scale=cfg_scale,
             stg_scale=stg_scale,
             rescale_scale=DEFAULT_RESCALE_SCALE,
-            modality_scale=DEFAULT_MODALITY_SCALE,
+            modality_scale=modality_scale,
             stg_blocks=[28],
         )
         audio_guider_params = MultiModalGuiderParams(
             cfg_scale=audio_cfg_scale,
             stg_scale=stg_scale,
             rescale_scale=DEFAULT_RESCALE_SCALE,
-            modality_scale=DEFAULT_MODALITY_SCALE,
+            modality_scale=modality_scale,
             stg_blocks=[28],
         )
         video_factory = create_multimodal_guider_factory(video_guider_params, negative_context=neg_video_embeds)
@@ -565,7 +672,8 @@ class IDLoraTwoStagesPipeline(TI2VidTwoStagesPipeline):
         self._pre_denoise_flush(video_state, audio_state)
         logger.info(
             "ID-LoRA stage 1: %dx%d, %d frames, %d steps, ref_audio_tokens=%d, "
-            "video_cfg=%.1f audio_cfg=%.1f identity=%.1f",
+            "video_cfg=%.1f audio_cfg=%.1f identity=%.1f stg=%.1f modality=%.1f "
+            "skip_stage_2=%s upsample_only=%s",
             stage1_h,
             stage1_w,
             num_frames,
@@ -574,6 +682,10 @@ class IDLoraTwoStagesPipeline(TI2VidTwoStagesPipeline):
             cfg_scale,
             audio_cfg_scale,
             identity_guidance_scale,
+            stg_scale,
+            modality_scale,
+            skip_stage_2,
+            upsample_only,
         )
         output_1 = id_lora_identity_guidance_denoise_loop(
             model=x0_model,
@@ -594,6 +706,17 @@ class IDLoraTwoStagesPipeline(TI2VidTwoStagesPipeline):
         s1_audio = strip_prefix_audio_tokens(output_1.audio_latent, ref_audio_len)
         s1_audio = s1_audio[:, :audio_t, :]
 
+        if skip_stage_2:
+            video_latent = self.video_patchifier.unpatchify(gen_video, (f_lat, h_lat, w_lat))
+            audio_latent = self.audio_patchifier.unpatchify(s1_audio)
+            _mx_eval(video_latent, audio_latent)
+            logger.info(
+                "ID-LoRA skip_stage_2: returning stage-1 %dx%d (no upsample / refine)",
+                stage1_h,
+                stage1_w,
+            )
+            return video_latent, audio_latent
+
         video_half = self.video_patchifier.unpatchify(gen_video, (f_lat, h_lat, w_lat))
         video_mlx = video_half.transpose(0, 2, 3, 4, 1)
         video_denorm = self.vae_encoder.denormalize_latent(video_mlx).transpose(0, 4, 1, 2, 3)
@@ -606,6 +729,16 @@ class IDLoraTwoStagesPipeline(TI2VidTwoStagesPipeline):
         w_full = w_lat * 2
         stage2_h = stage1_h * 2
         stage2_w = stage1_w * 2
+
+        if upsample_only:
+            audio_latent = self.audio_patchifier.unpatchify(s1_audio)
+            _mx_eval(video_upscaled, audio_latent)
+            logger.info(
+                "ID-LoRA upsample_only: returning 2× pixels at %dx%d (no stage-2 denoise)",
+                stage2_h,
+                stage2_w,
+            )
+            return video_upscaled, audio_latent
 
         conditionings_2 = combined_image_conditionings(
             [ImageConditioningInput(path=image, frame_idx=0, strength=1.0)],
@@ -704,7 +837,10 @@ class IDLoraTwoStagesPipeline(TI2VidTwoStagesPipeline):
         cfg_scale: float = DEFAULT_VIDEO_CFG,
         audio_cfg_scale: float = DEFAULT_AUDIO_CFG,
         stg_scale: float = DEFAULT_STG_SCALE,
+        modality_scale: float = DEFAULT_MODALITY_SCALE,
         identity_guidance_scale: float = DEFAULT_IDENTITY_GUIDANCE_SCALE,
+        skip_stage_2: bool = False,
+        upsample_only: bool = False,
         num_steps: int | None = None,
         **_ignored,
     ) -> str:
@@ -723,7 +859,10 @@ class IDLoraTwoStagesPipeline(TI2VidTwoStagesPipeline):
             cfg_scale=cfg_scale,
             audio_cfg_scale=audio_cfg_scale,
             stg_scale=stg_scale,
+            modality_scale=modality_scale,
             identity_guidance_scale=identity_guidance_scale,
+            skip_stage_2=bool(skip_stage_2),
+            upsample_only=bool(upsample_only),
         )
 
         if self.low_memory:

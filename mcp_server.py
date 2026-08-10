@@ -98,6 +98,8 @@ def _build_params(
     no_regen_audio: bool = False,
     reference_strength: float | None = None,
     skip_stage_2: bool = False,
+    upsample_only: bool = False,
+    modality_scale: float | None = None,
 ) -> GenerationParams:
     normalized_mode = _normalize_mode(mode)
 
@@ -150,6 +152,8 @@ def _build_params(
         no_regen_audio=no_regen_audio,
         reference_strength=reference_strength,
         skip_stage_2=bool(skip_stage_2),
+        upsample_only=bool(upsample_only),
+        modality_scale=modality_scale,
     )
 
 
@@ -205,6 +209,8 @@ def _build_multi_job(
     video_conditioning_specs: list[tuple[dict, float]],
     output_path: Path,
     skip_stage_2: bool = False,
+    upsample_only: bool = False,
+    modality_scale: float | None = None,
     end_image_payload: dict | None = None,
     no_regen_audio: bool = False,
     reference_strength: float | None = None,
@@ -235,6 +241,8 @@ def _build_multi_job(
         lora_specs=lora_specs,
         video_conditioning_specs=video_conditioning_specs,
         skip_stage_2=bool(skip_stage_2),
+        upsample_only=bool(upsample_only),
+        modality_scale=modality_scale,
         no_regen_audio=bool(no_regen_audio),
         reference_strength=reference_strength,
         cfg_scale=cfg_scale,
@@ -275,6 +283,8 @@ async def ltx_generate_video(
     no_regen_audio: bool = False,
     reference_strength: float | None = None,
     skip_stage_2: bool = False,
+    upsample_only: bool = False,
+    modality_scale: float | None = None,
     output_filename: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -285,7 +295,10 @@ async def ltx_generate_video(
 
     For mode=id_lora: requires image (first frame) + audio (~5s identity reference) and
     a structured prompt ``[VISUAL] / [SPEECH] / [SOUNDS]``. Optional lora_specs defaults
-    to CelebV-HQ ID-LoRA. Reference audio is identity context, not the final soundtrack.
+    to CelebV-HQ ID-LoRA. Reference audio is **voice identity only** — spoken words come
+    from ``[SPEECH]``, not the WAV. Balanced defaults: 20 steps, stg=0, modality=1;
+    pass num_steps=30 + stg_scale=1 + modality_scale=3 for the faithful preset.
+    skip_stage_2 / upsample_only are faster preview escapes.
     """
     if not prompt or not prompt.strip():
         raise ValueError("prompt is required")
@@ -329,6 +342,8 @@ async def ltx_generate_video(
             raise ValueError("mode=id_lora requires audio (identity reference, ~5s)")
         if lora_specs is not None and len(lora_specs) != 1:
             raise ValueError("mode=id_lora accepts at most one lora_specs entry (ID-LoRA adapter)")
+        if skip_stage_2 and upsample_only:
+            raise ValueError("skip_stage_2 and upsample_only are mutually exclusive")
 
     params = _build_params(
         prompt=prompt,
@@ -356,6 +371,8 @@ async def ltx_generate_video(
         no_regen_audio=no_regen_audio,
         reference_strength=reference_strength,
         skip_stage_2=skip_stage_2,
+        upsample_only=upsample_only,
+        modality_scale=modality_scale,
     )
 
     _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -411,6 +428,8 @@ async def ltx_generate_sequence(
     no_regen_audio: bool = False,
     reference_strength: float | None = None,
     skip_stage_2: bool = False,
+    upsample_only: bool = False,
+    modality_scale: float | None = None,
     output_prefix: str = DEFAULT_PREFIX,
 ) -> dict[str, Any]:
     """
@@ -517,6 +536,8 @@ async def ltx_generate_sequence(
                 video_conditioning_specs=parsed_vcond,
                 output_path=output_path,
                 skip_stage_2=skip_stage_2,
+                upsample_only=upsample_only,
+                modality_scale=modality_scale,
                 end_image_payload=end_image_payload,
                 no_regen_audio=no_regen_audio,
                 reference_strength=reference_strength,

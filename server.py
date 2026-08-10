@@ -871,6 +871,8 @@ class RequestHandler:
                         reference_strength=_msg_float(msg, "reference_strength"),
                         audio_start_seconds=_msg_float(msg, "audio_start_seconds"),
                         skip_stage_2=_msg_bool(msg, "skip_stage_2"),
+                        upsample_only=_msg_bool(msg, "upsample_only"),
+                        modality_scale=_msg_float(msg, "modality_scale"),
                     )
                 )
                 try:

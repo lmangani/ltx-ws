@@ -9,7 +9,44 @@ const API = "";
 const MODEL_PREF_KEY = "ltx-ws-preferred-model";
 const LORA_SEL_KEY = "ltx-ws-lora-preset-ids";
 const LORA_ENSURED_KEY = "ltx-ws-lora-ensured-specs";
+const NOTIFY_READY_KEY = "ltx-ws-notify-on-ready";
 const BLOB_VIDEO_PREFIX = "blob:";
+
+function readNotifyOnReadyPref(): boolean {
+  try {
+    return localStorage.getItem(NOTIFY_READY_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function persistNotifyOnReadyPref(enabled: boolean) {
+  try {
+    localStorage.setItem(NOTIFY_READY_KEY, enabled ? "1" : "0");
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
+/** Optional desktop notification when a run finishes (never required for playback). */
+function notifyGenerationReady(body = "Your video is ready to play.") {
+  if (!readNotifyOnReadyPref()) return;
+  if (typeof Notification === "undefined") return;
+  if (Notification.permission !== "granted") return;
+  try {
+    new Notification("LTX-WS Videofentanyl", {
+      body,
+      tag: "ltx-ws-generation-ready",
+    });
+  } catch {
+    /* Notifications may throw if blocked mid-session */
+  }
+}
+
+function promptLooksLikeIdLoraTemplate(text: string): boolean {
+  const t = text.trim();
+  return /\[VISUAL\]/i.test(t) && /\[SPEECH\]/i.test(t) && /\[SOUNDS\]/i.test(t);
+}
 
 function readEnsuredLoraSpecs(): Set<string> {
   try {
@@ -121,7 +158,8 @@ async function fetchFrames(): Promise<LibraryFrame[]> {
 }
 
 const IMAGE_INPUT_MODES = new Set(["generate", "i2v", "a2v", "keyframe", "id_lora"]);
-const ID_LORA_PROMPT_PLACEHOLDER =
+/** Prefill + placeholder for ID-LoRA structured prompts. */
+const ID_LORA_PROMPT_TEMPLATE =
   "[VISUAL]: A close-up of a person speaking to camera. " +
   "[SPEECH]: Hello, nice to meet you. " +
   "[SOUNDS]: Clear speech, quiet room.";
@@ -354,6 +392,9 @@ export default function App() {
   const [conditioningVideoScale, setConditioningVideoScale] = useState(1.0);
   const [referenceStrength, setReferenceStrength] = useState(1.0);
   const [skipStage2, setSkipStage2] = useState(false);
+  const [idLoraFaithful, setIdLoraFaithful] = useState(false);
+  const [idLoraUpsampleOnly, setIdLoraUpsampleOnly] = useState(false);
+  const [notifyOnReady, setNotifyOnReady] = useState(() => readNotifyOnReadyPref());
   const [sourceClipId, setSourceClipId] = useState<string | null>(null);
   const [retakeStart, setRetakeStart] = useState(0);
   const [retakeEnd, setRetakeEnd] = useState(12);
@@ -432,8 +473,9 @@ export default function App() {
   const idLoraPresetId = config?.id_lora_preset_id ?? "id_lora_celebvhq";
   const idLoraCelebPresetId = config?.id_lora_celebvhq_preset_id ?? "id_lora_celebvhq";
   const idLoraTalkvidPresetId = config?.id_lora_talkvid_preset_id ?? "id_lora_talkvid";
-  const idLoraPromptPlaceholder =
-    config?.id_lora_prompt_placeholder ?? ID_LORA_PROMPT_PLACEHOLDER;
+  const idLoraPromptTemplate =
+    config?.id_lora_prompt_placeholder ?? ID_LORA_PROMPT_TEMPLATE;
+  const idLoraPromptPlaceholder = idLoraPromptTemplate;
 
   const chainParts = useMemo(() => {
     if (!chainId || !selectedClipId) return [];
@@ -704,15 +746,31 @@ export default function App() {
       void ensureLoraPresets([next], config?.lora_presets, { interactive: true });
       return [next];
     });
-    setNumSteps((prev) => (prev < 20 ? 30 : prev));
+    setNumSteps((prev) => (prev < 20 ? 20 : prev));
+    setIdLoraFaithful(false);
+    setIdLoraUpsampleOnly(false);
+    setSkipStage2(false);
+    setPrompt((current) =>
+      promptLooksLikeIdLoraTemplate(current) ? current : idLoraPromptTemplate,
+    );
   }, [
     mode,
     idLoraPresetId,
     idLoraCelebPresetId,
     idLoraTalkvidPresetId,
+    idLoraPromptTemplate,
     config?.lora_presets,
     ensureLoraPresets,
   ]);
+
+  useEffect(() => {
+    if (mode !== "id_lora") return;
+    if (idLoraFaithful) {
+      setNumSteps(30);
+    } else {
+      setNumSteps((prev) => (prev === 30 ? 20 : prev < 20 ? 20 : prev));
+    }
+  }, [mode, idLoraFaithful]);
 
   const persistLoraSelection = useCallback(async (ids: string[]) => {
     try {
@@ -1376,6 +1434,7 @@ export default function App() {
       const chainClips = await fetchClips(runChainId);
       setClips((prev) => replaceChainClips(prev, runChainId, chainClips));
       setSelectedClipId(pickPlaybackClip(chainClips, runChainId));
+      notifyGenerationReady("Your video is ready to play.");
     };
 
     const setFromProtocol = (e: Record<string, unknown>) => {
@@ -1661,8 +1720,16 @@ export default function App() {
       }
       body.reference_strength = referenceStrength;
     }
-    if (mode === "ic_lora" && skipStage2) {
+    if ((mode === "ic_lora" || mode === "id_lora") && skipStage2) {
       body.skip_stage_2 = true;
+    }
+    if (mode === "id_lora" && idLoraUpsampleOnly && !skipStage2) {
+      body.upsample_only = true;
+    }
+    if (mode === "id_lora" && idLoraFaithful) {
+      body.num_steps = 30;
+      body.stg_scale = 1.0;
+      body.modality_scale = 3.0;
     }
     if ((mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap") && sourceClipId) {
       body.source_clip_id = sourceClipId;
@@ -1865,9 +1932,9 @@ export default function App() {
                     : "anonymous"
                 }
                 controls
-                autoPlay
                 loop
                 playsInline
+                preload="metadata"
               />
             ) : (
               <div className="player placeholder">
@@ -2111,8 +2178,16 @@ export default function App() {
                     value={mode}
                     onChange={(e) => {
                       const next = e.target.value;
+                      const prevMode = mode;
                       setMode(next);
                       clearMediaForMode(next);
+                      if (next === "id_lora" && prevMode !== "id_lora") {
+                        setPrompt((current) =>
+                          promptLooksLikeIdLoraTemplate(current)
+                            ? current
+                            : idLoraPromptTemplate,
+                        );
+                      }
                     }}
                   >
                     {config.generation_modes.map((m) => (
@@ -2311,6 +2386,44 @@ export default function App() {
                   />
                   Enhance prompt
                 </label>
+                <label
+                  className="check"
+                  title={
+                    typeof Notification === "undefined"
+                      ? "Browser notifications are not available here"
+                      : "Optional: ask the browser to notify you when a generation finishes (videos do not autoplay)"
+                  }
+                >
+                  <input
+                    type="checkbox"
+                    checked={notifyOnReady}
+                    disabled={typeof Notification === "undefined"}
+                    onChange={(e) => {
+                      const on = e.target.checked;
+                      if (!on) {
+                        setNotifyOnReady(false);
+                        persistNotifyOnReadyPref(false);
+                        return;
+                      }
+                      void (async () => {
+                        if (typeof Notification === "undefined") return;
+                        let permission = Notification.permission;
+                        if (permission === "default") {
+                          permission = await Notification.requestPermission();
+                        }
+                        const allowed = permission === "granted";
+                        setNotifyOnReady(allowed);
+                        persistNotifyOnReadyPref(allowed);
+                        if (!allowed) {
+                          setError(
+                            "Notification permission was denied. Enable it in browser settings if you want ready alerts.",
+                          );
+                        }
+                      })();
+                    }}
+                  />
+                  Notify when ready
+                </label>
                 {!isMultiClip && !audiocontinue && !isV2v && !isIcLora && !isFaceSwap && !isLipDub && !isIdLora && (
                   <label className="check">
                     <input
@@ -2384,11 +2497,14 @@ export default function App() {
                     <>
                       <span className="media-panel-title">ID-LoRA inputs</span>
                       <p className="hint hint-inline">
-                        First-frame face image + ~5s reference audio for <strong>identity</strong> only.
-                        The model generates new speech from your{" "}
-                        <code>[VISUAL] / [SPEECH] / [SOUNDS]</code> prompt — reference audio is not
-                        remuxed as the soundtrack. Requires dev MLX weights. Defaults to CelebV-HQ
-                        ID-LoRA (TalkVid available in the LoRA list).
+                        First-frame face image + ~5s reference audio for{" "}
+                        <strong>voice identity only</strong> — the WAV is not the
+                        soundtrack or transcript. The prompt is prefilled with{" "}
+                        <code>[VISUAL] / [SPEECH] / [SOUNDS]</code> blocks — edit
+                        the spoken line in <code>[SPEECH]</code>. Requires
+                        dev MLX weights. Defaults to CelebV-HQ ID-LoRA (TalkVid in
+                        the LoRA list). Balanced speed: 20 steps; enable Faithful
+                        for 30 + STG + modality.
                       </p>
                       <label className="media-upload">
                         <span className="media-upload-label">First-frame image (required)</span>
@@ -2447,6 +2563,39 @@ export default function App() {
                             />
                           </label>
                         ))}
+                      <label className="check">
+                        <input
+                          type="checkbox"
+                          checked={idLoraFaithful}
+                          disabled={busy}
+                          onChange={(e) => setIdLoraFaithful(e.target.checked)}
+                        />
+                        Faithful (30 steps / STG + modality)
+                      </label>
+                      <label className="check">
+                        <input
+                          type="checkbox"
+                          checked={skipStage2}
+                          disabled={busy || idLoraUpsampleOnly}
+                          onChange={(e) => {
+                            setSkipStage2(e.target.checked);
+                            if (e.target.checked) setIdLoraUpsampleOnly(false);
+                          }}
+                        />
+                        Skip stage 2 (faster preview, half-res)
+                      </label>
+                      <label className="check">
+                        <input
+                          type="checkbox"
+                          checked={idLoraUpsampleOnly}
+                          disabled={busy || skipStage2}
+                          onChange={(e) => {
+                            setIdLoraUpsampleOnly(e.target.checked);
+                            if (e.target.checked) setSkipStage2(false);
+                          }}
+                        />
+                        Upsample only (2× pixels, no refine)
+                      </label>
                     </>
                   )}
                   {isLipDub && (

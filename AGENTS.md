@@ -325,8 +325,10 @@ Structure prompts as a **timeline**, not duplicate full scene descriptions.
 1. Stage 1: **dev** transformer + ID-LoRA, first-frame I2V, reference audio at negative temporal positions (`[ref ‖ target]`), video CFG≈3 / audio CFG≈7 + identity guidance.
 2. Stage 2: drop ID-LoRA, 2× spatial upsample, fuse distilled LoRA, freeze stage-1 audio, short distilled refine.
 3. Prompt structure: `[VISUAL]: … [SPEECH]: … [SOUNDS]: …`.
-4. Defaults: ~5s ref audio tip, `num_frames=121`, stage-1 steps **30**, CelebV-HQ LoRA (`AviadDahan/LTX-2.3-ID-LoRA-CelebVHQ-3K`); alt TalkVid-3K.
-5. Requires **dev** MLX weights (`dgrauet/ltx-2.3-mlx` or q8) + distilled LoRA — same class as face_swap/keyframe. Output is ~2× stage-1 resolution (stage-1 long side ≤512).
+4. **Reference audio ≠ soundtrack.** The WAV is **voice identity only** (~5s mono tip); spoken words must be written in `[SPEECH]`. Empty/silent refs and 0-match LoRA adapters fail loudly.
+5. **Balanced defaults (speed):** stage-1 steps **20**, `stg_scale=0`, `modality_scale=1` (≈2.5× fewer DiT forwards than the old 30×5 path). **Faithful preset:** `num_steps=30`, `stg_scale=1`, `modality_scale=3`.
+6. **Preview escapes:** `skip_stage_2` (stage-1 resolution, no upsample/refine) or `upsample_only` (2× pixels, skip stage-2 denoise). Mutually exclusive.
+7. CelebV-HQ LoRA default (`AviadDahan/LTX-2.3-ID-LoRA-CelebVHQ-3K`); alt TalkVid-3K. Requires **dev** MLX weights (`dgrauet/ltx-2.3-mlx` or q8). Output is ~2× stage-1 resolution unless `skip_stage_2` (stage-1 long side ≤512).
 
 **Face swap (`mode: face_swap`)** — Comfy-aligned BFS V3 on MLX (`ltx_ltxv_add_guide` + `FaceSwapPipeline`):
 

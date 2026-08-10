@@ -113,6 +113,8 @@ class GenerationRequest:
     reference_strength: float | None = None
     audio_start_seconds: float | None = None
     skip_stage_2: bool = False
+    upsample_only: bool = False
+    modality_scale: float | None = None
 
 
 # Pipelines that bind ``load_audio`` at import time (``from … import load_audio``).
@@ -2529,7 +2531,8 @@ ID_LORA_TALKVID_SPEC = (
 )
 ID_LORA_DEFAULT_SPEC = ID_LORA_CELEBVHQ_SPEC
 ID_LORA_DEFAULT_SCALE = 1.0
-DEFAULT_ID_LORA_STAGE1_STEPS = 30
+DEFAULT_ID_LORA_STAGE1_STEPS = 20
+DEFAULT_ID_LORA_STAGE1_STEPS_FAITHFUL = 30
 
 
 FACE_SWAP_DISTILLED_DYNAMIC_SPEC = (
@@ -2668,21 +2671,36 @@ def _run_id_lora_generation(
         requested_height=requested_height,
         requested_width=requested_width,
     )
-    stage2_h, stage2_w = stage1_h * 2, stage1_w * 2
+    skip_stage_2 = bool(getattr(req, "skip_stage_2", False))
+    upsample_only = bool(getattr(req, "upsample_only", False))
+    if skip_stage_2 and upsample_only:
+        raise RuntimeError("id_lora: skip_stage_2 and upsample_only are mutually exclusive")
+    out_h = stage1_h if skip_stage_2 else stage1_h * 2
+    out_w = stage1_w if skip_stage_2 else stage1_w * 2
     stage1_steps = int(steps)
     if req.num_steps is None:
         stage1_steps = DEFAULT_ID_LORA_STAGE1_STEPS
 
+    audio_bytes = 0
+    try:
+        audio_bytes = Path(audio_path).stat().st_size
+    except OSError:
+        pass
     log.info(
         "ID-LoRA invoke: stage1=%dx%d → output=%dx%d frames=%d steps=%d lora=%s "
-        "(ref audio = identity context; generated speech from prompt)",
+        "audio_path=%s audio_bytes=%d skip_stage_2=%s upsample_only=%s "
+        "(ref audio = voice identity only; spoken words come from [SPEECH] in the prompt, not the WAV)",
         stage1_h,
         stage1_w,
-        stage2_h,
-        stage2_w,
+        out_h,
+        out_w,
         nf,
         stage1_steps,
         Path(resolved_loras[0][0]).name,
+        str(Path(audio_path).resolve()) if audio_path else audio_path,
+        audio_bytes,
+        skip_stage_2,
+        upsample_only,
     )
     pipe = gen._get_pipe(
         "id_lora",
@@ -2691,6 +2709,8 @@ def _run_id_lora_generation(
     from ltx_id_lora_pipeline import (
         DEFAULT_AUDIO_CFG,
         DEFAULT_IDENTITY_GUIDANCE_SCALE,
+        DEFAULT_MODALITY_SCALE,
+        DEFAULT_STG_SCALE,
         DEFAULT_VIDEO_CFG,
         IDLoraTwoStagesPipeline,
     )
@@ -2713,12 +2733,18 @@ def _run_id_lora_generation(
         "stage1_steps": stage1_steps,
         "cfg_scale": float(DEFAULT_VIDEO_CFG),
         "audio_cfg_scale": float(DEFAULT_AUDIO_CFG),
+        "stg_scale": float(DEFAULT_STG_SCALE),
+        "modality_scale": float(DEFAULT_MODALITY_SCALE),
         "identity_guidance_scale": float(DEFAULT_IDENTITY_GUIDANCE_SCALE),
+        "skip_stage_2": skip_stage_2,
+        "upsample_only": upsample_only,
     }
     if req.cfg_scale is not None:
         id_kwargs["cfg_scale"] = float(req.cfg_scale)
     if req.stg_scale is not None:
         id_kwargs["stg_scale"] = float(req.stg_scale)
+    if getattr(req, "modality_scale", None) is not None:
+        id_kwargs["modality_scale"] = float(req.modality_scale)
     if req.stage2_steps is not None:
         id_kwargs["stage2_steps"] = int(req.stage2_steps)
     _invoke_generate_and_save(pipe, **id_kwargs)
@@ -3307,6 +3333,8 @@ class LocalVideoGenerator:
         reference_strength: float | None = None,
         audio_start_seconds: float | None = None,
         skip_stage_2: bool = False,
+        upsample_only: bool = False,
+        modality_scale: float | None = None,
     ) -> str:
         self.clear_cancel()
         loop = asyncio.get_event_loop()
@@ -3344,6 +3372,8 @@ class LocalVideoGenerator:
                     reference_strength=reference_strength,
                     audio_start_seconds=audio_start_seconds,
                     skip_stage_2=bool(skip_stage_2),
+                    upsample_only=bool(upsample_only),
+                    modality_scale=modality_scale,
                 ),
             ),
         )

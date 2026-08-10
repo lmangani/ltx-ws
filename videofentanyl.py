@@ -252,6 +252,8 @@ class GenerationParams:
     audio_start_seconds: Optional[float] = None
     negative_prompt: str = ""
     skip_stage_2: bool = False
+    upsample_only: bool = False
+    modality_scale: Optional[float] = None
 
 
 @dataclasses.dataclass
@@ -393,6 +395,10 @@ def msg_simple_generate(p: GenerationParams) -> str:
         d["stage2_steps"] = int(p.stage2_steps)
     if getattr(p, "skip_stage_2", False):
         d["skip_stage_2"] = True
+    if getattr(p, "upsample_only", False):
+        d["upsample_only"] = True
+    if getattr(p, "modality_scale", None) is not None:
+        d["modality_scale"] = float(p.modality_scale)
     if p.no_regen_audio:
         d["no_regen_audio"] = True
     if p.reference_strength is not None:
@@ -1778,7 +1784,19 @@ examples:
     gen.add_argument(
         "--skip-stage-2",
         action="store_true",
-        help="IC-LoRA / HDR: skip upscale stage (half-res output, faster)",
+        help="IC-LoRA / HDR / ID-LoRA: skip upscale stage (half-res output, faster)",
+    )
+    gen.add_argument(
+        "--upsample-only",
+        action="store_true",
+        help="ID-LoRA: 2× upsample after stage 1, skip stage-2 denoise/reload",
+    )
+    gen.add_argument(
+        "--modality-scale",
+        type=float,
+        default=None,
+        metavar="F",
+        help="ID-LoRA modality guidance scale (default 1.0 balanced; 3.0 faithful)",
     )
     gen.add_argument(
         "--no-regen-audio",
@@ -2142,6 +2160,8 @@ async def async_main(args: argparse.Namespace):
         "no_regen_audio":          bool(args.no_regen_audio),
         "reference_strength":      args.reference_strength,
         "skip_stage_2":            bool(args.skip_stage_2),
+        "upsample_only":           bool(getattr(args, "upsample_only", False)),
+        "modality_scale":          getattr(args, "modality_scale", None),
     }
 
     # ── Build jobs ────────────────────────────────────────────────────────────

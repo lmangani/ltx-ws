@@ -1813,6 +1813,8 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
         audio_start_seconds=audio_start_seconds,
         negative_prompt=str(body.get("negative_prompt") or "").strip(),
         skip_stage_2=bool(body.get("skip_stage_2", False)),
+        upsample_only=bool(body.get("upsample_only", False)),
+        modality_scale=_optional_float(body.get("modality_scale")),
     )
 
 
@@ -1996,6 +1998,8 @@ async def _run_clip_inprocess(
                         audio_start_seconds=getattr(params, "audio_start_seconds", None),
                         negative_prompt=str(getattr(params, "negative_prompt", "") or ""),
                         skip_stage_2=bool(getattr(params, "skip_stage_2", False)),
+                        upsample_only=bool(getattr(params, "upsample_only", False)),
+                        modality_scale=getattr(params, "modality_scale", None),
                     )
                 )
                 while not gen_task.done():
