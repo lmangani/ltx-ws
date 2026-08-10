@@ -873,6 +873,8 @@ class RequestHandler:
                         skip_stage_2=_msg_bool(msg, "skip_stage_2"),
                         upsample_only=_msg_bool(msg, "upsample_only"),
                         modality_scale=_msg_float(msg, "modality_scale"),
+                        audio_cfg_scale=_msg_float(msg, "audio_cfg_scale"),
+                        identity_guidance_scale=_msg_float(msg, "identity_guidance_scale"),
                     )
                 )
                 try:

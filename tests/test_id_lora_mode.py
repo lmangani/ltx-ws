@@ -360,10 +360,14 @@ def test_invoke_generate_and_save_keeps_audio_path():
         skip_stage_2=True,
         upsample_only=False,
         modality_scale=1.0,
+        audio_cfg_scale=7.0,
+        identity_guidance_scale=4.0,
     )
     assert captured["audio_path"] == "/tmp/ref.wav"
     assert captured["skip_stage_2"] is True
     assert "modality_scale" in captured
+    assert captured["audio_cfg_scale"] == pytest.approx(7.0)
+    assert captured["identity_guidance_scale"] == pytest.approx(4.0)
 
 
 def test_ui_copy_says_voice_identity_not_soundtrack():
@@ -374,17 +378,48 @@ def test_ui_copy_says_voice_identity_not_soundtrack():
     assert "Upsample only" in app
     assert "modality_scale" in app
     assert "upsample_only" in app
+    assert "identity_guidance_scale" in app
+    assert "audio_cfg_scale" in app
+    assert "Identity guidance" in app
+    assert "Video CFG" in app
+    assert "Audio CFG" in app
     assert "ID_LORA_PROMPT_TEMPLATE" in app
     assert "promptLooksLikeIdLoraTemplate" in app
     assert "Notify when ready" in app
     assert "notifyGenerationReady" in app
-    assert "autoPlay" not in app or 'autoPlay\n' not in app
     # Player must not autoplay finished generations.
     assert "autoPlay" not in app.split("player-wrap")[1].split("</section>")[0]
+
+
+def test_build_params_passes_id_lora_guidance(tmp_path: Path):
+    from web_ui import ID_LORA_CELEBVHQ_SPEC, _build_params_from_request
+
+    face = tmp_path / "face.jpg"
+    face.write_bytes(b"jpeg")
+    audio = tmp_path / "ref.wav"
+    audio.write_bytes(b"RIFF")
+
+    params = _build_params_from_request(
+        {
+            "mode": "id_lora",
+            "prompt": "[VISUAL]: x. [SPEECH]: hi. [SOUNDS]: quiet.",
+            "image_path": str(face),
+            "audio_path": str(audio),
+            "lora_specs": [[ID_LORA_CELEBVHQ_SPEC, 1.0]],
+            "cfg_scale": 3.5,
+            "audio_cfg_scale": 8.0,
+            "identity_guidance_scale": 4.0,
+        }
+    )
+    assert params.cfg_scale == pytest.approx(3.5)
+    assert params.audio_cfg_scale == pytest.approx(8.0)
+    assert params.identity_guidance_scale == pytest.approx(4.0)
 
 
 def test_cli_documents_id_lora_speed_flags():
     src = Path("videofentanyl.py").read_text(encoding="utf-8")
     assert "--upsample-only" in src
     assert "--modality-scale" in src
+    assert "--audio-cfg-scale" in src
+    assert "--identity-guidance-scale" in src
     assert "ID-LoRA" in src or "id_lora" in src

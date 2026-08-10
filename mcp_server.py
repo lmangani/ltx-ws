@@ -100,6 +100,8 @@ def _build_params(
     skip_stage_2: bool = False,
     upsample_only: bool = False,
     modality_scale: float | None = None,
+    audio_cfg_scale: float | None = None,
+    identity_guidance_scale: float | None = None,
 ) -> GenerationParams:
     normalized_mode = _normalize_mode(mode)
 
@@ -154,6 +156,8 @@ def _build_params(
         skip_stage_2=bool(skip_stage_2),
         upsample_only=bool(upsample_only),
         modality_scale=modality_scale,
+        audio_cfg_scale=audio_cfg_scale,
+        identity_guidance_scale=identity_guidance_scale,
     )
 
 
@@ -216,6 +220,8 @@ def _build_multi_job(
     reference_strength: float | None = None,
     cfg_scale: float | None = None,
     stg_scale: float | None = None,
+    audio_cfg_scale: float | None = None,
+    identity_guidance_scale: float | None = None,
 ) -> Job:
     params = GenerationParams(
         prompt=prompt.strip(),
@@ -247,6 +253,8 @@ def _build_multi_job(
         reference_strength=reference_strength,
         cfg_scale=cfg_scale,
         stg_scale=stg_scale,
+        audio_cfg_scale=audio_cfg_scale,
+        identity_guidance_scale=identity_guidance_scale,
     )
     return Job(
         id=job_id,
@@ -285,6 +293,8 @@ async def ltx_generate_video(
     skip_stage_2: bool = False,
     upsample_only: bool = False,
     modality_scale: float | None = None,
+    audio_cfg_scale: float | None = None,
+    identity_guidance_scale: float | None = None,
     output_filename: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -298,6 +308,7 @@ async def ltx_generate_video(
     to CelebV-HQ ID-LoRA. Reference audio is **voice identity only** — spoken words come
     from ``[SPEECH]``, not the WAV. Balanced defaults: 20 steps, stg=0, modality=1;
     pass num_steps=30 + stg_scale=1 + modality_scale=3 for the faithful preset.
+    Tunable: cfg_scale (video), audio_cfg_scale, identity_guidance_scale.
     skip_stage_2 / upsample_only are faster preview escapes.
     """
     if not prompt or not prompt.strip():
@@ -373,6 +384,8 @@ async def ltx_generate_video(
         skip_stage_2=skip_stage_2,
         upsample_only=upsample_only,
         modality_scale=modality_scale,
+        audio_cfg_scale=audio_cfg_scale,
+        identity_guidance_scale=identity_guidance_scale,
     )
 
     _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -430,6 +443,8 @@ async def ltx_generate_sequence(
     skip_stage_2: bool = False,
     upsample_only: bool = False,
     modality_scale: float | None = None,
+    audio_cfg_scale: float | None = None,
+    identity_guidance_scale: float | None = None,
     output_prefix: str = DEFAULT_PREFIX,
 ) -> dict[str, Any]:
     """
@@ -543,6 +558,8 @@ async def ltx_generate_sequence(
                 reference_strength=reference_strength,
                 cfg_scale=cfg_scale,
                 stg_scale=stg_scale,
+                audio_cfg_scale=audio_cfg_scale,
+                identity_guidance_scale=identity_guidance_scale,
             )
         )
 

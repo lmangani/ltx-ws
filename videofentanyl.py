@@ -254,6 +254,8 @@ class GenerationParams:
     skip_stage_2: bool = False
     upsample_only: bool = False
     modality_scale: Optional[float] = None
+    audio_cfg_scale: Optional[float] = None
+    identity_guidance_scale: Optional[float] = None
 
 
 @dataclasses.dataclass
@@ -399,6 +401,10 @@ def msg_simple_generate(p: GenerationParams) -> str:
         d["upsample_only"] = True
     if getattr(p, "modality_scale", None) is not None:
         d["modality_scale"] = float(p.modality_scale)
+    if getattr(p, "audio_cfg_scale", None) is not None:
+        d["audio_cfg_scale"] = float(p.audio_cfg_scale)
+    if getattr(p, "identity_guidance_scale", None) is not None:
+        d["identity_guidance_scale"] = float(p.identity_guidance_scale)
     if p.no_regen_audio:
         d["no_regen_audio"] = True
     if p.reference_strength is not None:
@@ -1799,6 +1805,20 @@ examples:
         help="ID-LoRA modality guidance scale (default 1.0 balanced; 3.0 faithful)",
     )
     gen.add_argument(
+        "--audio-cfg-scale",
+        type=float,
+        default=None,
+        metavar="F",
+        help="ID-LoRA audio CFG scale (default 7.0)",
+    )
+    gen.add_argument(
+        "--identity-guidance-scale",
+        type=float,
+        default=None,
+        metavar="F",
+        help="ID-LoRA identity guidance (default 3.0; try 4–6 for stronger voice match)",
+    )
+    gen.add_argument(
         "--no-regen-audio",
         action="store_true",
         help="retake/extend: keep source audio instead of regenerating",
@@ -2162,6 +2182,8 @@ async def async_main(args: argparse.Namespace):
         "skip_stage_2":            bool(args.skip_stage_2),
         "upsample_only":           bool(getattr(args, "upsample_only", False)),
         "modality_scale":          getattr(args, "modality_scale", None),
+        "audio_cfg_scale":         getattr(args, "audio_cfg_scale", None),
+        "identity_guidance_scale": getattr(args, "identity_guidance_scale", None),
     }
 
     # ── Build jobs ────────────────────────────────────────────────────────────

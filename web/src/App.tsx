@@ -394,6 +394,9 @@ export default function App() {
   const [skipStage2, setSkipStage2] = useState(false);
   const [idLoraFaithful, setIdLoraFaithful] = useState(false);
   const [idLoraUpsampleOnly, setIdLoraUpsampleOnly] = useState(false);
+  const [idLoraVideoCfg, setIdLoraVideoCfg] = useState(3.0);
+  const [idLoraAudioCfg, setIdLoraAudioCfg] = useState(7.0);
+  const [idLoraIdentity, setIdLoraIdentity] = useState(3.0);
   const [notifyOnReady, setNotifyOnReady] = useState(() => readNotifyOnReadyPref());
   const [sourceClipId, setSourceClipId] = useState<string | null>(null);
   const [retakeStart, setRetakeStart] = useState(0);
@@ -1731,6 +1734,11 @@ export default function App() {
       body.stg_scale = 1.0;
       body.modality_scale = 3.0;
     }
+    if (mode === "id_lora") {
+      body.cfg_scale = idLoraVideoCfg;
+      body.audio_cfg_scale = idLoraAudioCfg;
+      body.identity_guidance_scale = idLoraIdentity;
+    }
     if ((mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap") && sourceClipId) {
       body.source_clip_id = sourceClipId;
     } else if ((mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap") && videoPath) {
@@ -2563,6 +2571,59 @@ export default function App() {
                             />
                           </label>
                         ))}
+                      <div className="id-lora-guidance-grid">
+                        <label className="ic-lora-scale">
+                          Identity guidance
+                          <input
+                            type="number"
+                            min={0}
+                            max={10}
+                            step={0.1}
+                            value={idLoraIdentity}
+                            disabled={busy}
+                            title="Speaker identity strength (default 3; try 4–6 if voice is weak)"
+                            onChange={(e) =>
+                              setIdLoraIdentity(
+                                Math.min(10, Math.max(0, Number(e.target.value) || 0)),
+                              )
+                            }
+                          />
+                        </label>
+                        <label className="ic-lora-scale">
+                          Video CFG
+                          <input
+                            type="number"
+                            min={1}
+                            max={15}
+                            step={0.1}
+                            value={idLoraVideoCfg}
+                            disabled={busy}
+                            title="Video classifier-free guidance (default 3.0)"
+                            onChange={(e) =>
+                              setIdLoraVideoCfg(
+                                Math.min(15, Math.max(1, Number(e.target.value) || 1)),
+                              )
+                            }
+                          />
+                        </label>
+                        <label className="ic-lora-scale">
+                          Audio CFG
+                          <input
+                            type="number"
+                            min={1}
+                            max={20}
+                            step={0.1}
+                            value={idLoraAudioCfg}
+                            disabled={busy}
+                            title="Audio classifier-free guidance (default 7.0)"
+                            onChange={(e) =>
+                              setIdLoraAudioCfg(
+                                Math.min(20, Math.max(1, Number(e.target.value) || 1)),
+                              )
+                            }
+                          />
+                        </label>
+                      </div>
                       <label className="check">
                         <input
                           type="checkbox"

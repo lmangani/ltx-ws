@@ -842,6 +842,20 @@ body {
   font-size: 0.85rem !important;
 }
 
+.id-lora-guidance-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px 12px;
+  margin: 8px 0 4px;
+  width: 100%;
+}
+
+@media (max-width: 720px) {
+  .id-lora-guidance-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .options-uploads {
   display: flex;
   gap: 8px;

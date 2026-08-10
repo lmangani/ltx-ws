@@ -1815,6 +1815,8 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
         skip_stage_2=bool(body.get("skip_stage_2", False)),
         upsample_only=bool(body.get("upsample_only", False)),
         modality_scale=_optional_float(body.get("modality_scale")),
+        audio_cfg_scale=_optional_float(body.get("audio_cfg_scale")),
+        identity_guidance_scale=_optional_float(body.get("identity_guidance_scale")),
     )
 
 
@@ -2000,6 +2002,8 @@ async def _run_clip_inprocess(
                         skip_stage_2=bool(getattr(params, "skip_stage_2", False)),
                         upsample_only=bool(getattr(params, "upsample_only", False)),
                         modality_scale=getattr(params, "modality_scale", None),
+                        audio_cfg_scale=getattr(params, "audio_cfg_scale", None),
+                        identity_guidance_scale=getattr(params, "identity_guidance_scale", None),
                     )
                 )
                 while not gen_task.done():

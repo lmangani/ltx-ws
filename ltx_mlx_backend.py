@@ -115,6 +115,8 @@ class GenerationRequest:
     skip_stage_2: bool = False
     upsample_only: bool = False
     modality_scale: float | None = None
+    audio_cfg_scale: float | None = None
+    identity_guidance_scale: float | None = None
 
 
 # Pipelines that bind ``load_audio`` at import time (``from … import load_audio``).
@@ -2741,10 +2743,14 @@ def _run_id_lora_generation(
     }
     if req.cfg_scale is not None:
         id_kwargs["cfg_scale"] = float(req.cfg_scale)
+    if getattr(req, "audio_cfg_scale", None) is not None:
+        id_kwargs["audio_cfg_scale"] = float(req.audio_cfg_scale)
     if req.stg_scale is not None:
         id_kwargs["stg_scale"] = float(req.stg_scale)
     if getattr(req, "modality_scale", None) is not None:
         id_kwargs["modality_scale"] = float(req.modality_scale)
+    if getattr(req, "identity_guidance_scale", None) is not None:
+        id_kwargs["identity_guidance_scale"] = float(req.identity_guidance_scale)
     if req.stage2_steps is not None:
         id_kwargs["stage2_steps"] = int(req.stage2_steps)
     _invoke_generate_and_save(pipe, **id_kwargs)
@@ -3335,6 +3341,8 @@ class LocalVideoGenerator:
         skip_stage_2: bool = False,
         upsample_only: bool = False,
         modality_scale: float | None = None,
+        audio_cfg_scale: float | None = None,
+        identity_guidance_scale: float | None = None,
     ) -> str:
         self.clear_cancel()
         loop = asyncio.get_event_loop()
@@ -3374,6 +3382,8 @@ class LocalVideoGenerator:
                     skip_stage_2=bool(skip_stage_2),
                     upsample_only=bool(upsample_only),
                     modality_scale=modality_scale,
+                    audio_cfg_scale=audio_cfg_scale,
+                    identity_guidance_scale=identity_guidance_scale,
                 ),
             ),
         )
