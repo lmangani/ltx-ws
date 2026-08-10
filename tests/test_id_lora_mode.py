@@ -243,6 +243,15 @@ def test_track_model_progress_publishes_id_lora_stage1_bar():
         assert snap["step"] == 4
 
 
+def test_id_lora_unpatchifies_before_decode():
+    """Regression: token latents (rank 3) must be unpatchified for audio VAE decode."""
+    src = Path("ltx_id_lora_pipeline.py").read_text(encoding="utf-8")
+    assert "audio_patchifier.unpatchify" in src
+    assert "video_patchifier.unpatchify" in src
+    # Must not return raw denoise tokens as the generate_id_lora result.
+    assert "return output_2.video_latent, output_2.audio_latent" not in src
+
+
 def test_apply_pending_loras_skips_id_lora_owned_paths():
     from ltx_mlx_backend import _apply_pending_loras
 

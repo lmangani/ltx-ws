@@ -677,7 +677,15 @@ class IDLoraTwoStagesPipeline(TI2VidTwoStagesPipeline):
             audio_text_embeds=audio_embeds,
             sigmas=sigmas_2,
         )
-        return output_2.video_latent, output_2.audio_latent
+        # Decode path expects unpatchified VAE latents: video (B,C,F,H,W),
+        # audio (B, 8, T, 16). Returning tokens here crashes audio VAE decode
+        # with ``expected 4, got 3``.
+        gen_tokens_2 = output_2.video_latent[:, : f_lat * h_full * w_full, :]
+        video_latent = self.video_patchifier.unpatchify(gen_tokens_2, (f_lat, h_full, w_full))
+        audio_out = output_2.audio_latent[:, :audio_t, :]
+        audio_latent = self.audio_patchifier.unpatchify(audio_out)
+        _mx_eval(video_latent, audio_latent)
+        return video_latent, audio_latent
 
     def generate_and_save(
         self,
