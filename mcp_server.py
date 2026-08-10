@@ -306,9 +306,9 @@ async def ltx_generate_video(
     For mode=id_lora: requires image (first frame) + audio (~5s identity reference) and
     a structured prompt ``[VISUAL] / [SPEECH] / [SOUNDS]``. Optional lora_specs defaults
     to CelebV-HQ ID-LoRA. Reference audio is **voice identity only** — spoken words come
-    from ``[SPEECH]``, not the WAV. Balanced defaults: 20 steps, stg=0, modality=1;
-    pass num_steps=30 + stg_scale=1 + modality_scale=3 for the faithful preset.
-    Tunable: cfg_scale (video), audio_cfg_scale, identity_guidance_scale.
+    from ``[SPEECH]``, not the WAV. Defaults: 30 steps, stg=1, modality=3 (character-safe);
+    optional faster path uses num_steps=20 while keeping STG/modality.
+    Tunable: cfg_scale (video), audio_cfg_scale, identity_guidance_scale, stg_scale, modality_scale.
     skip_stage_2 / upsample_only are faster preview escapes.
     """
     if not prompt or not prompt.strip():

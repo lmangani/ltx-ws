@@ -1802,7 +1802,7 @@ examples:
         type=float,
         default=None,
         metavar="F",
-        help="ID-LoRA modality guidance scale (default 1.0 balanced; 3.0 faithful)",
+        help="ID-LoRA modality guidance scale (default 3.0)",
     )
     gen.add_argument(
         "--audio-cfg-scale",

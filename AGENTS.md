@@ -326,8 +326,8 @@ Structure prompts as a **timeline**, not duplicate full scene descriptions.
 2. Stage 2: drop ID-LoRA, 2× spatial upsample, fuse distilled LoRA, freeze stage-1 audio, short distilled refine.
 3. Prompt structure: `[VISUAL]: … [SPEECH]: … [SOUNDS]: …`.
 4. **Reference audio ≠ soundtrack.** The WAV is **voice identity only** (~5s mono tip); spoken words must be written in `[SPEECH]`. Empty/silent refs and 0-match LoRA adapters fail loudly.
-5. **Balanced defaults (speed):** stage-1 steps **20**, `stg_scale=0`, `modality_scale=1` (≈2.5× fewer DiT forwards than the old 30×5 path). **Faithful preset:** `num_steps=30`, `stg_scale=1`, `modality_scale=3`.
-6. **Guidance knobs:** `cfg_scale` / video CFG≈**3**, `audio_cfg_scale`≈**7**, `identity_guidance_scale`≈**3** (raise toward **4–6** if voice match is weak). `ref_audio_tokens` is derived from WAV length — not user-set.
+5. **Defaults (character-safe):** stage-1 steps **30**, `stg_scale=1`, `modality_scale=3` (upstream). Optional **Faster** uses 20 steps but **keeps STG/modality** — do not disable STG for talking-head consistency after frame 0.
+6. **Guidance knobs:** `cfg_scale` / video CFG≈**3**, `audio_cfg_scale`≈**7**, `identity_guidance_scale`≈**3** (raise toward **4–6** if voice match is weak), plus STG / modality. `ref_audio_tokens` is derived from WAV length — not user-set.
 7. **Preview escapes:** `skip_stage_2` (stage-1 resolution, no upsample/refine) or `upsample_only` (2× pixels, skip stage-2 denoise). Mutually exclusive.
 8. CelebV-HQ LoRA default (`AviadDahan/LTX-2.3-ID-LoRA-CelebVHQ-3K`); alt TalkVid-3K. Requires **dev** MLX weights (`dgrauet/ltx-2.3-mlx` or q8). Output is ~2× stage-1 resolution unless `skip_stage_2` (stage-1 long side ≤512).
 

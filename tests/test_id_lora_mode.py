@@ -12,9 +12,8 @@ from ltx_core_mlx.utils.positions import compute_audio_positions
 from ltx_id_lora_pipeline import (
     DEFAULT_MODALITY_SCALE,
     DEFAULT_STAGE1_STEPS,
-    DEFAULT_STAGE1_STEPS_FAITHFUL,
+    DEFAULT_STAGE1_STEPS_FAST,
     DEFAULT_STG_SCALE,
-    DEFAULT_STG_SCALE_FAITHFUL,
     REF_AUDIO_MIN_PEAK,
     compute_id_lora_stage1_resolution,
     count_id_lora_key_matches,
@@ -319,18 +318,14 @@ def test_validate_id_lora_ref_audio_stats_rejects_silent_or_empty():
 
 
 def test_balanced_defaults_and_faithful_constants():
-    assert DEFAULT_STAGE1_STEPS == 20
-    assert DEFAULT_STAGE1_STEPS_FAITHFUL == 30
-    assert DEFAULT_STG_SCALE == pytest.approx(0.0)
-    assert DEFAULT_STG_SCALE_FAITHFUL == pytest.approx(1.0)
-    assert DEFAULT_MODALITY_SCALE == pytest.approx(1.0)
-    from ltx_id_lora_pipeline import DEFAULT_MODALITY_SCALE_FAITHFUL
-
-    assert DEFAULT_MODALITY_SCALE_FAITHFUL == pytest.approx(3.0)
+    # Upstream-faithful defaults: STG + modality stay on for character consistency.
+    assert DEFAULT_STAGE1_STEPS == 30
+    assert DEFAULT_STAGE1_STEPS_FAST == 20
+    assert DEFAULT_STG_SCALE == pytest.approx(1.0)
+    assert DEFAULT_MODALITY_SCALE == pytest.approx(3.0)
     from ltx_mlx_backend import DEFAULT_ID_LORA_STAGE1_STEPS
 
-    assert DEFAULT_ID_LORA_STAGE1_STEPS == 20
-
+    assert DEFAULT_ID_LORA_STAGE1_STEPS == 30
 
 def test_generate_and_save_accepts_audio_and_speed_kwargs():
     import inspect
@@ -383,7 +378,8 @@ def test_invoke_generate_and_save_keeps_audio_path():
 def test_ui_copy_says_voice_identity_not_soundtrack():
     app = Path("web/src/App.tsx").read_text(encoding="utf-8")
     assert "voice identity only" in app
-    assert "Faithful (30 steps" in app
+    assert "Faster (20 steps" in app
+    assert "Faithful (30 steps" not in app
     assert "Skip stage 2 (faster preview" in app
     assert "Upsample only" in app
     assert "modality_scale" in app
@@ -393,6 +389,11 @@ def test_ui_copy_says_voice_identity_not_soundtrack():
     assert "Identity guidance" in app
     assert "Video CFG" in app
     assert "Audio CFG" in app
+    assert "STG" in app
+    assert "Modality" in app
+    assert "idLoraStg" in app
+    assert "idLoraModality" in app
+    assert "idLoraFast" in app
     assert "ID_LORA_PROMPT_TEMPLATE" in app
     assert "promptLooksLikeIdLoraTemplate" in app
     assert "maybeRequestNotifyPermissionOnHttps" in app

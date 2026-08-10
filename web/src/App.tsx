@@ -433,11 +433,13 @@ export default function App() {
   const [conditioningVideoScale, setConditioningVideoScale] = useState(1.0);
   const [referenceStrength, setReferenceStrength] = useState(1.0);
   const [skipStage2, setSkipStage2] = useState(false);
-  const [idLoraFaithful, setIdLoraFaithful] = useState(false);
   const [idLoraUpsampleOnly, setIdLoraUpsampleOnly] = useState(false);
   const [idLoraVideoCfg, setIdLoraVideoCfg] = useState(3.0);
   const [idLoraAudioCfg, setIdLoraAudioCfg] = useState(7.0);
   const [idLoraIdentity, setIdLoraIdentity] = useState(3.0);
+  const [idLoraStg, setIdLoraStg] = useState(1.0);
+  const [idLoraModality, setIdLoraModality] = useState(3.0);
+  const [idLoraFast, setIdLoraFast] = useState(false);
   const [sourceClipId, setSourceClipId] = useState<string | null>(null);
   const [retakeStart, setRetakeStart] = useState(0);
   const [retakeEnd, setRetakeEnd] = useState(12);
@@ -793,10 +795,12 @@ export default function App() {
       void ensureLoraPresets([next], config?.lora_presets, { interactive: true });
       return [next];
     });
-    setNumSteps((prev) => (prev < 20 ? 20 : prev));
-    setIdLoraFaithful(false);
+    setNumSteps((prev) => (prev < 20 ? 30 : prev));
+    setIdLoraFast(false);
     setIdLoraUpsampleOnly(false);
     setSkipStage2(false);
+    setIdLoraStg(1.0);
+    setIdLoraModality(3.0);
     setPrompt((current) =>
       promptLooksLikeIdLoraTemplate(current) ? current : idLoraPromptTemplate,
     );
@@ -812,12 +816,12 @@ export default function App() {
 
   useEffect(() => {
     if (mode !== "id_lora") return;
-    if (idLoraFaithful) {
-      setNumSteps(30);
+    if (idLoraFast) {
+      setNumSteps(20);
     } else {
-      setNumSteps((prev) => (prev === 30 ? 20 : prev < 20 ? 20 : prev));
+      setNumSteps((prev) => (prev === 20 ? 30 : prev < 20 ? 30 : prev));
     }
-  }, [mode, idLoraFaithful]);
+  }, [mode, idLoraFast]);
 
   const persistLoraSelection = useCallback(async (ids: string[]) => {
     try {
@@ -1773,15 +1777,15 @@ export default function App() {
     if (mode === "id_lora" && idLoraUpsampleOnly && !skipStage2) {
       body.upsample_only = true;
     }
-    if (mode === "id_lora" && idLoraFaithful) {
-      body.num_steps = 30;
-      body.stg_scale = 1.0;
-      body.modality_scale = 3.0;
+    if (mode === "id_lora" && idLoraFast) {
+      body.num_steps = 20;
     }
     if (mode === "id_lora") {
       body.cfg_scale = idLoraVideoCfg;
       body.audio_cfg_scale = idLoraAudioCfg;
       body.identity_guidance_scale = idLoraIdentity;
+      body.stg_scale = idLoraStg;
+      body.modality_scale = idLoraModality;
     }
     if ((mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap") && sourceClipId) {
       body.source_clip_id = sourceClipId;
@@ -2517,8 +2521,9 @@ export default function App() {
                         <code>[VISUAL] / [SPEECH] / [SOUNDS]</code> blocks — edit
                         the spoken line in <code>[SPEECH]</code>. Requires
                         dev MLX weights. Defaults to CelebV-HQ ID-LoRA (TalkVid in
-                        the LoRA list). Balanced speed: 20 steps; enable Faithful
-                        for 30 + STG + modality.
+                        the LoRA list). Defaults keep <strong>STG + modality</strong> on
+                        for face consistency after the first frame; use Faster for 20
+                        steps only.
                       </p>
                       <label className="media-upload">
                         <span className="media-upload-label">First-frame image (required)</span>
@@ -2629,15 +2634,49 @@ export default function App() {
                             }
                           />
                         </label>
+                        <label className="ic-lora-scale">
+                          STG
+                          <input
+                            type="number"
+                            min={0}
+                            max={5}
+                            step={0.1}
+                            value={idLoraStg}
+                            disabled={busy}
+                            title="Spatio-temporal guidance (default 1.0 — keep on for face consistency)"
+                            onChange={(e) =>
+                              setIdLoraStg(
+                                Math.min(5, Math.max(0, Number(e.target.value) || 0)),
+                              )
+                            }
+                          />
+                        </label>
+                        <label className="ic-lora-scale">
+                          Modality
+                          <input
+                            type="number"
+                            min={0}
+                            max={10}
+                            step={0.1}
+                            value={idLoraModality}
+                            disabled={busy}
+                            title="AV-bimodal guidance (default 3.0)"
+                            onChange={(e) =>
+                              setIdLoraModality(
+                                Math.min(10, Math.max(0, Number(e.target.value) || 0)),
+                              )
+                            }
+                          />
+                        </label>
                       </div>
                       <label className="check">
                         <input
                           type="checkbox"
-                          checked={idLoraFaithful}
+                          checked={idLoraFast}
                           disabled={busy}
-                          onChange={(e) => setIdLoraFaithful(e.target.checked)}
+                          onChange={(e) => setIdLoraFast(e.target.checked)}
                         />
-                        Faithful (30 steps / STG + modality)
+                        Faster (20 steps; keeps STG/modality)
                       </label>
                       <label className="check">
                         <input
