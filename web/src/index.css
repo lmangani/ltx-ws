@@ -26,14 +26,15 @@ body {
 }
 
 .app {
-  max-width: 1100px;
+  max-width: 1280px;
   margin: 0 auto;
   padding: 16px 20px 32px;
 }
 
 .app-body {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 240px;
+  /* Library needs room for a 2-col thumb grid + delete controls (was 240px → cropped). */
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 340px);
   gap: 20px;
   align-items: start;
 }
@@ -50,8 +51,12 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 12px;
+  width: 100%;
+  min-width: 0;
   max-height: calc(100vh - 120px);
+  overflow-x: hidden;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   position: sticky;
   top: 16px;
 }
@@ -80,7 +85,7 @@ body {
 
 .library-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -88,6 +93,8 @@ body {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  width: 100%;
+  min-width: 0;
   padding: 6px;
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -103,6 +110,7 @@ body {
 
 .library-card-wrap {
   position: relative;
+  min-width: 0;
 }
 
 .library-card-wrap.active .library-card {
@@ -114,6 +122,7 @@ body {
   position: absolute;
   top: 4px;
   right: 4px;
+  z-index: 2;
   width: 22px;
   height: 22px;
   border: none;
@@ -128,7 +137,8 @@ body {
 }
 
 .library-card-wrap:hover .library-delete,
-.library-card-wrap.active .library-delete {
+.library-card-wrap.active .library-delete,
+.library-card-wrap:focus-within .library-delete {
   opacity: 1;
 }
 
@@ -386,6 +396,7 @@ body {
 
 .frame-card-wrap {
   position: relative;
+  min-width: 0;
 }
 
 .frame-card {
@@ -1241,6 +1252,18 @@ body {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 12px;
+}
+
+@media (max-width: 960px) {
+  .app-body {
+    grid-template-columns: 1fr;
+  }
+
+  .library {
+    position: static;
+    max-height: none;
+    overflow: visible;
+  }
 }
 
 @media (max-width: 640px) {
