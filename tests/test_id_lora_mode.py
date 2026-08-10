@@ -299,6 +299,16 @@ def test_count_id_lora_key_matches():
     assert total == 1 and matched == 0
 
 
+def test_ensure_stereo_waveform_duplicates_mono():
+    from ltx_id_lora_pipeline import ensure_stereo_waveform
+
+    mono = mx.zeros((1, 1, 16))
+    stereo = ensure_stereo_waveform(mono)
+    assert stereo.shape == (1, 2, 16)
+    already = mx.ones((1, 2, 8))
+    assert ensure_stereo_waveform(already).shape == (1, 2, 8)
+
+
 def test_validate_id_lora_ref_audio_stats_rejects_silent_or_empty():
     validate_id_lora_ref_audio_stats(peak=0.5, token_count=8)
     with pytest.raises(ValueError, match="silent"):

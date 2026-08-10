@@ -115,6 +115,19 @@ def waveform_peak(waveform: mx.array) -> float:
     return float(mx.max(mx.abs(waveform)).item())
 
 
+def ensure_stereo_waveform(waveform: mx.array) -> mx.array:
+    """Ensure ``(1, 2, samples)`` for MLX AudioVAE (conv expects 2 mel channels)."""
+    if waveform.ndim != 3:
+        raise ValueError(f"Expected waveform (1, channels, samples), got shape {tuple(waveform.shape)}")
+    channels = int(waveform.shape[1])
+    if channels == 2:
+        return waveform
+    if channels == 1:
+        return mx.concatenate([waveform, waveform], axis=1)
+    # Downmix extras to stereo by taking first two channels.
+    return waveform[:, :2, :]
+
+
 def validate_id_lora_ref_audio_stats(*, peak: float, token_count: int) -> None:
     """Fail loudly when reference audio is empty or near-silent."""
     if peak < REF_AUDIO_MIN_PEAK:
@@ -465,25 +478,29 @@ class IDLoraTwoStagesPipeline(TI2VidTwoStagesPipeline):
         logger.info("ID-LoRA: fused adapter into dev transformer for stage 1")
 
     def _encode_reference_audio(self, audio_path: str) -> tuple[mx.array, mx.array]:
-        # Mono + ~5–6s cap matches upstream identity-sample guidance.
+        # Cap ~5–6s per upstream identity tip. Keep stereo: MLX AudioVAE conv_in
+        # expects 2 mel channels (mono crashes with channel mismatch).
         audio_data = load_audio(
             audio_path,
             target_sample_rate=16000,
-            mono=True,
+            mono=False,
             max_duration=REF_AUDIO_MAX_DURATION_S,
         )
         if audio_data is None:
             raise ValueError(f"No audio stream found in {audio_path}")
 
-        peak = waveform_peak(audio_data.waveform)
-        n_samples = int(audio_data.waveform.shape[-1])
+        waveform = ensure_stereo_waveform(audio_data.waveform)
+        peak = waveform_peak(waveform)
+        n_samples = int(waveform.shape[-1])
         duration_s = n_samples / float(audio_data.sample_rate or 16000)
         logger.info(
-            "ID-LoRA ref audio: path=%s duration=%.2fs peak=%.5f sr=%s (identity context, not soundtrack)",
+            "ID-LoRA ref audio: path=%s duration=%.2fs peak=%.5f sr=%s channels=%s "
+            "(identity context, not soundtrack)",
             audio_path,
             duration_s,
             peak,
             audio_data.sample_rate,
+            int(waveform.shape[-2]) if waveform.ndim >= 2 else "?",
         )
         if peak < REF_AUDIO_MIN_PEAK:
             raise ValueError(
@@ -491,7 +508,7 @@ class IDLoraTwoStagesPipeline(TI2VidTwoStagesPipeline):
             )
 
         def _encode(encoder, processor) -> mx.array:
-            latent = encode_audio(audio_data.waveform, audio_data.sample_rate, encoder, processor)
+            latent = encode_audio(waveform, audio_data.sample_rate, encoder, processor)
             _mx_eval(latent)
             return latent
 
