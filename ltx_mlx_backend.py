@@ -2798,7 +2798,7 @@ def _run_face_swap_generation(
 
 def _stage_from_tqdm_desc(desc: str) -> str:
     d = (desc or "").strip().lower()
-    if "denois" in d:
+    if "denois" in d or "id-lora" in d or "id_lora" in d:
         return "denoising"
     if "download" in d:
         return "downloading"
@@ -2893,9 +2893,20 @@ class LocalVideoGenerator:
                 self._publish(generator)
 
             def __iter__(self):
-                for item in super().__iter__():
-                    generator._check_cancel()
-                    yield item
+                # Prefer driving update(1) ourselves: upstream tqdm.__iter__ keeps a
+                # local ``n`` and only calls update() when mininterval elapses, which
+                # can starve WebSocket keepalives on fast bars. Explicit update()
+                # always publishes model_progress for the UI.
+                if self.disable:
+                    yield from self.iterable
+                    return
+                try:
+                    for item in self.iterable:
+                        generator._check_cancel()
+                        yield item
+                        self.update(1)
+                finally:
+                    self.close()
 
             def refresh(self, *args: Any, **kwargs: Any) -> None:
                 generator._check_cancel()
@@ -2939,22 +2950,27 @@ class LocalVideoGenerator:
 
         tqdm_mod.tqdm = _TrackingTqdm
         tqdm_mod.auto.tqdm = _TrackingTqdm
-        samplers_mod: Any | None = None
-        orig_samplers_tqdm: Any = None
-        try:
-            import ltx_pipelines_mlx.utils.samplers as samplers_mod
-
-            orig_samplers_tqdm = getattr(samplers_mod, "tqdm", None)
-            samplers_mod.tqdm = _TrackingTqdm
-        except ImportError:
-            pass
+        # Modules that did ``from tqdm import tqdm`` keep a stale class binding;
+        # patch those names too (samplers stage-2 path, and any leftover ID-LoRA binds).
+        stale_bindings: list[tuple[Any, str, Any]] = []
+        for mod_name, attr in (
+            ("ltx_pipelines_mlx.utils.samplers", "tqdm"),
+            ("ltx_id_lora_pipeline", "tqdm"),
+        ):
+            try:
+                mod = __import__(mod_name, fromlist=["*"])
+            except ImportError:
+                continue
+            if hasattr(mod, attr):
+                stale_bindings.append((mod, attr, getattr(mod, attr)))
+                setattr(mod, attr, _TrackingTqdm)
         try:
             yield
         finally:
             tqdm_mod.tqdm = orig_tqdm
             tqdm_mod.auto.tqdm = orig_auto
-            if samplers_mod is not None and orig_samplers_tqdm is not None:
-                samplers_mod.tqdm = orig_samplers_tqdm
+            for mod, attr, orig in stale_bindings:
+                setattr(mod, attr, orig)
             self._model_progress.clear()
 
     def _resolve_model_dir(self) -> str:

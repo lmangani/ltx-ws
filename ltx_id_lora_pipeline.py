@@ -18,8 +18,8 @@ import logging
 from pathlib import Path
 
 import mlx.core as mx
+import tqdm as tqdm_lib
 from mlx_arsenal.diffusion import euler_step
-from tqdm import tqdm
 
 from ltx_core_mlx.components.guiders import (
     MultiModalGuiderFactory,
@@ -184,7 +184,16 @@ def id_lora_identity_guidance_denoise_loop(
     audio_uniform = _is_uniform_mask(audio_state.denoise_mask)
 
     steps = list(zip(sigmas[:-1], sigmas[1:]))
-    iterator = tqdm(steps, desc="ID-LoRA stage 1", disable=not show_progress)
+    # Look up ``tqdm.tqdm`` at call time so ``LocalVideoGenerator._track_model_progress``
+    # can patch the class for Web UI / WebSocket step keepalives (a frozen
+    # ``from tqdm import …`` binding would stall the UI on "GPU assigned — starting…").
+    # mininterval=0 so every denoise step publishes even when steps are fast.
+    iterator = tqdm_lib.tqdm(
+        steps,
+        desc="ID-LoRA stage 1",
+        disable=not show_progress,
+        mininterval=0,
+    )
 
     for sigma, sigma_next in iterator:
         video_guider = video_guider_factory.build_from_sigma(sigma)

@@ -191,6 +191,58 @@ def test_ui_payload_fields_for_id_lora():
     assert "disabled={loraBusy || addingCustomLora || isFaceSwap || isLipDub || isIdLora}" in app
 
 
+def test_stage_from_tqdm_maps_id_lora_desc():
+    from ltx_mlx_backend import _stage_from_tqdm_desc
+
+    assert _stage_from_tqdm_desc("ID-LoRA stage 1") == "denoising"
+    assert _stage_from_tqdm_desc("Denoising (guided)") == "denoising"
+
+
+def test_id_lora_denoise_uses_live_tqdm_lookup():
+    """Stage-1 bar must call ``tqdm.tqdm`` live so WebSocket progress patching works."""
+    import ast
+
+    src = Path("ltx_id_lora_pipeline.py").read_text(encoding="utf-8")
+    assert "import tqdm as tqdm_lib" in src
+    assert "tqdm_lib.tqdm(" in src
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "tqdm":
+            assert not any(a.name == "tqdm" for a in node.names)
+
+
+def test_track_model_progress_patches_id_lora_module_binding():
+    from ltx_mlx_backend import LocalVideoGenerator
+
+    src = Path("ltx_mlx_backend.py").read_text(encoding="utf-8")
+    assert '"ltx_id_lora_pipeline"' in src
+    assert "stale_bindings" in src
+    assert hasattr(LocalVideoGenerator, "_track_model_progress")
+
+
+def test_track_model_progress_publishes_id_lora_stage1_bar():
+    """Live ``tqdm.tqdm`` lookup under the progress CM must update model_progress."""
+    import threading
+
+    import tqdm as tqdm_lib
+
+    from ltx_mlx_backend import LocalVideoGenerator, _ModelProgressStore
+
+    gen = LocalVideoGenerator.__new__(LocalVideoGenerator)
+    gen._model_progress = _ModelProgressStore()
+    gen._cancel_requested = threading.Event()
+
+    with gen._track_model_progress():
+        bar = tqdm_lib.tqdm(range(4), desc="ID-LoRA stage 1", disable=False, mininterval=0)
+        for _ in bar:
+            pass
+        snap = gen.model_progress_for_ws()
+        assert snap is not None
+        assert snap["stage"] == "denoising"
+        assert snap["total"] == 4
+        assert snap["step"] == 4
+
+
 def test_apply_pending_loras_skips_id_lora_owned_paths():
     from ltx_mlx_backend import _apply_pending_loras
 
