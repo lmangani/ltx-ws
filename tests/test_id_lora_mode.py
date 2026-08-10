@@ -385,8 +385,10 @@ def test_ui_copy_says_voice_identity_not_soundtrack():
     assert "Audio CFG" in app
     assert "ID_LORA_PROMPT_TEMPLATE" in app
     assert "promptLooksLikeIdLoraTemplate" in app
-    assert "Notify when ready" in app
+    assert "maybeRequestNotifyPermissionOnHttps" in app
     assert "notifyGenerationReady" in app
+    assert "Notify when ready" not in app
+    assert "Notification permission was denied" not in app
     # Player must not autoplay finished generations.
     assert "autoPlay" not in app.split("player-wrap")[1].split("</section>")[0]
 

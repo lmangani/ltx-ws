@@ -10,7 +10,16 @@ const MODEL_PREF_KEY = "ltx-ws-preferred-model";
 const LORA_SEL_KEY = "ltx-ws-lora-preset-ids";
 const LORA_ENSURED_KEY = "ltx-ws-lora-ensured-specs";
 const NOTIFY_READY_KEY = "ltx-ws-notify-on-ready";
+const NOTIFY_ASKED_KEY = "ltx-ws-notify-permission-asked";
 const BLOB_VIDEO_PREFIX = "blob:";
+
+function isHttpsContext(): boolean {
+  try {
+    return typeof location !== "undefined" && location.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
 
 function readNotifyOnReadyPref(): boolean {
   try {
@@ -20,16 +29,48 @@ function readNotifyOnReadyPref(): boolean {
   }
 }
 
-function persistNotifyOnReadyPref(enabled: boolean) {
+function persistNotifyDecision(enabled: boolean) {
   try {
+    localStorage.setItem(NOTIFY_ASKED_KEY, "1");
     localStorage.setItem(NOTIFY_READY_KEY, enabled ? "1" : "0");
   } catch {
     /* ignore quota / private mode */
   }
 }
 
-/** Optional desktop notification when a run finishes (never required for playback). */
+function alreadyAskedNotifyPermission(): boolean {
+  try {
+    return localStorage.getItem(NOTIFY_ASKED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** HTTPS only: ask once on first visit, then remember grant/deny. No UI checkbox. */
+async function maybeRequestNotifyPermissionOnHttps(): Promise<void> {
+  if (!isHttpsContext()) return;
+  if (typeof Notification === "undefined") return;
+  if (alreadyAskedNotifyPermission()) return;
+
+  if (Notification.permission === "granted") {
+    persistNotifyDecision(true);
+    return;
+  }
+  if (Notification.permission === "denied") {
+    persistNotifyDecision(false);
+    return;
+  }
+  try {
+    const permission = await Notification.requestPermission();
+    persistNotifyDecision(permission === "granted");
+  } catch {
+    persistNotifyDecision(false);
+  }
+}
+
+/** Fire only when previously granted on HTTPS; never prompts from here. */
 function notifyGenerationReady(body = "Your video is ready to play.") {
+  if (!isHttpsContext()) return;
   if (!readNotifyOnReadyPref()) return;
   if (typeof Notification === "undefined") return;
   if (Notification.permission !== "granted") return;
@@ -39,7 +80,7 @@ function notifyGenerationReady(body = "Your video is ready to play.") {
       tag: "ltx-ws-generation-ready",
     });
   } catch {
-    /* Notifications may throw if blocked mid-session */
+    /* ignore */
   }
 }
 
@@ -397,7 +438,6 @@ export default function App() {
   const [idLoraVideoCfg, setIdLoraVideoCfg] = useState(3.0);
   const [idLoraAudioCfg, setIdLoraAudioCfg] = useState(7.0);
   const [idLoraIdentity, setIdLoraIdentity] = useState(3.0);
-  const [notifyOnReady, setNotifyOnReady] = useState(() => readNotifyOnReadyPref());
   const [sourceClipId, setSourceClipId] = useState<string | null>(null);
   const [retakeStart, setRetakeStart] = useState(0);
   const [retakeEnd, setRetakeEnd] = useState(12);
@@ -725,6 +765,10 @@ export default function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- snapshot on mode enter only
   }, [mode, icLoraHdrId, icLoraUnionId]);
+
+  useEffect(() => {
+    void maybeRequestNotifyPermissionOnHttps();
+  }, []);
 
   useEffect(() => {
     if (mode !== "face_swap" || !faceSwapPresetId) return;
@@ -2393,44 +2437,6 @@ export default function App() {
                     onChange={(e) => setEnhancePrompt(e.target.checked)}
                   />
                   Enhance prompt
-                </label>
-                <label
-                  className="check"
-                  title={
-                    typeof Notification === "undefined"
-                      ? "Browser notifications are not available here"
-                      : "Optional: ask the browser to notify you when a generation finishes (videos do not autoplay)"
-                  }
-                >
-                  <input
-                    type="checkbox"
-                    checked={notifyOnReady}
-                    disabled={typeof Notification === "undefined"}
-                    onChange={(e) => {
-                      const on = e.target.checked;
-                      if (!on) {
-                        setNotifyOnReady(false);
-                        persistNotifyOnReadyPref(false);
-                        return;
-                      }
-                      void (async () => {
-                        if (typeof Notification === "undefined") return;
-                        let permission = Notification.permission;
-                        if (permission === "default") {
-                          permission = await Notification.requestPermission();
-                        }
-                        const allowed = permission === "granted";
-                        setNotifyOnReady(allowed);
-                        persistNotifyOnReadyPref(allowed);
-                        if (!allowed) {
-                          setError(
-                            "Notification permission was denied. Enable it in browser settings if you want ready alerts.",
-                          );
-                        }
-                      })();
-                    }}
-                  />
-                  Notify when ready
                 </label>
                 {!isMultiClip && !audiocontinue && !isV2v && !isIcLora && !isFaceSwap && !isLipDub && !isIdLora && (
                   <label className="check">
